@@ -1,0 +1,7 @@
+{
+  "episodes": 10000,
+  "method": "mcts",
+  "seed": 0,
+  "lr": 0.01,
+  "l2": 1e-06
+}

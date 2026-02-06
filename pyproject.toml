@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trickster"
+version = "0.1.0"
+description = "Simple 2-player color trick card game with self-play training and a small Tk GUI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["fastapi", "uvicorn"]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[project.scripts]
+trickster-gui = "trickster.gui:main"
+trickster-train = "trickster.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

@@ -1,0 +1,8 @@
+# Runtime
+numpy==1.26.4
+fastapi
+uvicorn
+
+# Dev / tests
+pytest==8.3.4
+

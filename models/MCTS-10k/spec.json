@@ -1,0 +1,10 @@
+{
+  "game": "snapszer",
+  "kind": "mlp",
+  "method": "mcts",
+  "params": {
+    "activation": "relu",
+    "hidden_layers": 1,
+    "hidden_units": 64
+  }
+}
