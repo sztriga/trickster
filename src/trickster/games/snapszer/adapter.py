@@ -40,13 +40,26 @@ Action = Union[Card, str]  # Card or "close_talon"
 
 @dataclass(slots=True)
 class SnapszerNode:
-    """Immutable-ish game node: underlying GameState + pending lead card."""
+    """Immutable-ish game node: underlying GameState + pending lead card.
+
+    ``known_voids`` tracks suits each player is *provably* missing.
+    Updated when a follower doesn't follow suit in the closed phase
+    (must-follow rules), which is a definitive inference.
+    """
 
     gs: GameState
     pending_lead: Card | None  # None → leader's turn; Card → follower's turn
+    known_voids: tuple[frozenset[Color], frozenset[Color]] = (
+        frozenset(),
+        frozenset(),
+    )
 
     def clone(self) -> SnapszerNode:
-        return SnapszerNode(gs=self.gs.clone(), pending_lead=self.pending_lead)
+        return SnapszerNode(
+            gs=self.gs.clone(),
+            pending_lead=self.pending_lead,
+            known_voids=self.known_voids,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -98,18 +111,40 @@ class SnapszerGame:
 
     def apply(self, state: SnapszerNode, action: Action) -> SnapszerNode:
         gs = state.gs
+        voids = state.known_voids
+
         if action == "close_talon":
             new_gs = gs.clone()
             close_talon(new_gs, new_gs.leader)
-            return SnapszerNode(gs=new_gs, pending_lead=None)
+            return SnapszerNode(gs=new_gs, pending_lead=None, known_voids=voids)
+
         card: Card = action  # type: ignore[assignment]
         if state.pending_lead is None:
             # Leader plays — card becomes pending, state unchanged
-            return SnapszerNode(gs=gs.clone(), pending_lead=card)
-        # Follower plays — resolve trick
+            return SnapszerNode(gs=gs.clone(), pending_lead=card, known_voids=voids)
+
+        # Follower plays — resolve trick.
+        # Bayesian inference: in closed phase (must-follow), not following
+        # suit proves the follower lacks that suit.  If they also didn't
+        # play trump, they lack trump too.
+        follower = 1 - gs.leader
+        must_follow = gs.talon_closed or (
+            len(gs.draw_pile) == 0 and gs.trump_card is None
+        )
+        if must_follow and card.color != state.pending_lead.color:
+            v = set(voids[follower])
+            v.add(state.pending_lead.color)
+            if card.color != gs.trump_color:
+                # Didn't play trump either → void in trump too
+                v.add(gs.trump_color)
+            voids = (
+                (frozenset(v), voids[1]) if follower == 0
+                else (voids[0], frozenset(v))
+            )
+
         new_gs = gs.clone()
         new_gs, _ = play_trick(new_gs, state.pending_lead, card)
-        return SnapszerNode(gs=new_gs, pending_lead=None)
+        return SnapszerNode(gs=new_gs, pending_lead=None, known_voids=voids)
 
     def is_terminal(self, state: SnapszerNode) -> bool:
         return _is_terminal(state.gs)
@@ -142,31 +177,49 @@ class SnapszerGame:
             known.add(state.pending_lead)
 
         unknown = list(all_cards - known)
-        rng.shuffle(unknown)
-
         opp_size = len(det.hands[opponent])
         pile_size = len(det.draw_pile)
-        idx = 0
 
         # Pin pending lead in opponent hand if applicable
+        pinned: list[Card] = []
         if state.pending_lead is not None and gs.leader == opponent:
-            opp_hand = [state.pending_lead]
-            opp_hand.extend(unknown[idx: idx + opp_size - 1])
-            idx += opp_size - 1
+            pinned = [state.pending_lead]
+            unknown = [c for c in unknown if c != state.pending_lead]
+            opp_size -= 1  # one slot already taken
+
+        # --- Bayesian constraint: respect known voids ---
+        opp_voids = state.known_voids[opponent]
+        if opp_voids:
+            eligible = [c for c in unknown if c.color not in opp_voids]
+            ineligible = [c for c in unknown if c.color in opp_voids]
+            rng.shuffle(eligible)
+            rng.shuffle(ineligible)
+
+            if len(eligible) >= opp_size:
+                opp_cards = eligible[:opp_size]
+                leftover = eligible[opp_size:] + ineligible
+            else:
+                # Not enough eligible (rare edge case) — fill what we can
+                opp_cards = eligible + ineligible[:opp_size - len(eligible)]
+                leftover = ineligible[opp_size - len(eligible):]
+            rng.shuffle(leftover)
         else:
-            opp_hand = unknown[idx: idx + opp_size]
-            idx += opp_size
+            rng.shuffle(unknown)
+            opp_cards = unknown[:opp_size]
+            leftover = unknown[opp_size:]
 
         from collections import deque
-        det.hands[opponent] = opp_hand
-        det.draw_pile = deque(unknown[idx: idx + pile_size])
-        idx += pile_size
+        det.hands[opponent] = pinned + opp_cards
+        det.draw_pile = deque(leftover[:pile_size])
 
         if det.trump_card is not None and not det.trump_upcard_visible:
-            if idx < len(unknown):
-                det.trump_card = unknown[idx]
+            if pile_size < len(leftover):
+                det.trump_card = leftover[pile_size]
 
-        return SnapszerNode(gs=det, pending_lead=state.pending_lead)
+        return SnapszerNode(
+            gs=det, pending_lead=state.pending_lead,
+            known_voids=state.known_voids,
+        )
 
     # -- neural-network encoding -------------------------------------------
 
@@ -250,4 +303,5 @@ class SnapszerGame:
     def new_game(self, seed: int, **kwargs: Any) -> SnapszerNode:
         starting_leader = kwargs.get("starting_leader", seed % 2)
         gs = deal(seed=seed, starting_leader=starting_leader)
-        return SnapszerNode(gs=gs, pending_lead=None)
+        return SnapszerNode(gs=gs, pending_lead=None,
+                            known_voids=(frozenset(), frozenset()))

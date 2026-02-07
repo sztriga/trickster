@@ -14,7 +14,7 @@ from typing import Any, Optional
 import numpy as np
 
 from trickster.games.interface import GameInterface
-from trickster.models.alpha_net import AlphaNet
+from trickster.models.alpha_net import SharedAlphaNet as AlphaNet  # type alias for compat
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,15 +185,28 @@ def _run_mcts(
         if _game_is_terminal(leaf_state):
             value = _game_outcome(leaf_state, perspective)
         else:
-            # Expand: create children with priors (NO state computation)
             leaf_player = _game_current(leaf_state)
             leaf_actions = _game_legal(leaf_state)
             leaf_K = len(leaf_actions)
+
+            # Encode state once (shared by both heads)
+            leaf_value_from_both = None
+            leaf_feats = None
+            if use_policy or use_value:
+                leaf_feats = game.encode_state(leaf_state, leaf_player)
+
             if use_policy:
-                leaf_state_f = game.encode_state(leaf_state, leaf_player)
                 leaf_mask = game.legal_action_mask(leaf_state)
-                full_p = net.predict_policy(leaf_state_f, leaf_mask)
-                child_priors = np.array([full_p[game.action_to_index(a)] for a in leaf_actions])
+                if use_value:
+                    # Combined forward — shared body computed once
+                    leaf_value_from_both, full_p = net.predict_both(
+                        leaf_feats, leaf_mask,
+                    )
+                else:
+                    full_p = net.predict_policy(leaf_feats, leaf_mask)
+                child_priors = np.array(
+                    [full_p[game.action_to_index(a)] for a in leaf_actions],
+                )
                 cp_sum = child_priors.sum()
                 if cp_sum > 0:
                     child_priors /= cp_sum
@@ -211,9 +224,11 @@ def _run_mcts(
                 # Lazy: do NOT compute child states here
 
             # Evaluate the leaf position
-            if use_value:
-                leaf_state_feats = game.encode_state(leaf_state, leaf_player)
-                leaf_value = net.predict_value(leaf_state_feats)
+            if leaf_value_from_both is not None:
+                value = (leaf_value_from_both if leaf_player == perspective
+                         else -leaf_value_from_both)
+            elif use_value:
+                leaf_value = net.predict_value(leaf_feats)
                 value = leaf_value if leaf_player == perspective else -leaf_value
             else:
                 value = _random_rollout(
@@ -264,3 +279,72 @@ def alpha_mcts_choose(
         actions = game.legal_actions(state)
         return rng.choice(actions)
     return max(total, key=total.__getitem__)
+
+
+# ---------------------------------------------------------------------------
+#  MCTS policy — returns visit distribution for AlphaZero training
+# ---------------------------------------------------------------------------
+
+
+def alpha_mcts_policy(
+    state: Any,
+    game: GameInterface,
+    net: AlphaNet,
+    player: int,
+    config: MCTSConfig,
+    rng: random.Random,
+) -> tuple[np.ndarray, Any]:
+    """MCTS search returning *(policy_target, action)* for training.
+
+    ``policy_target`` is an ``(action_space_size,)`` distribution derived
+    from aggregated visit counts (temperature-adjusted via
+    ``config.visit_temp``).  ``action`` is sampled from that distribution.
+    """
+    total: dict[Any, float] = {}
+    for _ in range(config.determinizations):
+        det = game.determinize(state, player, rng)
+        rollout_rng = random.Random(rng.randrange(1 << 30))
+        visits = _run_mcts(det, game, net, player, config, rollout_rng)
+        for act, cnt in visits.items():
+            total[act] = total.get(act, 0.0) + cnt
+
+    action_space = game.action_space_size
+
+    if not total:
+        actions = game.legal_actions(state)
+        pi = np.zeros(action_space, dtype=np.float64)
+        for a in actions:
+            pi[game.action_to_index(a)] = 1.0 / len(actions)
+        return pi, rng.choice(actions)
+
+    # Build raw visit counts in action-space indices
+    raw = np.zeros(action_space, dtype=np.float64)
+    idx_to_action: dict[int, Any] = {}
+    for act, cnt in total.items():
+        idx = game.action_to_index(act)
+        raw[idx] = cnt
+        idx_to_action[idx] = act
+
+    # Temperature-adjusted distribution  (π_a ∝ N(a)^{1/τ})
+    nonzero = raw > 0
+    pi = np.zeros(action_space, dtype=np.float64)
+    temp = config.visit_temp
+    if temp > 0 and nonzero.any():
+        pi[nonzero] = raw[nonzero] ** (1.0 / temp)
+    elif nonzero.any():
+        # τ → 0: deterministic (pick most-visited)
+        pi[np.argmax(raw)] = 1.0
+
+    total_pi = pi.sum()
+    if total_pi > 0:
+        pi /= total_pi
+
+    # Sample action from distribution
+    legal_indices = [i for i in idx_to_action if pi[i] > 0]
+    if legal_indices:
+        weights = [pi[i] for i in legal_indices]
+        chosen_idx = rng.choices(legal_indices, weights=weights, k=1)[0]
+    else:
+        chosen_idx = rng.choice(list(idx_to_action.keys()))
+
+    return pi, idx_to_action[chosen_idx]

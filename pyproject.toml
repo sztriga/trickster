@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trickster"
-version = "0.1.0"
-description = "Simple 2-player color trick card game with self-play training and a small Tk GUI."
+version = "0.2.0"
+description = "Hungarian card game framework with AlphaZero MCTS training and React UI."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["fastapi", "uvicorn"]
+dependencies = ["fastapi", "uvicorn", "numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest==8.3.4"]

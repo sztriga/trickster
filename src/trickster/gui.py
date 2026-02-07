@@ -233,8 +233,52 @@ class UltiCardApp(tk.Tk):
     def _build_train_tab(self) -> None:
         root = self.train_tab
 
-        # -- Row 1: Architecture + Method side by side --
-        row1 = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
+        # -- Method selector --
+        method_row = ttk.Frame(root, padding=(PAD, PAD, PAD, 0))
+        method_row.pack(fill="x")
+        ttk.Label(method_row, text="Method").pack(side="left", padx=(0, 8))
+        self.seg_method = SegmentedControl(
+            method_row, ["Direct", "AlphaZero"], command=self._on_method_change,
+        )
+        self.seg_method.pack(side="left")
+
+        # -- Switchable parameter container --
+        self._param_container = ttk.Frame(root)
+        self._param_container.pack(fill="x")
+        self._direct_frame = ttk.Frame(self._param_container)
+        self._az_frame = ttk.Frame(self._param_container)
+        self._build_direct_panel()
+        self._build_az_panel()
+        self._direct_frame.pack(fill="x")  # default visible
+
+        # -- Start button --
+        btn_row = ttk.Frame(root, padding=(PAD, 8, PAD, 0))
+        btn_row.pack(fill="x")
+        self.btn_train = AccentButton(btn_row, text="Start training", command=self._start_training)
+        self.btn_train.pack(anchor="w")
+
+        # -- Status + progress --
+        self.lbl_train_status = ttk.Label(root, text="Idle")
+        self.lbl_train_status.pack(anchor="w", padx=PAD, pady=(8, 0))
+        self.prog = OrangeProgressBar(root, height=12)
+        self.prog.pack(fill="x", padx=PAD, pady=(4, 6))
+
+        # -- Log --
+        log = ttk.Frame(root, padding=(PAD, 0, PAD, PAD))
+        log.pack(fill="both", expand=True)
+        self.txt_train = tk.Text(log, height=8, wrap="word")
+        sb = ttk.Scrollbar(log, orient="vertical", command=self.txt_train.yview)
+        self.txt_train.configure(yscrollcommand=sb.set)
+        self.txt_train.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.txt_train.configure(state="disabled")
+
+    # -- Direct self-play panel --
+
+    def _build_direct_panel(self) -> None:
+        root = self._direct_frame
+
+        row1 = ttk.Frame(root, padding=(PAD, 8, PAD, 0))
         row1.pack(fill="x")
 
         arch = ttk.LabelFrame(row1, text="Architecture", padding=(8, 4, 8, 6))
@@ -256,19 +300,13 @@ class UltiCardApp(tk.Tk):
         )
         self.cmb_activation.grid(row=1, column=2, sticky="w")
 
-        meth = ttk.LabelFrame(row1, text="Training Method", padding=(8, 4, 8, 6))
-        meth.grid(row=0, column=1, sticky="nw")
-
-        ttk.Label(meth, text="Direct self-play").pack(anchor="w")
-
-        self._direct_panel = ttk.Frame(meth)
+        eps = ttk.LabelFrame(row1, text="Exploration", padding=(8, 4, 8, 6))
+        eps.grid(row=0, column=1, sticky="nw")
         self.var_eps0 = tk.DoubleVar(value=0.2)
         self.var_eps1 = tk.DoubleVar(value=0.02)
-        self.ent_eps0 = _field(self._direct_panel, self.var_eps0, "Eps start", 0, 0)
-        self.ent_eps1 = _field(self._direct_panel, self.var_eps1, "Eps end", 0, 1)
-        self._direct_panel.pack(anchor="w", pady=(4, 0))
+        self.ent_eps0 = _field(eps, self.var_eps0, "Eps start", 0, 0)
+        self.ent_eps1 = _field(eps, self.var_eps1, "Eps end", 0, 1)
 
-        # -- Row 2: Parameters + Start button --
         row2 = ttk.Frame(root, padding=(PAD, 8, PAD, 0))
         row2.pack(fill="x")
 
@@ -282,27 +320,77 @@ class UltiCardApp(tk.Tk):
         self.ent_lr = _field(row2, self.var_lr, "LR", 0, 2)
         self.ent_l2 = _field(row2, self.var_l2, "L2", 0, 3)
 
-        self.btn_train = AccentButton(row2, text="Start training", command=self._start_training)
-        self.btn_train.grid(row=1, column=4, sticky="w", padx=(8, 0))
+    # -- AlphaZero panel --
 
-        # -- Status + progress --
-        self.lbl_train_status = ttk.Label(root, text="Idle")
-        self.lbl_train_status.pack(anchor="w", padx=PAD, pady=(8, 0))
-        self.prog = OrangeProgressBar(root, height=12)
-        self.prog.pack(fill="x", padx=PAD, pady=(4, 6))
+    def _build_az_panel(self) -> None:
+        root = self._az_frame
 
-        # -- Log --
-        log = ttk.Frame(root, padding=(PAD, 0, PAD, PAD))
-        log.pack(fill="both", expand=True)
-        self.txt_train = tk.Text(log, height=8, wrap="word")
-        sb = ttk.Scrollbar(log, orient="vertical", command=self.txt_train.yview)
-        self.txt_train.configure(yscrollcommand=sb.set)
-        self.txt_train.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.txt_train.insert("end", "Tip: For expert iteration training, use the CLI: python scripts/train.py --method expert\n")
-        self.txt_train.configure(state="disabled")
+        # Network settings
+        net_f = ttk.LabelFrame(root, text="Network", padding=(8, 4, 8, 6))
+        net_f.pack(fill="x", padx=PAD, pady=(8, 0))
 
-    # -- Dynamic panels --
+        self.var_az_body = tk.IntVar(value=128)
+        self.var_az_body_layers = tk.IntVar(value=2)
+        self.var_az_head = tk.IntVar(value=64)
+
+        self.ent_az_body = _field(net_f, self.var_az_body, "Body units", 0, 0)
+        self.ent_az_body_layers = _field(net_f, self.var_az_body_layers, "Body layers", 0, 1, width=4)
+        self.ent_az_head = _field(net_f, self.var_az_head, "Head units", 0, 2)
+
+        # Training + MCTS settings
+        train_f = ttk.LabelFrame(root, text="Training & Search", padding=(8, 4, 8, 6))
+        train_f.pack(fill="x", padx=PAD, pady=(8, 0))
+
+        self.var_az_iters = tk.IntVar(value=200)
+        self.var_az_gpi = tk.IntVar(value=40)
+        self.var_az_bootstrap = tk.IntVar(value=5000)
+        self.var_az_sims = tk.IntVar(value=50)
+        self.var_az_dets = tk.IntVar(value=4)
+        self.var_az_train_steps = tk.IntVar(value=100)
+        self.var_az_batch = tk.IntVar(value=32)
+        self.var_az_buffer = tk.IntVar(value=50000)
+
+        self.ent_az_iters = _field(train_f, self.var_az_iters, "Iterations", 0, 0)
+        self.ent_az_gpi = _field(train_f, self.var_az_gpi, "Games/iter", 0, 1)
+        self.ent_az_bootstrap = _field(train_f, self.var_az_bootstrap, "Bootstrap", 0, 2)
+        self.ent_az_sims = _field(train_f, self.var_az_sims, "Sims", 0, 3)
+        self.ent_az_dets = _field(train_f, self.var_az_dets, "Dets", 2, 0, width=4)
+        self.ent_az_train_steps = _field(train_f, self.var_az_train_steps, "Train steps", 2, 1)
+        self.ent_az_batch = _field(train_f, self.var_az_batch, "Batch", 2, 2, width=5)
+        self.ent_az_buffer = _field(train_f, self.var_az_buffer, "Buffer cap", 2, 3)
+
+        # Hyper-parameters + output name
+        hp = ttk.Frame(root, padding=(PAD, 8, PAD, 0))
+        hp.pack(fill="x")
+
+        self.var_az_lr = tk.DoubleVar(value=0.01)
+        self.var_az_l2 = tk.DoubleVar(value=1e-4)
+        self.var_az_seed = tk.IntVar(value=42)
+        self.var_az_name = tk.StringVar(value="AlphaZero")
+
+        self.ent_az_lr = _field(hp, self.var_az_lr, "LR", 0, 0)
+        self.ent_az_l2 = _field(hp, self.var_az_l2, "L2", 0, 1)
+        self.ent_az_seed = _field(hp, self.var_az_seed, "Seed", 0, 2)
+        self.ent_az_name = _field(hp, self.var_az_name, "Name", 0, 3, width=12)
+
+        # Collect all AZ entry widgets for enable/disable
+        self._az_entries = [
+            self.ent_az_body, self.ent_az_body_layers, self.ent_az_head,
+            self.ent_az_iters, self.ent_az_gpi, self.ent_az_bootstrap,
+            self.ent_az_sims, self.ent_az_dets, self.ent_az_train_steps,
+            self.ent_az_batch, self.ent_az_buffer,
+            self.ent_az_lr, self.ent_az_l2, self.ent_az_seed, self.ent_az_name,
+        ]
+
+    # -- Panel toggles --
+
+    def _on_method_change(self, method: str) -> None:
+        if method == "AlphaZero":
+            self._direct_frame.pack_forget()
+            self._az_frame.pack(fill="x")
+        else:
+            self._az_frame.pack_forget()
+            self._direct_frame.pack(fill="x")
 
     def _on_arch_change(self, arch: str) -> None:
         if arch == "MLP":
@@ -330,6 +418,7 @@ class UltiCardApp(tk.Tk):
 
     def _set_train_controls_enabled(self, enabled: bool) -> None:
         st = "normal" if enabled else "disabled"
+        self.seg_method.set_enabled(enabled)
         self.seg_arch.set_enabled(enabled)
         for w in (
             self.ent_hidden, self.ent_layers, self.cmb_activation,
@@ -337,6 +426,11 @@ class UltiCardApp(tk.Tk):
             self.ent_episodes, self.ent_seed,
             self.ent_lr, self.ent_l2,
         ):
+            try:
+                w.configure(state=st)
+            except tk.TclError:
+                pass
+        for w in self._az_entries:
             try:
                 w.configure(state=st)
             except tk.TclError:
@@ -349,9 +443,19 @@ class UltiCardApp(tk.Tk):
         self.txt_train.see("end")
         self.txt_train.configure(state="disabled")
 
+    # -- Start training (dispatch by method) --
+
     def _start_training(self) -> None:
         if self._train_thread is not None and self._train_thread.is_alive():
             return
+        if self.seg_method.get() == "AlphaZero":
+            self._start_az_training()
+        else:
+            self._start_direct_training()
+
+    # -- Direct self-play training --
+
+    def _start_direct_training(self) -> None:
         episodes = int(self.var_episodes.get())
         seed = int(self.var_seed.get())
         lr = float(self.var_lr.get())
@@ -400,6 +504,136 @@ class UltiCardApp(tk.Tk):
         self._train_thread = threading.Thread(target=worker, daemon=True)
         self._train_thread.start()
 
+    # -- AlphaZero training --
+
+    def _start_az_training(self) -> None:
+        iters = int(self.var_az_iters.get())
+        gpi = int(self.var_az_gpi.get())
+        sims = int(self.var_az_sims.get())
+        dets = int(self.var_az_dets.get())
+        bootstrap = int(self.var_az_bootstrap.get())
+        train_steps = int(self.var_az_train_steps.get())
+        batch_size = int(self.var_az_batch.get())
+        buffer_cap = int(self.var_az_buffer.get())
+        body_units = int(self.var_az_body.get())
+        body_layers = int(self.var_az_body_layers.get())
+        head_units = int(self.var_az_head.get())
+        lr = float(self.var_az_lr.get())
+        l2 = float(self.var_az_l2.get())
+        seed = int(self.var_az_seed.get())
+        name = str(self.var_az_name.get()).strip() or "AlphaZero"
+
+        self._set_train_controls_enabled(False)
+        self.prog.set_maximum(max(1, iters))
+        self.prog.set_value(0)
+        self.lbl_train_status.configure(text="AlphaZero training...")
+
+        self._append_train_log(
+            f"AlphaZero: {name}  iters={iters} gpi={gpi} "
+            f"sims={sims} dets={dets} bootstrap={bootstrap} lr={lr}"
+        )
+
+        def on_az_progress(stats):
+            self._train_queue.put(("az_progress", stats))
+
+        _p = dict(
+            iters=iters, gpi=gpi, sims=sims, dets=dets,
+            bootstrap=bootstrap, train_steps=train_steps,
+            batch_size=batch_size, buffer_cap=buffer_cap,
+            body_units=body_units, body_layers=body_layers,
+            head_units=head_units, lr=lr, l2=l2, seed=seed, name=name,
+        )
+
+        def worker():
+            try:
+                import pickle as _pkl
+                from trickster.games.snapszer.adapter import SnapszerGame as _SG
+                from trickster.mcts import MCTSConfig as _MC
+                from trickster.training.alpha_zero import train_alpha_zero as _train
+
+                p = _p
+                game = _SG()
+                mcts_config = _MC(
+                    simulations=p["sims"],
+                    determinizations=p["dets"],
+                    use_value_head=True,
+                    use_policy_priors=True,
+                    dirichlet_alpha=0.3,
+                    dirichlet_weight=0.25,
+                    visit_temp=1.0,
+                )
+
+                net, stats = _train(
+                    game=game,
+                    iterations=p["iters"],
+                    games_per_iter=p["gpi"],
+                    train_steps=p["train_steps"],
+                    mcts_config=mcts_config,
+                    body_units=p["body_units"],
+                    body_layers=p["body_layers"],
+                    head_units=p["head_units"],
+                    lr=p["lr"],
+                    l2=p["l2"],
+                    batch_size=p["batch_size"],
+                    buffer_capacity=p["buffer_cap"],
+                    bootstrap_games=p["bootstrap"],
+                    seed=p["seed"],
+                    on_progress=on_az_progress,
+                )
+
+                # Save model
+                save_dir = Path("models") / p["name"]
+                save_dir.mkdir(parents=True, exist_ok=True)
+                net_path = save_dir / "net.pkl"
+                with open(net_path, "wb") as f:
+                    _pkl.dump(net, f)
+
+                # Write spec.json so model appears in model listings
+                spec_data = {
+                    "game": "snapszer",
+                    "kind": "alphazero",
+                    "method": "alphazero",
+                    "params": {
+                        "body_layers": p["body_layers"],
+                        "body_units": p["body_units"],
+                        "head_units": p["head_units"],
+                    },
+                }
+                (save_dir / "spec.json").write_text(
+                    json.dumps(spec_data, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                # Write train_info.json
+                info = {
+                    "method": "alphazero",
+                    "seed": p["seed"],
+                    "lr": p["lr"],
+                    "l2": p["l2"],
+                    "iterations": p["iters"],
+                    "games_per_iter": p["gpi"],
+                    "total_games": stats.total_games,
+                    "total_samples": stats.total_samples,
+                    "bootstrap_games": p["bootstrap"],
+                    "sims": p["sims"],
+                    "dets": p["dets"],
+                    "train_steps": p["train_steps"],
+                    "batch_size": p["batch_size"],
+                    "buffer_capacity": p["buffer_cap"],
+                }
+                (save_dir / "train_info.json").write_text(
+                    json.dumps(info, indent=2) + "\n", encoding="utf-8",
+                )
+
+                self._train_queue.put(("az_done", (save_dir, stats)))
+            except Exception as e:
+                self._train_queue.put(("error", e))
+
+        self._train_thread = threading.Thread(target=worker, daemon=True)
+        self._train_thread.start()
+
+    # -- Queue polling --
+
     def _poll_train_queue(self) -> None:
         try:
             while True:
@@ -408,11 +642,32 @@ class UltiCardApp(tk.Tk):
                     done, _ = payload
                     self.prog.set_value(done)
                     self.lbl_train_status.configure(text=f"Training... {done}/{self.prog.maximum}")
+                elif kind == "az_progress":
+                    stats = payload
+                    self.prog.set_value(stats.iterations)
+                    phase = "bootstrap" if stats.phase == "bootstrap" else "AlphaZero"
+                    self.lbl_train_status.configure(
+                        text=f"Training ({phase})  iter {stats.iterations}/{self.prog.maximum}  "
+                             f"games={stats.total_games}  vmse={stats.last_value_mse:.4f}  "
+                             f"pce={stats.last_policy_ce:.4f}"
+                    )
                 elif kind == "done":
                     mdir2, _, stats = payload
                     self.prog.set_value(self.prog.maximum)
                     self.lbl_train_status.configure(text=f"Done. {mdir2}/latest.pkl")
                     self._append_train_log(f"Done: {stats.episodes} episodes")
+                    self._set_train_controls_enabled(True)
+                    self._refresh_all_model_dropdowns()
+                    self._refresh_models_list()
+                elif kind == "az_done":
+                    save_dir, stats = payload
+                    self.prog.set_value(self.prog.maximum)
+                    self.lbl_train_status.configure(text=f"Done. {save_dir}/net.pkl")
+                    self._append_train_log(
+                        f"AlphaZero done: {stats.total_games} games, "
+                        f"{stats.total_samples} samples  "
+                        f"vmse={stats.last_value_mse:.4f}  pce={stats.last_policy_ce:.4f}"
+                    )
                     self._set_train_controls_enabled(True)
                     self._refresh_all_model_dropdowns()
                     self._refresh_models_list()
@@ -745,7 +1000,15 @@ class UltiCardApp(tk.Tk):
         if train_info_path.exists():
             try:
                 ti = json.loads(train_info_path.read_text(encoding="utf-8"))
-                lines.append(f"Episodes: {ti.get('episodes', '?')}")
+                if ti.get("method") == "alphazero":
+                    lines.append(f"Iterations: {ti.get('iterations', '?')}")
+                    lines.append(f"Games/iter: {ti.get('games_per_iter', '?')}")
+                    lines.append(f"Total games: {ti.get('total_games', '?')}")
+                    lines.append(f"Total samples: {ti.get('total_samples', '?')}")
+                    lines.append(f"Bootstrap: {ti.get('bootstrap_games', '?')}")
+                    lines.append(f"Sims: {ti.get('sims', '?')}  Dets: {ti.get('dets', '?')}")
+                else:
+                    lines.append(f"Episodes: {ti.get('episodes', '?')}")
                 if "lr" in ti:
                     lines.append(f"LR: {ti['lr']}  L2: {ti.get('l2', '?')}")
                 if "seed" in ti:
@@ -754,7 +1017,13 @@ class UltiCardApp(tk.Tk):
                 pass
 
         has_latest = (d / "latest.pkl").exists()
-        lines.append(f"latest.pkl: {'yes' if has_latest else 'no'}")
+        has_net = (d / "net.pkl").exists()
+        if has_net:
+            lines.append(f"net.pkl: yes")
+        if has_latest:
+            lines.append(f"latest.pkl: yes")
+        if not has_net and not has_latest:
+            lines.append("No model file found")
 
         # Disk size
         total = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())

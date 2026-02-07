@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ import random
 
 from trickster.games.snapszer.agent import LearnedAgent
 from trickster.games.snapszer.cards import Card, Color
+from trickster.games.snapszer.adapter import SnapszerGame, SnapszerNode
 from trickster.games.snapszer.game import (
     can_close_talon,
     can_declare_marriage,
@@ -27,6 +29,8 @@ from trickster.games.snapszer.game import (
     play_trick,
     talon_size,
 )
+from trickster.mcts import MCTSConfig, alpha_mcts_choose
+from trickster.models.alpha_net import SharedAlphaNet
 from trickster.training.model_spec import list_model_dirs, model_label_from_dir
 from trickster.training.model_store import load_slot
 
@@ -58,10 +62,71 @@ class Session:
 
 _SESSIONS: dict[str, Session] = {}
 
+# ---------------------------------------------------------------------------
+#  AlphaZero MCTS agent
+# ---------------------------------------------------------------------------
+
+_ALPHA_NET_PATH = Path("models/AlphaZero/net.pkl")
+_ALPHA_LABEL = "AlphaZero (MCTS)"
+_ALPHA_EVAL_CONFIG = MCTSConfig(
+    simulations=50,
+    determinizations=6,
+    use_value_head=True,
+    use_policy_priors=True,
+    dirichlet_alpha=0.0,   # no noise at play time
+    visit_temp=0.1,        # near-greedy
+)
+_ALPHA_GAME = SnapszerGame()
+
+# Cache the loaded net so we don't reload every move
+_alpha_net_cache: dict[str, SharedAlphaNet] = {}
+
+
+def _load_alpha_net() -> Optional[SharedAlphaNet]:
+    """Load the SharedAlphaNet for MCTS play (cached)."""
+    if not _ALPHA_NET_PATH.exists():
+        return None
+    cache_key = str(_ALPHA_NET_PATH)
+    if cache_key not in _alpha_net_cache:
+        with open(_ALPHA_NET_PATH, "rb") as f:
+            _alpha_net_cache[cache_key] = pickle.load(f)  # noqa: S301
+    return _alpha_net_cache[cache_key]
+
+
+def _is_alpha_model(label: str) -> bool:
+    return label == _ALPHA_LABEL
+
+
+def _alpha_choose_action(
+    gs: object,
+    pending_lead: Optional[Card],
+    ai_player: int,
+    rng: random.Random,
+) -> Any:
+    """Use MCTS search to pick a move for the AlphaZero agent."""
+    net = _load_alpha_net()
+    if net is None:
+        raise HTTPException(status_code=500, detail="AlphaZero net not found")
+    node = SnapszerNode(
+        gs=gs, pending_lead=pending_lead,
+        known_voids=(frozenset(), frozenset()),
+    )
+    actions = _ALPHA_GAME.legal_actions(node)
+    if len(actions) <= 1:
+        return actions[0]
+    return alpha_mcts_choose(
+        node, _ALPHA_GAME, net, ai_player, _ALPHA_EVAL_CONFIG, rng,
+    )
+
+
+# ---------------------------------------------------------------------------
+#  Legacy (direct-trained) model support
+# ---------------------------------------------------------------------------
+
 
 def _load_policy_by_label(label: str) -> Optional[Any]:
     """Load a trained policy by its GUI label."""
-    if not label:
+    if not label or _is_alpha_model(label):
         return None
     dirs = list_model_dirs(root="models")
     by_label = {model_label_from_dir(d): d for d in dirs}
@@ -76,16 +141,12 @@ def _load_policy_by_label(label: str) -> Optional[Any]:
 def _ai_agent(policy, *, seed: int) -> Optional[LearnedAgent]:
     if policy is None:
         return None
-    import random as _random
-
-    return LearnedAgent(policy.lead_model, policy.follow_model, _random.Random(seed), epsilon=0.0)
+    return LearnedAgent(policy.lead_model, policy.follow_model, random.Random(seed), epsilon=0.0)
 
 
 def _random_choice(legal):
-    import random as _random
-
     lst = list(legal)
-    return _random.choice(lst)
+    return random.choice(lst)
 
 
 def _public_state(sess: Session) -> dict[str, Any]:
@@ -148,10 +209,6 @@ def _public_state(sess: Session) -> dict[str, Any]:
 
 
 def _finalize_deal(sess: Session) -> str:
-    """
-    Compute deal winner + awarded game points and update session match_points once.
-    Returns a user-facing prompt.
-    """
     if sess.deal_over:
         w = sess.last_award.get("winner") if sess.last_award else None
         return "Deal over." if w is None else ("Deal over: you win." if w == 0 else "Deal over: AI wins.")
@@ -176,14 +233,20 @@ def _advance_ai(sess: Session) -> str:
     """
     Run AI moves until it's human's turn/response, terminal,
     or until a trick completes (so the UI can show the two cards briefly).
-    Returns a short prompt string.
     """
     st = sess.state
-    policy = _load_policy_by_label(sess.model_label)
-    # Deterministic per-session AI RNG (stable across API calls for same deal).
-    ai_seed = int(sess.seed) ^ 0x51F15E
+    use_alpha = _is_alpha_model(sess.model_label)
 
-    ai = _ai_agent(policy, seed=ai_seed)
+    # Deterministic per-session AI RNG
+    ai_seed = int(sess.seed) ^ 0x51F15E
+    ai_rng = random.Random(ai_seed + st.trick_no * 7)
+
+    if not use_alpha:
+        policy = _load_policy_by_label(sess.model_label)
+        ai = _ai_agent(policy, seed=ai_seed)
+    else:
+        policy = None
+        ai = None
 
     sess.needs_continue = False
 
@@ -195,67 +258,68 @@ def _advance_ai(sess: Session) -> str:
         responder = 1 - leader
 
         if sess.pending_lead is None:
-            # leader must play
             if leader == 1:
-                # Heuristic: exchanging trump jack is always beneficial in our current rule set.
-                if can_exchange_trump_jack(st, 1):
-                    exchange_trump_jack(st, 1)
-                # Learned takarás: compare "close now" vs best lead card using the lead model.
-                can_close = can_close_talon(st, 1)
-                lead_legal_pre = legal_actions(st, leader, None)
-                trump_up = st.trump_card if st.trump_upcard_visible else None
-                if ai is not None and can_close:
-                    do_close, _best_card = ai.choose_lead_or_close_talon(
-                        st.hands[leader],
-                        lead_legal_pre,
-                        can_close_talon=can_close,
-                        draw_pile_size=len(st.draw_pile),
-                        captured_self=st.captured[leader],
-                        captured_opp=st.captured[responder],
-                        trump_color=st.trump_color,
-                        trump_upcard=trump_up,
-                    )
-                    if do_close:
+                if use_alpha:
+                    action = _alpha_choose_action(st, None, 1, ai_rng)
+                    if action == "close_talon":
                         close_talon(st, 1)
-                lead_legal = legal_actions(st, leader, None)
-                lead = (
-                    ai.choose_lead(
-                        st.hands[leader],
-                        lead_legal,
+                        action = _alpha_choose_action(st, None, 1, ai_rng)
+                    sess.pending_lead = action
+                else:
+                    # Legacy LearnedAgent path
+                    if can_exchange_trump_jack(st, 1):
+                        exchange_trump_jack(st, 1)
+                    can_close = can_close_talon(st, 1)
+                    lead_legal_pre = legal_actions(st, leader, None)
+                    trump_up = st.trump_card if st.trump_upcard_visible else None
+                    if ai is not None and can_close:
+                        do_close, _best_card = ai.choose_lead_or_close_talon(
+                            st.hands[leader], lead_legal_pre,
+                            can_close_talon=can_close,
+                            draw_pile_size=len(st.draw_pile),
+                            captured_self=st.captured[leader],
+                            captured_opp=st.captured[responder],
+                            trump_color=st.trump_color, trump_upcard=trump_up,
+                        )
+                        if do_close:
+                            close_talon(st, 1)
+                    lead_legal = legal_actions(st, leader, None)
+                    lead = (
+                        ai.choose_lead(
+                            st.hands[leader], lead_legal,
+                            draw_pile_size=len(st.draw_pile),
+                            captured_self=st.captured[leader],
+                            captured_opp=st.captured[responder],
+                            trump_color=st.trump_color,
+                            trump_upcard=st.trump_card if st.trump_upcard_visible else None,
+                        )
+                        if ai is not None
+                        else _random_choice(lead_legal)
+                    )
+                    sess.pending_lead = lead
+                return "AI led. Pick your response."
+            return "Your turn: lead a card."
+
+        lead = sess.pending_lead
+        if responder == 1:
+            if use_alpha:
+                resp = _alpha_choose_action(st, lead, 1, ai_rng)
+            else:
+                resp_legal = legal_actions(st, responder, lead)
+                resp = (
+                    ai.choose_follow(
+                        st.hands[responder], lead, resp_legal,
                         draw_pile_size=len(st.draw_pile),
-                        captured_self=st.captured[leader],
-                        captured_opp=st.captured[responder],
+                        captured_self=st.captured[responder],
+                        captured_opp=st.captured[leader],
                         trump_color=st.trump_color,
                         trump_upcard=st.trump_card if st.trump_upcard_visible else None,
                     )
                     if ai is not None
-                    else _random_choice(lead_legal)
+                    else _random_choice(resp_legal)
                 )
-                sess.pending_lead = lead
-                return "AI led. Pick your response."
-            return "Your turn: lead a card."
-
-        # responder must play
-        lead = sess.pending_lead
-        if responder == 1:
-            resp_legal = legal_actions(st, responder, lead)
-            resp = (
-                ai.choose_follow(
-                    st.hands[responder],
-                    lead,
-                    resp_legal,
-                    draw_pile_size=len(st.draw_pile),
-                    captured_self=st.captured[responder],
-                    captured_opp=st.captured[leader],
-                    trump_color=st.trump_color,
-                    trump_upcard=st.trump_card if st.trump_upcard_visible else None,
-                )
-                if ai is not None
-                else _random_choice(resp_legal)
-            )
             st, _ = play_trick(st, lead, resp)
             sess.pending_lead = None
-            # Stop after a completed trick so the UI can show it briefly.
             if is_terminal(st):
                 return _finalize_deal(sess)
             sess.needs_continue = True
@@ -266,7 +330,6 @@ def _advance_ai(sess: Session) -> str:
 
 app = FastAPI(title="Trickster API")
 
-# Dev-friendly CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -275,26 +338,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve card images directly from the Python package folder
 CARDS_DIR = Path(__file__).resolve().parents[2] / "src" / "trickster" / "card_graphics"
 app.mount("/cards", StaticFiles(directory=str(CARDS_DIR)), name="cards")
 
 
 @app.get("/api/models")
 def list_models() -> list[str]:
-    return sorted([model_label_from_dir(d) for d in list_model_dirs(root="models")])
+    labels = sorted([model_label_from_dir(d) for d in list_model_dirs(root="models")])
+    if _ALPHA_NET_PATH.exists() and _ALPHA_LABEL not in labels:
+        labels.append(_ALPHA_LABEL)
+    return labels
 
 
 @app.post("/api/new")
 def new_game(payload: dict[str, Any]) -> dict[str, Any]:
-    # If no seed is provided, default to a random one.
     if "seed" in payload and payload.get("seed", None) is not None and str(payload.get("seed")).strip() != "":
         seed = int(payload["seed"])
     else:
         seed = random.randint(0, 2_147_483_647)
     model_label = str(payload.get("modelLabel", "") or "")
     gid = str(uuid.uuid4())
-    # Random starting leader (deterministic if seed is set).
     starting = random.Random(int(seed)).randrange(2)
     st = deal(seed=seed, starting_leader=starting)
     sess = Session(state=st, pending_lead=None, model_label=model_label, created_at=time.time(), needs_continue=False)
@@ -313,9 +376,6 @@ def new_game(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/api/new_deal")
 def new_deal(payload: dict[str, Any]) -> dict[str, Any]:
-    """
-    Start a new deal within the same match (keeps matchPoints).
-    """
     game_id = str(payload.get("gameId", "") or "")
     sess = _SESSIONS.get(game_id)
     if sess is None:
@@ -347,7 +407,6 @@ def get_state(game_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="Unknown gameId")
     out = _public_state(sess)
     out["gameId"] = game_id
-    # Read-only: do not auto-advance. The frontend should call /api/continue to advance.
     if sess.deal_over:
         out["prompt"] = "Deal over."
         return out
@@ -397,7 +456,7 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
 
     if typ == "close_talon":
         if not (sess.pending_lead is None and st.leader == 0 and can_close_talon(st, 0)):
-            raise HTTPException(status_code=400, detail="Takarás not allowed now.")
+            raise HTTPException(status_code=400, detail="Takaras not allowed now.")
         close_talon(st, 0)
         out = _public_state(sess)
         out["gameId"] = game_id
@@ -429,7 +488,6 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
         try:
             prompt = _advance_ai(sess)
         except ValueError as e:
-            # Convert game-rule violations into client errors rather than 500s.
             raise HTTPException(status_code=400, detail=str(e))
         out = _public_state(sess)
         out["gameId"] = game_id
@@ -440,18 +498,15 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Unknown action type")
 
     card = _card_from_json(payload.get("card") or {})
-
     leader = st.leader
     responder = 1 - leader
 
     if sess.pending_lead is None:
-        # Human must be leader
         if leader != 0:
             raise HTTPException(status_code=400, detail="Not your turn to lead.")
         legal = set(legal_actions(st, 0, None))
         if card not in legal:
             raise HTTPException(status_code=400, detail="Illegal lead card.")
-        # If a marriage was declared, the leader must lead the King or Queen of that suit.
         if getattr(st, "pending_marriage", None) is not None:
             p, suit, _pts = st.pending_marriage
             if int(p) == 0:
@@ -462,11 +517,9 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
                         detail="After declaring a marriage you must lead the King or Queen of that suit.",
                     )
         sess.pending_lead = card
-        # Let AI respond, but stop if the trick completes.
         try:
             prompt = _advance_ai(sess)
         except ValueError as e:
-            # Convert game-rule violations into client errors rather than 500s.
             sess.pending_lead = None
             raise HTTPException(status_code=400, detail=str(e))
         out = _public_state(sess)
@@ -474,7 +527,6 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
         out["prompt"] = prompt
         return out
     else:
-        # Human must be responder
         if responder != 0:
             raise HTTPException(status_code=400, detail="Not your turn to respond.")
         lead = sess.pending_lead
@@ -484,7 +536,6 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
         st, _ = play_trick(st, lead, card)
         sess.pending_lead = None
 
-    # Trick completed by human response: pause before any further AI lead.
     if is_terminal(st):
         prompt = _finalize_deal(sess)
     else:
@@ -494,4 +545,3 @@ def action(payload: dict[str, Any]) -> dict[str, Any]:
     out["gameId"] = game_id
     out["prompt"] = prompt
     return out
-

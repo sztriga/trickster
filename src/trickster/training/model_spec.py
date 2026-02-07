@@ -95,6 +95,11 @@ def model_label_from_dir(d: Path) -> str:
             act = params.get("activation", "?")
             layers_str = f" L={layers}" if layers not in (1, "1", None) else ""
             return f"{d.name}  (mlp h={h}{layers_str} act={act}{tag})"
+        if k == "alphazero":
+            body = params.get("body_units", "?")
+            blayers = params.get("body_layers", "?")
+            head = params.get("head_units", "?")
+            return f"{d.name}  (alphazero {body}x{blayers} head={head})"
         return f"{d.name}  ({k}{tag})"
     except Exception:
         return d.name
