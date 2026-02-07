@@ -1,0 +1,10 @@
+{
+  "game": "snapszer",
+  "kind": "mlp",
+  "method": "expert",
+  "params": {
+    "activation": "relu",
+    "hidden_layers": 2,
+    "hidden_units": 128
+  }
+}

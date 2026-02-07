@@ -14,10 +14,6 @@ from trickster.training.eval import (
     evaluate_policies_parallel,
     evaluate_policy_vs_random,
     evaluate_policy_vs_random_parallel,
-    evaluate_policy_vs_random_mcts,
-    evaluate_policy_vs_random_mcts_parallel,
-    evaluate_head_to_head,
-    evaluate_head_to_head_parallel,
 )
 from trickster.training.model_store import load_slot, save_latest_and_prev, slot_exists
 from trickster.training.self_play import train_self_play
@@ -263,8 +259,7 @@ class UltiCardApp(tk.Tk):
         meth = ttk.LabelFrame(row1, text="Training Method", padding=(8, 4, 8, 6))
         meth.grid(row=0, column=1, sticky="nw")
 
-        self.seg_method = SegmentedControl(meth, ["Direct", "MCTS"], command=self._on_method_change)
-        self.seg_method.pack(anchor="w")
+        ttk.Label(meth, text="Direct self-play").pack(anchor="w")
 
         self._direct_panel = ttk.Frame(meth)
         self.var_eps0 = tk.DoubleVar(value=0.2)
@@ -272,16 +267,6 @@ class UltiCardApp(tk.Tk):
         self.ent_eps0 = _field(self._direct_panel, self.var_eps0, "Eps start", 0, 0)
         self.ent_eps1 = _field(self._direct_panel, self.var_eps1, "Eps end", 0, 1)
         self._direct_panel.pack(anchor="w", pady=(4, 0))
-
-        self._mcts_panel = ttk.Frame(meth)
-        self.var_mcts_sims = tk.IntVar(value=50)
-        self.var_mcts_dets = tk.IntVar(value=4)
-        self.var_mcts_c = tk.DoubleVar(value=1.4)
-        self.var_mcts_workers = tk.IntVar(value=1)
-        self.ent_mcts_sims = _field(self._mcts_panel, self.var_mcts_sims, "Sims", 0, 0)
-        self.ent_mcts_dets = _field(self._mcts_panel, self.var_mcts_dets, "Dets", 0, 1)
-        self.ent_mcts_c = _field(self._mcts_panel, self.var_mcts_c, "Explore c", 0, 2)
-        self.ent_mcts_workers = _field(self._mcts_panel, self.var_mcts_workers, "Workers", 0, 3, width=4)
 
         # -- Row 2: Parameters + Start button --
         row2 = ttk.Frame(root, padding=(PAD, 8, PAD, 0))
@@ -314,7 +299,7 @@ class UltiCardApp(tk.Tk):
         self.txt_train.configure(yscrollcommand=sb.set)
         self.txt_train.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.txt_train.insert("end", "Tip: MCTS training is much slower per episode -- consider 500-2000 episodes.\n")
+        self.txt_train.insert("end", "Tip: For expert iteration training, use the CLI: python scripts/train.py --method expert\n")
         self.txt_train.configure(state="disabled")
 
     # -- Dynamic panels --
@@ -329,17 +314,8 @@ class UltiCardApp(tk.Tk):
             if abs(float(self.var_lr.get()) - 0.01) < 1e-12:
                 self.var_lr.set(0.05)
 
-    def _on_method_change(self, method: str) -> None:
-        if method == "MCTS":
-            self._direct_panel.pack_forget()
-            self._mcts_panel.pack(anchor="w", pady=(4, 0))
-        else:
-            self._mcts_panel.pack_forget()
-            self._direct_panel.pack(anchor="w", pady=(4, 0))
-
     def _current_train_spec(self) -> ModelSpec:
         kind = self.seg_arch.get().lower()
-        method = self.seg_method.get().lower()
         if kind == "mlp":
             return ModelSpec(
                 kind="mlp",
@@ -348,18 +324,16 @@ class UltiCardApp(tk.Tk):
                     "hidden_layers": int(self.var_hidden_layers.get()),
                     "activation": str(self.var_activation.get()),
                 },
-                method=method,
+                method="direct",
             )
-        return ModelSpec(kind="linear", params={}, method=method)
+        return ModelSpec(kind="linear", params={}, method="direct")
 
     def _set_train_controls_enabled(self, enabled: bool) -> None:
         st = "normal" if enabled else "disabled"
         self.seg_arch.set_enabled(enabled)
-        self.seg_method.set_enabled(enabled)
         for w in (
             self.ent_hidden, self.ent_layers, self.cmb_activation,
             self.ent_eps0, self.ent_eps1,
-            self.ent_mcts_sims, self.ent_mcts_dets, self.ent_mcts_c, self.ent_mcts_workers,
             self.ent_episodes, self.ent_seed,
             self.ent_lr, self.ent_l2,
         ):
@@ -382,7 +356,6 @@ class UltiCardApp(tk.Tk):
         seed = int(self.var_seed.get())
         lr = float(self.var_lr.get())
         l2 = float(self.var_l2.get())
-        method = self.seg_method.get()
         spec = self._current_train_spec()
         mdir = model_dir(spec, root="models")
         write_spec(spec, root="models")
@@ -392,58 +365,33 @@ class UltiCardApp(tk.Tk):
         self.prog.set_value(0)
         self.lbl_train_status.configure(text="Training...")
 
-        if method == "MCTS":
-            self._append_train_log(
-                f"MCTS: {mdir.name}  ep={episodes} sims={self.var_mcts_sims.get()} "
-                f"dets={self.var_mcts_dets.get()} c={self.var_mcts_c.get()} lr={lr} l2={l2}"
-            )
-        else:
-            self._append_train_log(
-                f"Direct: {mdir.name}  ep={episodes} "
-                f"eps={self.var_eps0.get()}->{self.var_eps1.get()} lr={lr} l2={l2}"
-            )
+        self._append_train_log(
+            f"Direct: {mdir.name}  ep={episodes} "
+            f"eps={self.var_eps0.get()}->{self.var_eps1.get()} lr={lr} l2={l2}"
+        )
 
-        _progress_every = 10 if method == "MCTS" else 250
         _last_emit = [0]
 
         def on_progress(done, stats):
-            if done < _last_emit[0] + _progress_every and done < episodes:
+            if done < _last_emit[0] + 250 and done < episodes:
                 return
             _last_emit[0] = done
             self._train_queue.put(("progress", (done, stats)))
 
-        _method, _spec, _episodes = method, spec, episodes
+        _spec, _episodes = spec, episodes
         _seed, _lr, _l2, _mdir = seed, lr, l2, mdir
 
         def worker():
             try:
-                if _method == "MCTS":
-                    from trickster.games.snapszer.mcts_agent import MCTSConfig
-                    from trickster.training.mcts_self_play import train_mcts_self_play
-                    cfg = MCTSConfig(
-                        simulations=int(self.var_mcts_sims.get()),
-                        determinizations=int(self.var_mcts_dets.get()),
-                        c=float(self.var_mcts_c.get()),
-                    )
-                    _workers = max(1, int(self.var_mcts_workers.get()))
-                    policy, stats = train_mcts_self_play(
-                        spec=_spec, episodes=_episodes,
-                        mcts_config=cfg, seed=_seed, lr=_lr, l2=_l2,
-                        buffer_capacity=50_000, batch_size=128,
-                        updates_per_game=4, workers=_workers,
-                        on_progress=on_progress,
-                    )
-                else:
-                    policy, stats = train_self_play(
-                        spec=_spec, episodes=_episodes,
-                        seed=_seed, lr=_lr, l2=_l2,
-                        epsilon_start=float(self.var_eps0.get()),
-                        epsilon_end=float(self.var_eps1.get()),
-                        on_progress=on_progress,
-                    )
+                policy, stats = train_self_play(
+                    spec=_spec, episodes=_episodes,
+                    seed=_seed, lr=_lr, l2=_l2,
+                    epsilon_start=float(self.var_eps0.get()),
+                    epsilon_end=float(self.var_eps1.get()),
+                    on_progress=on_progress,
+                )
                 save_latest_and_prev(policy, models_dir=_mdir)
-                # Save training metadata.
-                info = {"episodes": stats.episodes, "method": _method.lower(), "seed": _seed, "lr": _lr, "l2": _l2}
+                info = {"episodes": stats.episodes, "method": "direct", "seed": _seed, "lr": _lr, "l2": _l2}
                 (_mdir / "train_info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
                 self._train_queue.put(("done", (_mdir, policy, stats)))
             except Exception as e:
@@ -604,35 +552,20 @@ class UltiCardApp(tk.Tk):
         workers = max(1, int(self.vr_var_workers.get()))
         label = self.vr_var_model.get()
 
-        use_mcts = False
-        try:
-            use_mcts = read_spec(mdir / "spec.json").method == "mcts"
-        except Exception:
-            pass
-
         self._set_eval_controls_enabled(False)
-        mode = "mcts" if use_mcts else "direct"
         self.lbl_vr_result.configure(text="")
-        self.eval_status.configure(text=f"Evaluating {label} vs random ({mode})...")
+        self.eval_status.configure(text=f"Evaluating {label} vs random...")
         self.eval_prog.set_maximum(1)
         self.eval_prog.set_value(0)
 
         def worker():
             try:
                 pol = load_slot("latest", models_dir=mdir)
-                if use_mcts:
-                    from trickster.games.snapszer.mcts_agent import MCTSConfig
-                    mcts_cfg = MCTSConfig(simulations=50, determinizations=4, c=1.4)
-                    if workers <= 1:
-                        st = evaluate_policy_vs_random_mcts(pol, games=games, seed=seed, mcts_config=mcts_cfg)
-                    else:
-                        st = evaluate_policy_vs_random_mcts_parallel(pol, games=games, seed=seed, workers=workers, mcts_config=mcts_cfg)
+                if workers <= 1:
+                    st = evaluate_policy_vs_random(pol, games=games, seed=seed)
                 else:
-                    if workers <= 1:
-                        st = evaluate_policy_vs_random(pol, games=games, seed=seed)
-                    else:
-                        st = evaluate_policy_vs_random_parallel(pol, games=games, seed=seed, workers=workers)
-                self._eval_queue.put(("vr_done", (label, mode, st)))
+                    st = evaluate_policy_vs_random_parallel(pol, games=games, seed=seed, workers=workers)
+                self._eval_queue.put(("vr_done", (label, st)))
             except Exception as e:
                 self._eval_queue.put(("eval_error", e))
 
@@ -658,27 +591,9 @@ class UltiCardApp(tk.Tk):
         workers = max(1, int(self.cmp_var_workers.get()))
         a_label, b_label = self.cmp_var_a.get(), self.cmp_var_b.get()
 
-        # Detect MCTS models.
-        from trickster.games.snapszer.mcts_agent import MCTSConfig
-        mcts_cfg_a: MCTSConfig | None = None
-        mcts_cfg_b: MCTSConfig | None = None
-        try:
-            if read_spec(a_dir / "spec.json").method == "mcts":
-                mcts_cfg_a = MCTSConfig(simulations=50, determinizations=4, c=1.4)
-        except Exception:
-            pass
-        try:
-            if read_spec(b_dir / "spec.json").method == "mcts":
-                mcts_cfg_b = MCTSConfig(simulations=50, determinizations=4, c=1.4)
-        except Exception:
-            pass
-
-        mode_a = "mcts" if mcts_cfg_a else "direct"
-        mode_b = "mcts" if mcts_cfg_b else "direct"
-
         self._set_eval_controls_enabled(False)
         self.lbl_compare_result.configure(text="")
-        self.eval_status.configure(text=f"Comparing A({mode_a}) vs B({mode_b})...")
+        self.eval_status.configure(text=f"Comparing A vs B...")
         self.eval_prog.set_maximum(1)
         self.eval_prog.set_value(0)
 
@@ -686,23 +601,11 @@ class UltiCardApp(tk.Tk):
             try:
                 pa = load_slot("latest", models_dir=a_dir)
                 pb = load_slot("latest", models_dir=b_dir)
-                if mcts_cfg_a is not None or mcts_cfg_b is not None:
-                    if workers <= 1:
-                        st = evaluate_head_to_head(
-                            pa, pb, games=games, seed=seed,
-                            mcts_config_a=mcts_cfg_a, mcts_config_b=mcts_cfg_b,
-                        )
-                    else:
-                        st = evaluate_head_to_head_parallel(
-                            pa, pb, games=games, seed=seed, workers=workers,
-                            mcts_config_a=mcts_cfg_a, mcts_config_b=mcts_cfg_b,
-                        )
+                if workers <= 1:
+                    st = evaluate_policies(pa, pb, games=games, seed=seed)
                 else:
-                    if workers <= 1:
-                        st = evaluate_policies(pa, pb, games=games, seed=seed)
-                    else:
-                        st = evaluate_policies_parallel(pa, pb, games=games, seed=seed, workers=workers)
-                self._eval_queue.put(("compare_done", (a_label, b_label, mode_a, mode_b, st)))
+                    st = evaluate_policies_parallel(pa, pb, games=games, seed=seed, workers=workers)
+                self._eval_queue.put(("compare_done", (a_label, b_label, st)))
             except Exception as e:
                 self._eval_queue.put(("eval_error", e))
 
@@ -716,26 +619,26 @@ class UltiCardApp(tk.Tk):
             while True:
                 kind, payload = self._eval_queue.get_nowait()
                 if kind == "vr_done":
-                    label, mode, stats = payload
+                    label, stats = payload
                     self.lbl_vr_result.configure(
                         text=f"Model {stats.a_points} pts vs Random {stats.b_points} pts  "
                              f"({stats.a_ppd:.2f} vs {stats.b_ppd:.2f} per deal, {stats.deals} deals)"
                     )
                     self._append_eval_log(
-                        f"{label} ({mode}): model={stats.a_points} random={stats.b_points} ppd={stats.a_ppd:.2f} deals={stats.deals}"
+                        f"{label}: model={stats.a_points} random={stats.b_points} ppd={stats.a_ppd:.2f} deals={stats.deals}"
                     )
                     self.eval_prog.set_value(1)
                     self.eval_status.configure(text="Done.")
                     self._set_eval_controls_enabled(True)
                 elif kind == "compare_done":
-                    a_label, b_label, mode_a, mode_b, stats = payload
+                    a_label, b_label, stats = payload
                     self.lbl_compare_result.configure(
                         text=f"A {stats.a_points} pts ({stats.a_ppd:.2f}/deal) | "
                              f"B {stats.b_points} pts ({stats.b_ppd:.2f}/deal)  "
                              f"({stats.deals} deals)"
                     )
                     self._append_eval_log(
-                        f"Compare: {a_label}({mode_a}) vs {b_label}({mode_b})  A={stats.a_points} B={stats.b_points} deals={stats.deals}"
+                        f"Compare: {a_label} vs {b_label}  A={stats.a_points} B={stats.b_points} deals={stats.deals}"
                     )
                     self.eval_prog.set_value(1)
                     self.eval_status.configure(text="Compare done.")

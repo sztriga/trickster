@@ -59,7 +59,8 @@ class Session:
 _SESSIONS: dict[str, Session] = {}
 
 
-def _load_policy_by_label(label: str):
+def _load_policy_by_label(label: str) -> Optional[Any]:
+    """Load a trained policy by its GUI label."""
     if not label:
         return None
     dirs = list_model_dirs(root="models")
@@ -180,7 +181,9 @@ def _advance_ai(sess: Session) -> str:
     st = sess.state
     policy = _load_policy_by_label(sess.model_label)
     # Deterministic per-session AI RNG (stable across API calls for same deal).
-    ai = _ai_agent(policy, seed=(int(sess.seed) ^ 0x51F15E))
+    ai_seed = int(sess.seed) ^ 0x51F15E
+
+    ai = _ai_agent(policy, seed=ai_seed)
 
     sess.needs_continue = False
 

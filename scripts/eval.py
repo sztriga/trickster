@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""CLI evaluation script — same interface as the GUI Evaluate tab.
+"""CLI evaluation script.
 
 Usage examples:
 
-  # Evaluate a model vs random (auto-detects MCTS)
-  python scripts/eval.py vs-random models/Direct --deals 2000 --workers 4
+  # Evaluate a model vs random
+  python scripts/eval.py vs-random models/Wolverine --deals 2000 --workers 4
 
-  # Head-to-head compare (auto-detects MCTS per side)
-  python scripts/eval.py compare models/Direct models/MCTS --deals 2000 --workers 4
+  # Head-to-head compare
+  python scripts/eval.py compare models/Wolverine models/Batman --deals 2000 --workers 4
 
   # List available models
   python scripts/eval.py list
@@ -23,28 +23,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from trickster.training.eval import (
     EvalStats,
-    evaluate_head_to_head,
-    evaluate_head_to_head_parallel,
     evaluate_policies,
     evaluate_policies_parallel,
     evaluate_policy_vs_random,
     evaluate_policy_vs_random_parallel,
-    evaluate_policy_vs_random_mcts,
-    evaluate_policy_vs_random_mcts_parallel,
 )
 from trickster.training.model_spec import list_model_dirs, model_label_from_dir, read_spec
 from trickster.training.model_store import load_slot, slot_exists
-
-
-def _detect_mcts(model_dir: Path):
-    """Return an MCTSConfig if the model was MCTS-trained, else None."""
-    try:
-        if read_spec(model_dir / "spec.json").method == "mcts":
-            from trickster.games.snapszer.mcts_agent import MCTSConfig
-            return MCTSConfig(simulations=50, determinizations=4, c=1.4)
-    except Exception:
-        pass
-    return None
 
 
 def _print_stats(label_a: str, label_b: str, stats: EvalStats) -> None:
@@ -72,25 +57,16 @@ def cmd_vs_random(args) -> int:
         print(f"Error: {model_dir}/latest.pkl not found")
         return 1
 
-    mcts_cfg = _detect_mcts(model_dir)
-    mode = "mcts" if mcts_cfg else "direct"
-    print(f"Evaluating {model_dir.name} ({mode}) vs random — {args.deals} deals, {args.workers} workers")
+    label = model_label_from_dir(model_dir)
+    print(f"Evaluating {label} vs random -- {args.deals} deals, {args.workers} workers")
 
     pol = load_slot("latest", models_dir=model_dir)
     t0 = time.perf_counter()
 
-    if mcts_cfg:
-        if args.workers <= 1:
-            stats = evaluate_policy_vs_random_mcts(pol, games=args.deals, seed=args.seed, mcts_config=mcts_cfg)
-        else:
-            stats = evaluate_policy_vs_random_mcts_parallel(
-                pol, games=args.deals, seed=args.seed, workers=args.workers, mcts_config=mcts_cfg,
-            )
+    if args.workers <= 1:
+        stats = evaluate_policy_vs_random(pol, games=args.deals, seed=args.seed)
     else:
-        if args.workers <= 1:
-            stats = evaluate_policy_vs_random(pol, games=args.deals, seed=args.seed)
-        else:
-            stats = evaluate_policy_vs_random_parallel(pol, games=args.deals, seed=args.seed, workers=args.workers)
+        stats = evaluate_policy_vs_random_parallel(pol, games=args.deals, seed=args.seed, workers=args.workers)
 
     elapsed = time.perf_counter() - t0
     print(f"Done in {elapsed:.1f}s")
@@ -108,34 +84,19 @@ def cmd_compare(args) -> int:
         print(f"Error: {b_dir}/latest.pkl not found")
         return 1
 
-    cfg_a = _detect_mcts(a_dir)
-    cfg_b = _detect_mcts(b_dir)
-    mode_a = "mcts" if cfg_a else "direct"
-    mode_b = "mcts" if cfg_b else "direct"
-
-    print(f"Comparing A={a_dir.name} ({mode_a}) vs B={b_dir.name} ({mode_b})")
+    a_label = model_label_from_dir(a_dir)
+    b_label = model_label_from_dir(b_dir)
+    print(f"Comparing A={a_label} vs B={b_label}")
     print(f"  {args.deals} deals, {args.workers} workers")
 
     pa = load_slot("latest", models_dir=a_dir)
     pb = load_slot("latest", models_dir=b_dir)
     t0 = time.perf_counter()
 
-    if cfg_a is not None or cfg_b is not None:
-        if args.workers <= 1:
-            stats = evaluate_head_to_head(
-                pa, pb, games=args.deals, seed=args.seed,
-                mcts_config_a=cfg_a, mcts_config_b=cfg_b,
-            )
-        else:
-            stats = evaluate_head_to_head_parallel(
-                pa, pb, games=args.deals, seed=args.seed, workers=args.workers,
-                mcts_config_a=cfg_a, mcts_config_b=cfg_b,
-            )
+    if args.workers <= 1:
+        stats = evaluate_policies(pa, pb, games=args.deals, seed=args.seed)
     else:
-        if args.workers <= 1:
-            stats = evaluate_policies(pa, pb, games=args.deals, seed=args.seed)
-        else:
-            stats = evaluate_policies_parallel(pa, pb, games=args.deals, seed=args.seed, workers=args.workers)
+        stats = evaluate_policies_parallel(pa, pb, games=args.deals, seed=args.seed, workers=args.workers)
 
     elapsed = time.perf_counter() - t0
     print(f"Done in {elapsed:.1f}s")
@@ -152,7 +113,7 @@ def main() -> int:
 
     # vs-random
     vr = sub.add_parser("vs-random", help="Evaluate model vs random opponent")
-    vr.add_argument("model", help="Path to model directory (e.g. models/Direct)")
+    vr.add_argument("model", help="Path to model directory (e.g. models/Wolverine)")
     vr.add_argument("--deals", type=int, default=2000)
     vr.add_argument("--seed", type=int, default=0)
     vr.add_argument("--workers", type=int, default=4)

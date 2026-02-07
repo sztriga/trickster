@@ -1,0 +1,10 @@
+{
+  "method": "expert",
+  "seed": 42,
+  "lr": 0.01,
+  "l2": 1e-06,
+  "iterations": 500,
+  "games_per_iter": 200,
+  "total_games": 100000,
+  "total_samples": 1410010
+}

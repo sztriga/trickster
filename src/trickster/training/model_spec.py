@@ -19,7 +19,7 @@ class ModelSpec:
     kind: str  # "linear" | "mlp"
     params: Dict[str, Any]
     game: str = "snapszer"  # which game this model is trained for
-    method: str = "direct"  # "direct" | "mcts"
+    method: str = "direct"  # "direct" | "expert"
 
     def canonical(self) -> Dict[str, Any]:
         # Normalize common fields for stable hashing
@@ -86,7 +86,7 @@ def model_label_from_dir(d: Path) -> str:
         k = canon["kind"]
         m = canon.get("method", "direct")
         params = canon["params"]
-        tag = f" {m}" if m != "direct" else ""
+        tag = f" {m}" if m not in ("direct",) else ""
         if k == "linear":
             return f"{d.name}  (linear{tag})"
         if k == "mlp":

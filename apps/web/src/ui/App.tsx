@@ -259,7 +259,7 @@ export function App() {
                   disabled={busy || !!state?.needsContinue || !!state?.dealOver || !state?.canExchangeTrumpJack}
                   title="If you have the trump Jack and the talon has at least 2 cards (including the upcard), you can swap it with the upcard. Not allowed after the upcard has been picked up."
                 >
-                  Exchange trump J
+                  Exchange trump
                 </button>
                 <button
                   className="btn btn-small"
