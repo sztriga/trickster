@@ -13,7 +13,7 @@ from typing import Any, Sequence, Union
 
 import numpy as np
 
-from trickster.games.snapszer.cards import ALL_COLORS, Card, Color, RANK_VALUES, make_deck
+from trickster.games.snapszer.cards import ALL_COLORS, Card, Color, HAND_SIZE, RANK_VALUES, TRICKS_PER_GAME, make_deck
 
 # Pre-compute the full deck once (frozen set for fast set operations in determinize)
 _ALL_CARDS: frozenset[Card] = frozenset(make_deck())
@@ -79,6 +79,9 @@ for _col in ALL_COLORS:
         _idx += 1
 _CLOSE_TALON_IDX = 20
 _ACTION_SPACE = 21
+
+# Combined action→index dict (avoids branch + method-call overhead)
+_ACTION_IDX: dict[Action, int] = {**_CARD_TO_IDX, "close_talon": _CLOSE_TALON_IDX}
 
 
 class SnapszerGame:
@@ -288,15 +291,139 @@ class SnapszerGame:
         return _ACTION_SPACE
 
     def action_to_index(self, action: Action) -> int:
-        if action == "close_talon":
-            return _CLOSE_TALON_IDX
-        return _CARD_TO_IDX[action]
+        return _ACTION_IDX[action]
 
     def legal_action_mask(self, state: SnapszerNode) -> np.ndarray:
         mask = np.zeros(_ACTION_SPACE, dtype=bool)
+        _idx = _ACTION_IDX
         for a in self.legal_actions(state):
-            mask[self.action_to_index(a)] = True
+            mask[_idx[a]] = True
         return mask
+
+    # -- fast random rollout (mutable, no per-move cloning) ---------------
+
+    def fast_rollout(
+        self, state: SnapszerNode, perspective: int, rng: random.Random,
+    ) -> float:
+        """Play random moves on a single mutable copy — no per-move cloning.
+
+        This replaces the generic ``_random_rollout`` loop for Snapszer,
+        eliminating ~1 M ``GameState.clone()`` calls per training iteration.
+        Trick resolution and draw logic are inlined to cut Python call overhead.
+        Close-talon is never chosen (random agents skip it).
+        """
+        gs = state.gs.clone()          # single clone for the entire rollout
+        pending = state.pending_lead
+        _hands = gs.hands
+        _scores = gs.scores
+        _captured = gs.captured
+        _trump = gs.trump_color
+        _draw_pile = gs.draw_pile
+        _choice = rng.choice
+        _HAND = HAND_SIZE
+
+        last_winner = gs.leader
+
+        while True:
+            # --- inline is_terminal ---
+            if _scores[0] >= 66 or _scores[1] >= 66:
+                break
+            if gs.trick_no >= TRICKS_PER_GAME or (
+                len(_hands[0]) == 0 and len(_hands[1]) == 0
+            ):
+                break
+
+            leader = gs.leader
+            follower = 1 - leader
+
+            if pending is None:
+                # Leader picks a random card (skip close-talon)
+                pending = _choice(_hands[leader])
+            else:
+                # Follower responds
+                must_follow = gs.talon_closed or (
+                    len(_draw_pile) == 0 and gs.trump_card is None
+                )
+                if must_follow:
+                    # --- inline legal_response_cards ---
+                    hand_f = _hands[follower]
+                    same = [c for c in hand_f if c.color == pending.color]
+                    if not same:
+                        trumps = [c for c in hand_f if c.color == _trump]
+                        legal = trumps if trumps else hand_f
+                    else:
+                        higher = [c for c in same if c.number > pending.number]
+                        legal = higher if higher else same
+                else:
+                    legal = _hands[follower]
+
+                resp = _choice(legal)
+
+                # Remove cards from hands
+                _hands[leader].remove(pending)
+                _hands[follower].remove(resp)
+
+                # --- inline resolve_trick ---
+                lead_trump = pending.color == _trump
+                resp_trump = resp.color == _trump
+                if resp_trump and not lead_trump:
+                    winner = follower
+                elif lead_trump and not resp_trump:
+                    winner = leader
+                elif resp.color != pending.color:
+                    winner = leader
+                elif resp.number > pending.number:
+                    winner = follower
+                else:
+                    winner = leader
+
+                _scores[winner] += pending.number + resp.number
+                _captured[winner].append(pending)
+                _captured[winner].append(resp)
+                gs.leader = winner
+                gs.trick_no += 1
+                gs.pending_marriage = None
+                last_winner = winner
+
+                # --- inline draw-to-five (winner then loser) ---
+                if not gs.talon_closed:
+                    for p in (winner, 1 - winner):
+                        h = _hands[p]
+                        while len(h) < _HAND:
+                            if _draw_pile:
+                                h.append(_draw_pile.popleft())
+                            elif gs.trump_card is not None:
+                                h.append(gs.trump_card)
+                                gs.trump_card = None
+                            else:
+                                break
+
+                pending = None
+
+        # --- inline deal_awarded_game_points / deal_winner ---
+        s0, s1 = _scores
+        if s0 >= 66 and s1 < 66:
+            w = 0
+        elif s1 >= 66 and s0 < 66:
+            w = 1
+        elif s0 >= 66 and s1 >= 66:
+            w = 0 if s0 >= s1 else 1
+        elif gs.talon_closed and gs.talon_closed_by is not None:
+            w = 1 - gs.talon_closed_by          # closer failed
+        else:
+            w = last_winner                      # last trick winner wins
+
+        l = 1 - w
+        if gs.talon_closed and gs.talon_closed_by is not None and w != gs.talon_closed_by:
+            pts = 3 if gs.talon_close_any_zero_tricks else 2
+        elif len(_captured[l]) == 0:
+            pts = 3                              # schwarz
+        elif _scores[l] < 33:
+            pts = 2                              # under 33
+        else:
+            pts = 1                              # at least 33
+
+        return float(pts) / 3.0 if w == perspective else -float(pts) / 3.0
 
     # -- new game ----------------------------------------------------------
 

@@ -407,6 +407,13 @@ _CARD_FLAT: dict[tuple[Color, int], int] = {
     for ri, n in enumerate(RANK_VALUES)
 }
 
+# Direct Card → flat index (avoids tuple creation in hot loops)
+_CARD_FLAT_OBJ: dict[Card, int] = {
+    Card(c, n): ci * _N_RANKS + ri
+    for ci, c in enumerate(ALL_COLORS)
+    for ri, n in enumerate(RANK_VALUES)
+}
+
 
 class FastEncoder:
     """Numpy-native batch encoder for lead / follow features.
@@ -546,6 +553,7 @@ class FastEncoder:
     def _fill_hand(self, x: np.ndarray, hand: Sequence[Card],
                    has_idx: np.ndarray, count_idx: np.ndarray,
                    max_idx: np.ndarray, size_idx: int) -> None:
+        _cf = _CARD_FLAT_OBJ
         counts = [0] * _N_COLORS
         maxns = [0] * _N_COLORS
         for c in hand:
@@ -553,7 +561,7 @@ class FastEncoder:
             counts[ci] += 1
             if c.number > maxns[ci]:
                 maxns[ci] = c.number
-            x[has_idx[_CARD_FLAT[(c.color, c.number)]]] = 1.0
+            x[has_idx[_cf[c]]] = 1.0
         for ci in range(_N_COLORS):
             x[count_idx[ci]] = float(counts[ci])
             x[max_idx[ci]] = float(maxns[ci]) * _INV_MAX_RANK
@@ -582,23 +590,24 @@ class FastEncoder:
         x[trump_up_present] = 1.0 if trump_upcard is not None else 0.0
         x[trump_up_number] = 0.0 if trump_upcard is None else float(trump_upcard.number) * _INV_MAX_RANK
 
+        _cf = _CARD_FLAT_OBJ
         for c in captured_self:
-            x[cap_self_has[_CARD_FLAT[(c.color, c.number)]]] = 1.0
+            x[cap_self_has[_cf[c]]] = 1.0
         x[cap_self_count] = float(len(captured_self)) / 20.0
         for c in captured_opp:
-            x[cap_opp_has[_CARD_FLAT[(c.color, c.number)]]] = 1.0
+            x[cap_opp_has[_cf[c]]] = 1.0
         x[cap_opp_count] = float(len(captured_opp)) / 20.0
 
         # Unseen = full deck - self_captured - opp_captured - hand - seen_extra
         seen = np.zeros(_N_COLORS * _N_RANKS, dtype=np.float64)
         for c in captured_self:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         for c in captured_opp:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         for c in hand:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         for c in seen_extra:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         unseen = 1.0 - seen
         x[unseen_has] = unseen
         if closed:
@@ -813,6 +822,7 @@ class AlphaEncoder:
         trump_upcard: Card | None,
     ) -> None:
         """Write state features into *x* (1-D or a single row of a 2-D array)."""
+        _cf = _CARD_FLAT_OBJ
         # Hand
         counts = [0] * _N_COLORS
         maxns = [0] * _N_COLORS
@@ -821,7 +831,7 @@ class AlphaEncoder:
             counts[ci] += 1
             if c.number > maxns[ci]:
                 maxns[ci] = c.number
-            x[self._s_hand_has[_CARD_FLAT[(c.color, c.number)]]] = 1.0
+            x[self._s_hand_has[_cf[c]]] = 1.0
         for ci in range(_N_COLORS):
             x[self._s_hand_count[ci]] = float(counts[ci])
             x[self._s_hand_max[ci]] = float(maxns[ci]) * _INV_MAX_RANK
@@ -835,22 +845,22 @@ class AlphaEncoder:
         x[self._s_trump_up_present] = 1.0 if trump_upcard is not None else 0.0
         x[self._s_trump_up_number] = 0.0 if trump_upcard is None else float(trump_upcard.number) * _INV_MAX_RANK
         for c in captured_self:
-            x[self._s_cap_self_has[_CARD_FLAT[(c.color, c.number)]]] = 1.0
+            x[self._s_cap_self_has[_cf[c]]] = 1.0
         x[self._s_cap_self_count] = float(len(captured_self)) / 20.0
         for c in captured_opp:
-            x[self._s_cap_opp_has[_CARD_FLAT[(c.color, c.number)]]] = 1.0
+            x[self._s_cap_opp_has[_cf[c]]] = 1.0
         x[self._s_cap_opp_count] = float(len(captured_opp)) / 20.0
 
         # Unseen
         seen = np.zeros(_N_COLORS * _N_RANKS, dtype=np.float64)
         for c in captured_self:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         for c in captured_opp:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         for c in hand:
-            seen[_CARD_FLAT[(c.color, c.number)]] = 1.0
+            seen[_cf[c]] = 1.0
         if pending_lead is not None:
-            seen[_CARD_FLAT[(pending_lead.color, pending_lead.number)]] = 1.0
+            seen[_cf[pending_lead]] = 1.0
         unseen = 1.0 - seen
         x[self._s_unseen_has] = unseen
         if closed:

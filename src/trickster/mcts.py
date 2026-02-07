@@ -90,7 +90,16 @@ def _random_rollout(
     perspective: int,
     rng: random.Random,
 ) -> float:
-    """Play random moves to terminal, return outcome for *perspective*."""
+    """Play random moves to terminal, return outcome for *perspective*.
+
+    If the game provides a ``fast_rollout`` method (e.g. Snapszer), it is
+    used instead of the generic Python loop — saving ~50% of MCTS time by
+    avoiding per-move state cloning and method-call overhead.
+    """
+    _fast = getattr(game, "fast_rollout", None)
+    if _fast is not None:
+        return _fast(state, perspective, rng)
+
     _is_terminal = game.is_terminal
     _legal = game.legal_actions
     _apply = game.apply
@@ -166,6 +175,9 @@ def _run_mcts(
     _game_legal = game.legal_actions
     _game_current = game.current_player
     _game_outcome = game.outcome
+    _game_encode = game.encode_state
+    _game_mask = game.legal_action_mask
+    _game_a2i = game.action_to_index
 
     for _ in range(config.simulations):
         # 1. Select
@@ -193,10 +205,10 @@ def _run_mcts(
             leaf_value_from_both = None
             leaf_feats = None
             if use_policy or use_value:
-                leaf_feats = game.encode_state(leaf_state, leaf_player)
+                leaf_feats = _game_encode(leaf_state, leaf_player)
 
             if use_policy:
-                leaf_mask = game.legal_action_mask(leaf_state)
+                leaf_mask = _game_mask(leaf_state)
                 if use_value:
                     # Combined forward — shared body computed once
                     leaf_value_from_both, full_p = net.predict_both(
@@ -205,7 +217,7 @@ def _run_mcts(
                 else:
                     full_p = net.predict_policy(leaf_feats, leaf_mask)
                 child_priors = np.array(
-                    [full_p[game.action_to_index(a)] for a in leaf_actions],
+                    [full_p[_game_a2i(a)] for a in leaf_actions],
                 )
                 cp_sum = child_priors.sum()
                 if cp_sum > 0:
