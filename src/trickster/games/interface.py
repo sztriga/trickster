@@ -57,6 +57,14 @@ class GameInterface(Protocol):
     #  Imperfect information
     # ------------------------------------------------------------------
 
+    def same_team(self, state: State, player_a: int, player_b: int) -> bool:
+        """Whether two players are on the same team in *state*.
+
+        Default: each player is their own team (2-player zero-sum).
+        Override for coalition games (e.g. Ulti defenders).
+        """
+        ...
+
     def determinize(self, state: State, player: int, rng: random.Random) -> State:
         """Sample a concrete state consistent with *player*'s observations.
 

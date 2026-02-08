@@ -167,6 +167,13 @@ def _run_mcts(
     node_states: dict[int, Any] = {id(root): state}
     # Pre-seed root children states are NOT computed here (lazy)
 
+    # Pre-compute ally set for 3-player coalition support
+    _same_team = game.same_team
+    perspective_allies = frozenset(
+        p for p in range(game.num_players)
+        if _same_team(state, p, perspective)
+    )
+
     c_puct = config.c_puct
     use_policy = config.use_policy_priors
     use_value = config.use_value_head
@@ -248,11 +255,11 @@ def _run_mcts(
                     rollout_rng or random.Random(),
                 )
 
-        # 4. Backpropagate
+        # 4. Backpropagate (coalition-aware: allies get +value)
         node: Optional[_Node] = leaf
         while node is not None:
             node.visits += 1
-            if node.player == perspective:
+            if node.player in perspective_allies:
                 node.value_sum += value
             else:
                 node.value_sum -= value

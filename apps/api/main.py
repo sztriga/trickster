@@ -335,6 +335,10 @@ app.add_middleware(
 CARDS_DIR = Path(__file__).resolve().parents[2] / "src" / "trickster" / "card_graphics"
 app.mount("/cards", StaticFiles(directory=str(CARDS_DIR)), name="cards")
 
+# Include Ulti router
+from apps.api.ulti import router as ulti_router
+app.include_router(ulti_router)
+
 
 @app.get("/api/models")
 def list_models() -> list[str]:

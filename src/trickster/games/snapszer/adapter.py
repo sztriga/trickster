@@ -198,6 +198,9 @@ class SnapszerGame:
             return float(pts) / 3.0
         return -float(pts) / 3.0
 
+    def same_team(self, state: SnapszerNode, player_a: int, player_b: int) -> bool:
+        return player_a == player_b  # 2-player, no teams
+
     # -- imperfect information ---------------------------------------------
 
     def determinize(
