@@ -66,12 +66,6 @@ export async function apiNewDeal(gameId: string, seed?: number | null): Promise<
   return (await res.json()) as GameState;
 }
 
-export async function apiGetState(gameId: string): Promise<GameState> {
-  const res = await fetch(`/api/state/${encodeURIComponent(gameId)}`);
-  if (!res.ok) throw new Error(await res.text());
-  return (await res.json()) as GameState;
-}
-
 export async function apiContinue(gameId: string): Promise<GameState> {
   const res = await fetch("/api/continue", {
     method: "POST",

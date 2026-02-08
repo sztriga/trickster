@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List
+from typing import List
 
 
 class Color(str, Enum):
@@ -43,7 +43,4 @@ def make_deck() -> List[Card]:
     return [Card(c, n) for c in ALL_COLORS for n in RANK_VALUES]
 
 
-def format_hand(hand: Iterable[Card]) -> str:
-    items = sorted(hand, key=lambda x: (x.color.value, x.number))
-    return " ".join(c.short() for c in items)
 

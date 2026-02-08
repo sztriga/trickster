@@ -13,7 +13,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import random
 
-from trickster.games.snapszer.agent import LearnedAgent
 from trickster.games.snapszer.cards import Card, Color
 from trickster.games.snapszer.adapter import SnapszerGame, SnapszerNode
 from trickster.games.snapszer.game import (
@@ -33,7 +32,6 @@ from trickster.games.snapszer.game import (
 from trickster.mcts import MCTSConfig, alpha_mcts_choose, _run_mcts
 from trickster.models.alpha_net import SharedAlphaNet
 from trickster.training.model_spec import list_model_dirs, model_label_from_dir
-from trickster.training.model_store import load_slot
 
 
 def _card_to_json(c: Card) -> dict[str, Any]:
@@ -89,24 +87,6 @@ def _refresh_label_map() -> None:
     for d in list_model_dirs(root="models"):
         label = model_label_from_dir(d)
         _label_to_dir[label] = d
-
-
-def _is_alpha_model(label: str) -> bool:
-    """Check if a model label corresponds to an AlphaZero model."""
-    if not _label_to_dir:
-        _refresh_label_map()
-    d = _label_to_dir.get(label)
-    if d is None:
-        return False
-    spec_path = d / "spec.json"
-    if not spec_path.exists():
-        return False
-    from trickster.training.model_spec import read_spec
-    try:
-        spec = read_spec(spec_path)
-        return spec.kind == "alphazero" and (d / "net.pkl").exists()
-    except Exception:
-        return False
 
 
 def _load_alpha_net(label: str = "") -> Optional[SharedAlphaNet]:
@@ -171,31 +151,6 @@ def _alpha_choose_action(
     return alpha_mcts_choose(
         node, _ALPHA_GAME, net, ai_player, cfg, rng,
     )
-
-
-# ---------------------------------------------------------------------------
-#  Legacy (direct-trained) model support
-# ---------------------------------------------------------------------------
-
-
-def _load_policy_by_label(label: str) -> Optional[Any]:
-    """Load a trained policy by its GUI label."""
-    if not label or _is_alpha_model(label):
-        return None
-    dirs = list_model_dirs(root="models")
-    by_label = {model_label_from_dir(d): d for d in dirs}
-    d = by_label.get(label)
-    if d is None:
-        return None
-    if not (d / "latest.pkl").exists():
-        return None
-    return load_slot("latest", models_dir=d)
-
-
-def _ai_agent(policy, *, seed: int) -> Optional[LearnedAgent]:
-    if policy is None:
-        return None
-    return LearnedAgent(policy.lead_model, policy.follow_model, random.Random(seed), epsilon=0.0)
 
 
 def _random_choice(legal):
@@ -309,18 +264,10 @@ def _advance_ai(sess: Session) -> str:
     or until a trick completes (so the UI can show the two cards briefly).
     """
     st = sess.state
-    use_alpha = _is_alpha_model(sess.model_label)
 
     # Deterministic per-session AI RNG
     ai_seed = int(sess.seed) ^ 0x51F15E
     ai_rng = random.Random(ai_seed + st.trick_no * 7)
-
-    if not use_alpha:
-        policy = _load_policy_by_label(sess.model_label)
-        ai = _ai_agent(policy, seed=ai_seed)
-    else:
-        policy = None
-        ai = None
 
     sess.needs_continue = False
     sess.ai_bubble = None  # clear previous bubble
@@ -336,77 +283,29 @@ def _advance_ai(sess: Session) -> str:
             if leader == 1:
                 bubbles: list[str] = []
 
-                # Exchange trump jack (always beneficial, both paths)
+                # Exchange trump jack (always beneficial)
                 if can_exchange_trump_jack(st, 1):
                     exchange_trump_jack(st, 1)
                     bubbles.append("Cserélek!")
 
-                if use_alpha:
-                    # Alpha path: MCTS decides close_talon, marriages,
-                    # and lead card.  Loop until we get a card action.
-                    while True:
-                        action = _alpha_choose_action(st, None, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label)
-                        if action == "close_talon":
-                            close_talon(st, 1)
-                            bubbles.append("Betakarok!")
-                            continue
-                        if isinstance(action, str) and action.startswith("marry_"):
-                            suit = Color(action[6:])
-                            pts = declare_marriage(st, 1, suit)
-                            bubbles.append("Van 40-em!" if pts == 40 else "Van 20-am!")
-                            if is_terminal(st):
-                                sess.ai_bubble = " ".join(bubbles) if bubbles else None
-                                return _finalize_deal(sess)
-                            continue
-                        break  # action is a card
-                    sess.pending_lead = action
-                else:
-                    # Legacy path: auto close + auto marriage + model lead
-                    can_close = can_close_talon(st, 1)
-                    lead_legal_pre = legal_actions(st, leader, None)
-                    trump_up = st.trump_card if st.trump_upcard_visible else None
-                    if ai is not None and can_close:
-                        do_close, _best_card = ai.choose_lead_or_close_talon(
-                            st.hands[leader], lead_legal_pre,
-                            can_close_talon=can_close,
-                            draw_pile_size=len(st.draw_pile),
-                            captured_self=st.captured[leader],
-                            captured_opp=st.captured[responder],
-                            trump_color=st.trump_color, trump_upcard=trump_up,
-                        )
-                        if do_close:
-                            close_talon(st, 1)
-                            bubbles.append("Betakarok!")
-
-                    # Auto-declare marriages (legacy agent can't learn this)
-                    for suit in Color:
-                        if can_declare_marriage(st, 1, suit):
-                            pts = declare_marriage(st, 1, suit)
-                            bubbles.append("Van 40-em!" if pts == 40 else "Van 20-am!")
-                            if is_terminal(st):
-                                sess.ai_bubble = " ".join(bubbles) if bubbles else None
-                                return _finalize_deal(sess)
-                            break
-
-                    lead_legal = legal_actions(st, leader, None)
-                    # Respect pending_marriage constraint
-                    if st.pending_marriage is not None:
-                        _p, m_suit, _pts = st.pending_marriage
-                        lead_legal = [c for c in lead_legal
-                                      if c.color == m_suit and c.number in (3, 4)]
-                    lead = (
-                        ai.choose_lead(
-                            st.hands[leader], lead_legal,
-                            draw_pile_size=len(st.draw_pile),
-                            captured_self=st.captured[leader],
-                            captured_opp=st.captured[responder],
-                            trump_color=st.trump_color,
-                            trump_upcard=st.trump_card if st.trump_upcard_visible else None,
-                        )
-                        if ai is not None
-                        else _random_choice(lead_legal)
-                    )
-                    sess.pending_lead = lead
+                # MCTS decides close_talon, marriages, and lead card.
+                # Loop until we get a card action.
+                while True:
+                    action = _alpha_choose_action(st, None, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label)
+                    if action == "close_talon":
+                        close_talon(st, 1)
+                        bubbles.append("Betakarok!")
+                        continue
+                    if isinstance(action, str) and action.startswith("marry_"):
+                        suit = Color(action[6:])
+                        pts = declare_marriage(st, 1, suit)
+                        bubbles.append("Van 40-em!" if pts == 40 else "Van 20-am!")
+                        if is_terminal(st):
+                            sess.ai_bubble = " ".join(bubbles) if bubbles else None
+                            return _finalize_deal(sess)
+                        continue
+                    break  # action is a card
+                sess.pending_lead = action
 
                 sess.ai_bubble = " ".join(bubbles) if bubbles else None
                 return "A gép kijátszott. Válaszolj!"
@@ -414,27 +313,11 @@ def _advance_ai(sess: Session) -> str:
 
         lead = sess.pending_lead
         if responder == 1:
-            if use_alpha:
-                resp = _alpha_choose_action(st, lead, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label)
-            else:
-                resp_legal = legal_actions(st, responder, lead)
-                resp = (
-                    ai.choose_follow(
-                        st.hands[responder], lead, resp_legal,
-                        draw_pile_size=len(st.draw_pile),
-                        captured_self=st.captured[responder],
-                        captured_opp=st.captured[leader],
-                        trump_color=st.trump_color,
-                        trump_upcard=st.trump_card if st.trump_upcard_visible else None,
-                    )
-                    if ai is not None
-                    else _random_choice(resp_legal)
-                )
+            resp = _alpha_choose_action(st, lead, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label)
             st, _ = play_trick(st, lead, resp)
             sess.pending_lead = None
             sess.needs_continue = True
             return "Ütés kész."
-            # If terminal, _finalize_deal happens on the next /api/continue
 
         return "Válaszolj a kijátszásra."
 

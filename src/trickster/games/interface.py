@@ -6,7 +6,7 @@ training, and evaluation code can be fully game-agnostic.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 import random
@@ -73,35 +73,8 @@ class GameInterface(Protocol):
         """Length of the state feature vector."""
         ...
 
-    @property
-    def action_dims(self) -> dict[str, int]:
-        """Feature dimensions per decision type.
-
-        E.g. ``{"lead": 138, "follow": 145}`` for Snapszer.
-        """
-        ...
-
-    def decision_type(self, state: State) -> str:
-        """Which policy head should act in this state.
-
-        E.g. ``"lead"`` or ``"follow"`` for Snapszer.
-        """
-        ...
-
     def encode_state(self, state: State, player: int) -> np.ndarray:
         """Encode observable state into a 1-D float array for the value head."""
-        ...
-
-    def encode_actions(
-        self,
-        state: State,
-        player: int,
-        actions: Sequence[Action],
-    ) -> np.ndarray:
-        """Encode *(state, action)* pairs into an ``(N, action_dim)`` array.
-
-        One row per legal action — used by the policy head.
-        """
         ...
 
     @property

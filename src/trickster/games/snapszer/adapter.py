@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Any, Sequence, Union
+from typing import Any, Union
 
 import numpy as np
 
@@ -268,16 +268,6 @@ class SnapszerGame:
     def state_dim(self) -> int:
         return self._enc.state_dim
 
-    @property
-    def action_dims(self) -> dict[str, int]:
-        return {
-            "lead": self._enc.lead_policy_dim,
-            "follow": self._enc.follow_policy_dim,
-        }
-
-    def decision_type(self, state: SnapszerNode) -> str:
-        return "follow" if state.pending_lead is not None else "lead"
-
     def encode_state(self, state: SnapszerNode, player: int) -> np.ndarray:
         gs = state.gs
         trump_up = gs.trump_card if gs.trump_upcard_visible else None
@@ -287,37 +277,6 @@ class SnapszerGame:
             draw_pile_size=len(gs.draw_pile),
             captured_self=gs.captured[player],
             captured_opp=gs.captured[1 - player],
-            trump_color=gs.trump_color,
-            trump_upcard=trump_up,
-        )
-
-    def encode_actions(
-        self,
-        state: SnapszerNode,
-        player: int,
-        actions: Sequence[Action],
-    ) -> np.ndarray:
-        gs = state.gs
-        trump_up = gs.trump_card if gs.trump_upcard_visible else None
-        cap_self = gs.captured[player]
-        cap_opp = gs.captured[1 - player]
-        if state.pending_lead is None:
-            return self._enc.encode_lead_policy(
-                hand=gs.hands[player],
-                actions=list(actions),
-                draw_pile_size=len(gs.draw_pile),
-                captured_self=cap_self,
-                captured_opp=cap_opp,
-                trump_color=gs.trump_color,
-                trump_upcard=trump_up,
-            )
-        return self._enc.encode_follow_policy(
-            hand=gs.hands[player],
-            lead_card=state.pending_lead,
-            actions=list(actions),
-            draw_pile_size=len(gs.draw_pile),
-            captured_self=cap_self,
-            captured_opp=cap_opp,
             trump_color=gs.trump_color,
             trump_upcard=trump_up,
         )

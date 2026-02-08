@@ -33,29 +33,11 @@ from trickster.games.snapszer.game import deal_awarded_game_points
 from trickster.mcts import MCTSConfig, alpha_mcts_choose
 from trickster.models.alpha_net import SharedAlphaNet, create_shared_alpha_net
 from trickster.training.alpha_zero import train_alpha_zero
-from trickster.training.self_play import train_self_play, save_policy, load_policy
-from trickster.training.policy import create_policy
-from trickster.training.model_spec import ModelSpec
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Tier definitions
 # ═══════════════════════════════════════════════════════════════════════
-
-@dataclass
-class DirectTier:
-    name: str
-    tag: str           # short label for logging
-    episodes: int
-    kind: str          # "linear" or "mlp"
-    hidden_units: int = 128
-    hidden_layers: int = 2
-    activation: str = "relu"
-    lr: float = 0.01
-    l2: float = 1e-4
-    seed: int = 42
-    description: str = ""
-
 
 @dataclass
 class AZTier:
@@ -83,18 +65,7 @@ class AZTier:
         return self.iters * self.gpi
 
 
-LADDER: list[DirectTier | AZTier] = [
-    # ── Tier 0: Direct baseline ──────────────────────────────────────
-    DirectTier(
-        name="T0-Direct",
-        tag="T0",
-        episodes=20_000,
-        kind="mlp",
-        hidden_units=128,
-        hidden_layers=2,
-        lr=0.01,
-        description="Direct self-play MLP baseline (20k episodes)",
-    ),
+LADDER: list[AZTier] = [
     # ── Tier 1: AZ Pawn — tiny net, very light search ────────────────
     AZTier(
         name="T1-Pawn",
@@ -221,35 +192,6 @@ LADDER: list[DirectTier | AZTier] = [
 #  Model registration (spec.json + train_info.json → visible in GUI)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _register_direct_model(
-    tier: DirectTier, model_dir: Path, train_time: float,
-) -> None:
-    spec = {
-        "game": "snapszer",
-        "kind": tier.kind,
-        "method": "direct",
-        "params": {
-            "hidden_units": tier.hidden_units,
-            "hidden_layers": tier.hidden_layers,
-            "activation": tier.activation,
-        } if tier.kind == "mlp" else {},
-    }
-    info = {
-        "method": "direct",
-        "episodes": tier.episodes,
-        "lr": tier.lr,
-        "l2": tier.l2,
-        "seed": tier.seed,
-        "train_time_s": round(train_time, 1),
-    }
-    (model_dir / "spec.json").write_text(
-        json.dumps(spec, indent=2, sort_keys=True) + "\n", encoding="utf-8",
-    )
-    (model_dir / "train_info.json").write_text(
-        json.dumps(info, indent=2) + "\n", encoding="utf-8",
-    )
-
-
 def _register_az_model(
     tier: AZTier, model_dir: Path, stats, train_time: float,
 ) -> None:
@@ -294,51 +236,6 @@ def _register_az_model(
 # ═══════════════════════════════════════════════════════════════════════
 #  Training
 # ═══════════════════════════════════════════════════════════════════════
-
-def train_direct_tier(tier: DirectTier, game: SnapszerGame) -> Path:
-    model_dir = Path("models") / tier.name
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    spec = ModelSpec(
-        kind=tier.kind,
-        params={
-            "hidden_units": tier.hidden_units,
-            "hidden_layers": tier.hidden_layers,
-            "activation": tier.activation,
-        } if tier.kind == "mlp" else {},
-        method="direct",
-    )
-
-    last_report = [0]
-
-    def on_progress(ep, stats):
-        if ep - last_report[0] >= 2000 or ep == tier.episodes:
-            last_report[0] = ep
-            pct = ep / tier.episodes * 100
-            print(
-                f"    {ep:>6d}/{tier.episodes} ({pct:4.0f}%)  "
-                f"p0_wr={stats.winrate_p0:.2f}",
-                flush=True,
-            )
-
-    t0 = time.perf_counter()
-    policy, stats = train_self_play(
-        spec=spec,
-        episodes=tier.episodes,
-        seed=tier.seed,
-        lr=tier.lr,
-        l2=tier.l2,
-        epsilon_start=0.15,
-        epsilon_end=0.05,
-        on_progress=on_progress,
-    )
-    elapsed = time.perf_counter() - t0
-
-    save_policy(policy, model_dir / "latest.pkl")
-    _register_direct_model(tier, model_dir, elapsed)
-
-    return model_dir
-
 
 def train_az_tier(tier: AZTier, game: SnapszerGame) -> Path:
     model_dir = Path("models") / tier.name
@@ -411,66 +308,25 @@ def _load_agent(model_dir: Path, game: SnapszerGame):
     spec_data = json.loads(spec_path.read_text(encoding="utf-8"))
     kind = spec_data.get("kind", "")
 
-    if kind == "alphazero":
-        net_path = model_dir / "net.pkl"
-        with open(net_path, "rb") as f:
-            net = pickle.load(f)
-        eval_config = MCTSConfig(
-            simulations=50,
-            determinizations=4,
-            use_value_head=True,
-            use_policy_priors=True,
-            dirichlet_alpha=0.0,
-            visit_temp=0.1,
-        )
+    net_path = model_dir / "net.pkl"
+    with open(net_path, "rb") as f:
+        net = pickle.load(f)
+    eval_config = MCTSConfig(
+        simulations=50,
+        determinizations=4,
+        use_value_head=True,
+        use_policy_priors=True,
+        dirichlet_alpha=0.0,
+        visit_temp=0.1,
+    )
 
-        def az_agent(node, player, rng):
-            actions = game.legal_actions(node)
-            if len(actions) <= 1:
-                return actions[0]
-            return alpha_mcts_choose(node, game, net, player, eval_config, rng)
+    def az_agent(node, player, rng):
+        actions = game.legal_actions(node)
+        if len(actions) <= 1:
+            return actions[0]
+        return alpha_mcts_choose(node, game, net, player, eval_config, rng)
 
-        return az_agent, model_dir.name
-    else:
-        # Direct / policy-based
-        from trickster.games.snapszer.agent import LearnedAgent
-
-        policy = load_policy(model_dir / "latest.pkl")
-        agent = LearnedAgent(
-            lead_model=policy.lead_model,
-            follow_model=policy.follow_model,
-            rng=random.Random(0),
-            epsilon=0.0,  # no exploration at eval time
-        )
-
-        def direct_agent(node, player, rng):
-            actions = game.legal_actions(node)
-            if len(actions) <= 1:
-                return actions[0]
-            gs = node.gs
-            trump_up = gs.trump_card if gs.trump_upcard_visible else None
-            if node.pending_lead is None:
-                # Leader's turn
-                card_actions = [a for a in actions if a != "close_talon"]
-                return agent.choose_lead(
-                    gs.hands[player], card_actions,
-                    draw_pile_size=len(gs.draw_pile),
-                    captured_self=gs.captured[player],
-                    captured_opp=gs.captured[1 - player],
-                    trump_color=gs.trump_color,
-                    trump_upcard=trump_up,
-                )
-            else:
-                return agent.choose_follow(
-                    gs.hands[player], node.pending_lead, actions,
-                    draw_pile_size=len(gs.draw_pile),
-                    captured_self=gs.captured[player],
-                    captured_opp=gs.captured[1 - player],
-                    trump_color=gs.trump_color,
-                    trump_upcard=trump_up,
-                )
-
-        return direct_agent, model_dir.name
+    return az_agent, model_dir.name
 
 
 def _random_agent(node, game, rng):
@@ -518,13 +374,10 @@ def show_ladder() -> None:
     print("  Strength Ladder")
     print("  " + "─" * 60)
     for i, tier in enumerate(LADDER):
-        if isinstance(tier, DirectTier):
-            detail = f"Direct MLP {tier.hidden_units}x{tier.hidden_layers}, {tier.episodes:,} ep"
-        else:
-            detail = (
-                f"AZ {tier.body_units}x{tier.body_layers}/h{tier.head_units}, "
-                f"{tier.total_games:,}g, {tier.sims}s×{tier.dets}d"
-            )
+        detail = (
+            f"AZ {tier.body_units}x{tier.body_layers}/h{tier.head_units}, "
+            f"{tier.total_games:,}g, {tier.sims}s×{tier.dets}d"
+        )
         print(f"  {i}: {tier.name:<14s}  {detail}")
         print(f"     {tier.description}")
     print()
@@ -626,10 +479,7 @@ def _model_is_loadable(model_dir: Path) -> bool:
     except Exception:
         return False
 
-    kind = spec_data.get("kind", "")
-    if kind == "alphazero":
-        return (model_dir / "net.pkl").exists()
-    return (model_dir / "latest.pkl").exists()
+    return (model_dir / "net.pkl").exists()
 
 
 def main() -> None:
@@ -735,14 +585,10 @@ def main() -> None:
             print(f"┌─ Tier {i}: {tier.name} {'─' * (49 - len(tier.name))}")
             print(f"│  {tier.description}")
 
-            if isinstance(tier, DirectTier):
-                print(f"│  MLP {tier.hidden_units}x{tier.hidden_layers} | "
-                      f"{tier.episodes:,} episodes | lr={tier.lr}")
-            else:
-                print(f"│  Net {tier.body_units}x{tier.body_layers}/h{tier.head_units} | "
-                      f"{tier.total_games:,} games ({tier.iters} iters × {tier.gpi} gpi) | "
-                      f"{tier.sims}s×{tier.dets}d | "
-                      f"bootstrap={tier.bootstrap:,} | workers={tier.workers}")
+            print(f"│  Net {tier.body_units}x{tier.body_layers}/h{tier.head_units} | "
+                  f"{tier.total_games:,} games ({tier.iters} iters × {tier.gpi} gpi) | "
+                  f"{tier.sims}s×{tier.dets}d | "
+                  f"bootstrap={tier.bootstrap:,} | workers={tier.workers}")
             print("│")
 
             model_dir = Path("models") / tier.name
@@ -755,10 +601,7 @@ def main() -> None:
                 continue
 
             t0 = time.perf_counter()
-            if isinstance(tier, DirectTier):
-                d = train_direct_tier(tier, game)
-            else:
-                d = train_az_tier(tier, game)
+            d = train_az_tier(tier, game)
             elapsed = time.perf_counter() - t0
 
             trained_dirs.append(d)

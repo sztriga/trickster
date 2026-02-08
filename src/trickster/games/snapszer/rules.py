@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
 from trickster.games.snapszer.cards import Card, Color
 
@@ -12,10 +11,6 @@ class TrickResult:
     leader_card: Card
     responder_card: Card
     winner: int  # 0 or 1 (player index)
-
-
-def can_follow_color(hand: Sequence[Card], color: Color) -> bool:
-    return any(c.color == color for c in hand)
 
 
 def legal_response_cards(hand: Sequence[Card], lead: Card, *, must_follow: bool, trump: Color) -> List[Card]:
@@ -69,11 +64,4 @@ def resolve_trick(*, leader_idx: int, leader_card: Card, responder_card: Card, t
     if responder_card.number > leader_card.number:
         return TrickResult(leader_card=leader_card, responder_card=responder_card, winner=1 - leader_idx)
     return TrickResult(leader_card=leader_card, responder_card=responder_card, winner=leader_idx)
-
-
-def hand_color_counts(hand: Iterable[Card]) -> dict[Color, int]:
-    d: dict[Color, int] = defaultdict(int)
-    for c in hand:
-        d[c.color] += 1
-    return dict(d)
 
