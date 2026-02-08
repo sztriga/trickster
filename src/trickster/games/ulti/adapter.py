@@ -396,16 +396,19 @@ class UltiGame:
         Performs the full pre-play sequence automatically:
         1. Deal 10 cards each + 2-card talon.
         2. First bidder becomes soloist (simplified — no bidding).
-        3. Soloist picks up talon, randomly discards 2 cards.
+        3. Soloist picks up talon, discards 2 cards.
         4. Trump is chosen randomly from soloist's suits
            (10 % chance of Betli for variety).
 
         The ``starting_leader`` kwarg is interpreted as dealer index.
         ``training_mode`` can filter to specific contract types.
+        ``_discard_fn`` overrides the default random discard with a
+        callable ``(hand, betli, trump) -> [Card, Card]``.
         """
         rng = random.Random(seed)
         dealer = kwargs.get("starting_leader", 0) % NUM_PLAYERS
         training_mode = kwargs.get("training_mode", None)
+        discard_fn = kwargs.get("_discard_fn", None)
 
         gs, talon = deal(seed=seed, dealer=dealer)
         gs.training_mode = training_mode
@@ -429,8 +432,11 @@ class UltiGame:
             trump = rng.choice(suits_in_hand)
             set_contract(gs, soloist, trump=trump)
 
-        # Discard 2 cards (random)
-        discards = rng.sample(gs.hands[soloist], 2)
+        # Discard 2 cards — use provided heuristic or random
+        if discard_fn is not None:
+            discards = discard_fn(gs.hands[soloist], betli, gs.trump)
+        else:
+            discards = rng.sample(gs.hands[soloist], 2)
         discard_talon(gs, discards)
 
         # Declare all marriages before the play phase begins.
