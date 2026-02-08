@@ -12,6 +12,10 @@ Exploration is ensured by:
 - **Dirichlet noise** on root priors (``MCTSConfig.dirichlet_alpha``).
 - **Temperature** on visit counts (``MCTSConfig.visit_temp``), so
   the policy target is a soft distribution even when MCTS is strong.
+
+Parallel self-play is supported via ``num_workers`` — each iteration's
+games are distributed across worker processes using
+:class:`~concurrent.futures.ProcessPoolExecutor`.
 """
 
 from __future__ import annotations
@@ -25,6 +29,28 @@ import numpy as np
 from trickster.games.interface import GameInterface
 from trickster.mcts import MCTSConfig, alpha_mcts_policy
 from trickster.models.alpha_net import SharedAlphaNet, create_shared_alpha_net
+
+
+# ---------------------------------------------------------------------------
+#  Multiprocessing helpers (must be at module level for pickling)
+# ---------------------------------------------------------------------------
+
+_WORKER_GAME: GameInterface | None = None
+
+
+def _init_self_play_worker(game: GameInterface) -> None:
+    """Called once per worker process to set the game instance."""
+    global _WORKER_GAME
+    _WORKER_GAME = game
+
+
+def _play_game_in_worker(
+    args: tuple[SharedAlphaNet, MCTSConfig, int, int],
+) -> "list[AlphaZeroSample]":
+    """Worker entry-point — uses the pre-initialized game."""
+    net, config, game_seed, ep_idx = args
+    assert _WORKER_GAME is not None
+    return _play_one_game(_WORKER_GAME, net, config, game_seed, ep_idx)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +197,7 @@ def train_alpha_zero(
     bootstrap_games: int = 0,
     seed: int = 0,
     net: SharedAlphaNet | None = None,
+    num_workers: int = 1,
     on_progress: Optional[Callable[[AlphaZeroStats], None]] = None,
 ) -> tuple[SharedAlphaNet, AlphaZeroStats]:
     """Run AlphaZero training: MCTS self-play → train SharedAlphaNet.
@@ -197,6 +224,11 @@ def train_alpha_zero(
         signal before switching to pure AlphaZero (value-head) mode.
     net : SharedAlphaNet, optional
         Pass an existing net to continue training.
+    num_workers : int
+        Number of parallel processes for self-play.  ``1`` (default)
+        runs everything sequentially in the main process.  Values > 1
+        distribute games across worker processes — each worker receives
+        a snapshot of the latest network weights per iteration.
     on_progress : callable, optional
         Called after every iteration with an :class:`AlphaZeroStats`.
 
@@ -238,46 +270,78 @@ def train_alpha_zero(
     stats = AlphaZeroStats()
     replay_buffer: list[AlphaZeroSample] = []
 
-    for it in range(iterations):
-        games_so_far = it * games_per_iter
-        # Choose config: bootstrap (rollouts) vs full AlphaZero (value head)
-        if bootstrap_games > 0 and games_so_far < bootstrap_games:
-            iter_config = bootstrap_config
-            phase = "bootstrap"
-        else:
-            iter_config = mcts_config
-            phase = "alphazero"
+    # Set up process pool (created once, reused across iterations).
+    # The game object is set in each worker via the initializer so it
+    # is pickled only num_workers times.  The network weights (≈400 KB)
+    # are sent per-task so workers always use the latest parameters.
+    executor = None
+    if num_workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
 
-        # 1. Self-play with MCTS expert
-        new_samples: list[AlphaZeroSample] = []
-        for g in range(games_per_iter):
-            game_seed = seed + it * games_per_iter + g
-            samples = _play_one_game(
-                game, net, iter_config, game_seed,
-                it * games_per_iter + g,
-            )
-            new_samples.extend(samples)
-
-        # 2. Add to replay buffer (FIFO eviction)
-        replay_buffer.extend(new_samples)
-        if len(replay_buffer) > buffer_capacity:
-            replay_buffer = replay_buffer[-buffer_capacity:]
-
-        # 3. Train on buffer
-        vmse, pce = _train_on_buffer(
-            net, replay_buffer, rng, lr, l2, train_steps, batch_size,
+        executor = ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_self_play_worker,
+            initargs=(game,),
         )
 
-        # 4. Stats
-        stats.iterations = it + 1
-        stats.total_games += games_per_iter
-        stats.total_samples += len(new_samples)
-        stats.last_value_mse = vmse
-        stats.last_policy_ce = pce
-        stats.buffer_size = len(replay_buffer)
-        stats.phase = phase  # type: ignore[attr-defined]
+    try:
+        for it in range(iterations):
+            games_so_far = it * games_per_iter
+            # Choose config: bootstrap (rollouts) vs full AlphaZero (value head)
+            if bootstrap_games > 0 and games_so_far < bootstrap_games:
+                iter_config = bootstrap_config
+                phase = "bootstrap"
+            else:
+                iter_config = mcts_config
+                phase = "alphazero"
 
-        if on_progress is not None:
-            on_progress(stats)
+            # 1. Self-play with MCTS expert
+            new_samples: list[AlphaZeroSample] = []
+
+            if executor is not None:
+                # --- parallel self-play ---
+                tasks = [
+                    (net, iter_config,
+                     seed + it * games_per_iter + g,
+                     it * games_per_iter + g)
+                    for g in range(games_per_iter)
+                ]
+                for samples in executor.map(_play_game_in_worker, tasks):
+                    new_samples.extend(samples)
+            else:
+                # --- sequential self-play ---
+                for g in range(games_per_iter):
+                    game_seed = seed + it * games_per_iter + g
+                    samples = _play_one_game(
+                        game, net, iter_config, game_seed,
+                        it * games_per_iter + g,
+                    )
+                    new_samples.extend(samples)
+
+            # 2. Add to replay buffer (FIFO eviction)
+            replay_buffer.extend(new_samples)
+            if len(replay_buffer) > buffer_capacity:
+                replay_buffer = replay_buffer[-buffer_capacity:]
+
+            # 3. Train on buffer
+            vmse, pce = _train_on_buffer(
+                net, replay_buffer, rng, lr, l2, train_steps, batch_size,
+            )
+
+            # 4. Stats
+            stats.iterations = it + 1
+            stats.total_games += games_per_iter
+            stats.total_samples += len(new_samples)
+            stats.last_value_mse = vmse
+            stats.last_policy_ce = pce
+            stats.buffer_size = len(replay_buffer)
+            stats.phase = phase  # type: ignore[attr-defined]
+
+            if on_progress is not None:
+                on_progress(stats)
+
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     return net, stats

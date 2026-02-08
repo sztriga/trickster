@@ -21,10 +21,14 @@ from trickster.games.snapszer.features import get_alpha_encoder
 from trickster.games.snapszer.game import (
     GameState,
     can_close_talon,
+    can_declare_marriage,
+    can_exchange_trump_jack,
     close_talon,
     deal,
     deal_awarded_game_points,
     deal_winner,
+    declare_marriage,
+    exchange_trump_jack,
     is_terminal as _is_terminal,
     legal_actions as _legal_actions,
     play_trick,
@@ -67,7 +71,7 @@ class SnapszerNode:
 # ---------------------------------------------------------------------------
 
 
-# Card → index mapping: 20 cards (4 colors * 5 ranks) + 1 close_talon = 21
+# Card → index mapping: 20 cards + 1 close_talon + 4 marriages = 25
 _CARD_TO_IDX: dict[Card, int] = {}
 _IDX_TO_CARD: dict[int, Card] = {}
 _idx = 0
@@ -78,10 +82,25 @@ for _col in ALL_COLORS:
         _IDX_TO_CARD[_idx] = c
         _idx += 1
 _CLOSE_TALON_IDX = 20
-_ACTION_SPACE = 21
+
+# Marriage declaration actions: one per suit (indices 21-24)
+_MARRY_START_IDX = 21
+_MARRY_ACTIONS: dict[Color, str] = {}
+_MARRY_SUIT: dict[str, Color] = {}
+for _mi, _mc in enumerate(ALL_COLORS):
+    _ms = f"marry_{_mc.value}"
+    _MARRY_ACTIONS[_mc] = _ms
+    _MARRY_SUIT[_ms] = _mc
+
+_ACTION_SPACE = 25
 
 # Combined action→index dict (avoids branch + method-call overhead)
-_ACTION_IDX: dict[Action, int] = {**_CARD_TO_IDX, "close_talon": _CLOSE_TALON_IDX}
+_ACTION_IDX: dict[Action, int] = {
+    **_CARD_TO_IDX,
+    "close_talon": _CLOSE_TALON_IDX,
+}
+for _mi, _mc in enumerate(ALL_COLORS):
+    _ACTION_IDX[f"marry_{_mc.value}"] = _MARRY_START_IDX + _mi
 
 
 class SnapszerGame:
@@ -106,10 +125,19 @@ class SnapszerGame:
         if state.pending_lead is not None:
             # Follower's turn
             return _legal_actions(gs, 1 - gs.leader, state.pending_lead)
-        # Leader's turn — legal cards + optionally close_talon
-        actions: list[Action] = list(_legal_actions(gs, gs.leader, None))
-        if can_close_talon(gs, gs.leader):
+        leader = gs.leader
+        # If a marriage was declared, leader must lead K or Q of that suit.
+        if gs.pending_marriage is not None:
+            _p, suit, _pts = gs.pending_marriage
+            return [c for c in gs.hands[leader]
+                    if c.color == suit and c.number in (3, 4)]
+        # Normal leader turn: cards + optionally close_talon + marriages
+        actions: list[Action] = list(_legal_actions(gs, leader, None))
+        if can_close_talon(gs, leader):
             actions.append("close_talon")
+        for suit in ALL_COLORS:
+            if can_declare_marriage(gs, leader, suit):
+                actions.append(_MARRY_ACTIONS[suit])
         return actions
 
     def apply(self, state: SnapszerNode, action: Action) -> SnapszerNode:
@@ -119,6 +147,13 @@ class SnapszerGame:
         if action == "close_talon":
             new_gs = gs.clone()
             close_talon(new_gs, new_gs.leader)
+            return SnapszerNode(gs=new_gs, pending_lead=None, known_voids=voids)
+
+        # Marriage declaration
+        if isinstance(action, str) and action in _MARRY_SUIT:
+            suit = _MARRY_SUIT[action]
+            new_gs = gs.clone()
+            declare_marriage(new_gs, new_gs.leader, suit)
             return SnapszerNode(gs=new_gs, pending_lead=None, known_voids=voids)
 
         card: Card = action  # type: ignore[assignment]
@@ -147,6 +182,9 @@ class SnapszerGame:
 
         new_gs = gs.clone()
         new_gs, _ = play_trick(new_gs, state.pending_lead, card)
+        # Auto-exchange trump jack for the new leader (always beneficial)
+        if can_exchange_trump_jack(new_gs, new_gs.leader):
+            exchange_trump_jack(new_gs, new_gs.leader)
         return SnapszerNode(gs=new_gs, pending_lead=None, known_voids=voids)
 
     def is_terminal(self, state: SnapszerNode) -> bool:
@@ -337,8 +375,26 @@ class SnapszerGame:
             follower = 1 - leader
 
             if pending is None:
-                # Leader picks a random card (skip close-talon)
-                pending = _choice(_hands[leader])
+                hand_l = _hands[leader]
+                # Always declare marriage if K+Q available (free points)
+                if gs.pending_marriage is None:
+                    for suit in ALL_COLORS:
+                        k = Card(suit, 4)
+                        q = Card(suit, 3)
+                        if k in hand_l and q in hand_l:
+                            pts = 40 if suit == _trump else 20
+                            _scores[leader] += pts
+                            gs.pending_marriage = (leader, suit, pts)
+                            # Terminal after marriage?
+                            if _scores[0] >= 66 or _scores[1] >= 66:
+                                break
+                            pending = _choice([k, q])
+                            break
+                if _scores[0] >= 66 or _scores[1] >= 66:
+                    break  # terminal after marriage
+                if pending is None:
+                    # Leader picks a random card (skip close-talon)
+                    pending = _choice(hand_l)
             else:
                 # Follower responds
                 must_follow = gs.talon_closed or (
@@ -397,6 +453,17 @@ class SnapszerGame:
                                 gs.trump_card = None
                             else:
                                 break
+
+                    # --- inline exchange trump jack for new leader ---
+                    if (gs.trump_card is not None
+                            and gs.trump_upcard_visible
+                            and len(_draw_pile) >= 1):  # talon_size >= 2
+                        trump_jack = Card(_trump, 2)
+                        w_hand = _hands[winner]
+                        if trump_jack in w_hand:
+                            w_hand.remove(trump_jack)
+                            w_hand.append(gs.trump_card)
+                            gs.trump_card = trump_jack
 
                 pending = None
 

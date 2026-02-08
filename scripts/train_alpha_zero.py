@@ -114,7 +114,25 @@ def main() -> None:
                         help="Determinizations per move (default 4)")
     parser.add_argument("--eval-deals", type=int, default=200,
                         help="Deals per evaluation matchup (default 200)")
+    parser.add_argument("--body-units", type=int, default=128,
+                        help="Body hidden units (default 128)")
+    parser.add_argument("--body-layers", type=int, default=2,
+                        help="Body hidden layers (default 2)")
+    parser.add_argument("--head-units", type=int, default=64,
+                        help="Head hidden units (default 64)")
+    parser.add_argument("--lr", type=float, default=0.01,
+                        help="Learning rate (default 0.01)")
+    parser.add_argument("--l2", type=float, default=1e-4,
+                        help="L2 regularization (default 1e-4)")
+    parser.add_argument("--train-steps", type=int, default=100,
+                        help="SGD steps per iteration (default 100)")
+    parser.add_argument("--batch-size", type=int, default=32,
+                        help="Mini-batch size (default 32)")
+    parser.add_argument("--buffer", type=int, default=50000,
+                        help="Replay buffer capacity (default 50000)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel self-play processes (default 1 = sequential)")
     parser.add_argument("--save", type=str, default="models/AlphaZero/net.pkl",
                         help="Path to save the trained network")
     args = parser.parse_args()
@@ -138,11 +156,13 @@ def main() -> None:
     print("=" * 64)
     print("  AlphaZero Hybrid Bootstrap Training")
     print("=" * 64)
+    print(f"  Network: body={args.body_units}x{args.body_layers}, head={args.head_units}, ReLU")
     print(f"  MCTS: {args.sims} sims x {args.dets} dets")
-    print(f"  Network: body=128x2, heads=64, ReLU")
     print(f"  Budget: {args.iters} iters x {args.games_per_iter} games = {total_games} games")
     print(f"  Bootstrap: first {args.bootstrap} games use random rollouts")
     print(f"    -> ~{bootstrap_iters} iters of rollout MCTS, then switch to value head")
+    print(f"  LR: {args.lr}  L2: {args.l2}  Batch: {args.batch_size}  Buffer: {args.buffer}")
+    print(f"  Workers: {args.workers} {'(parallel)' if args.workers > 1 else '(sequential)'}")
     print()
 
     t0 = time.perf_counter()
@@ -164,17 +184,18 @@ def main() -> None:
         game=game,
         iterations=args.iters,
         games_per_iter=args.games_per_iter,
-        train_steps=100,
+        train_steps=args.train_steps,
         mcts_config=train_config,
-        body_units=128,
-        body_layers=2,
-        head_units=64,
-        lr=0.01,
-        l2=1e-4,
-        batch_size=32,
-        buffer_capacity=50_000,
+        body_units=args.body_units,
+        body_layers=args.body_layers,
+        head_units=args.head_units,
+        lr=args.lr,
+        l2=args.l2,
+        batch_size=args.batch_size,
+        buffer_capacity=args.buffer,
         bootstrap_games=args.bootstrap,
         seed=args.seed,
+        num_workers=args.workers,
         on_progress=on_progress,
     )
     train_time = time.perf_counter() - t0

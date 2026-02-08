@@ -28,6 +28,10 @@ export function cardImageUrl(card: Card): string {
   return `/cards/card_piece_${suitCode(card.color)}${rankCode(card.number)}.jpg`;
 }
 
+export function cardBackUrl(): string {
+  return "/cards/card_back.png";
+}
+
 export function cardLabel(card: Card): string {
   // Debug label (for alt text).
   return `${card.color[0]}-${card.number}`;

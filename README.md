@@ -1,69 +1,49 @@
-## Trickster — card-based AI game (engine + train + GUI)
+# Trickster
 
-This is a **minimal**, non-Streamlit project where you can:
+AI framework for **Snapszer** (Hungarian Schnapsen) — a two-player imperfect-information trick-taking card game.
 
-- **Train** a simple AI via self-play
-- **Play** against the trained AI in a small local GUI
+Train AlphaZero-style agents using MCTS + neural networks, then play against them in a React web UI with live analysis mode.
 
-### Game rules (this project)
-
-- Deck (Schnapsen / Hungarian "snapszer" direction): **Hungarian suits** (Hearts, Bells, Leaves, Acorns) × ranks
-  **J, Q, K, 10, A** (20 cards)
-- Card points: **J=2, Q=3, K=4, 10=10, A=11**
-- At the start, each player gets **5 cards**
-- The remaining cards form a **face-down draw pile**
-- Each trick:
-  - The **leader** plays (“calls”) a card
-  - The **responder** must play the **same color** if possible
-    - If they have any **higher** number in that color, they must respond with a **higher** one (they may choose which)
-    - If they only have **lower** cards of that color, they must play one of those
-  - If they **cannot follow color**, they may play any card
-  - Winner:
-    - If responder followed color and played **higher**, responder wins the round
-    - Otherwise leader wins the round
-- After the trick, **both players draw back up to 5 cards** (if possible):
-  - **Winner draws first**, then the other player
-- Each trick winner takes the **sum of the two cards' points**
-- The game ends after **10 tricks** (the full 20-card deck is used)
-- The player with the most points wins
-
-### “Random baseline” vs “untrained model”
-
-- **Random baseline** (used in Evaluate → “Progress vs baseline”): a player that picks a **uniform random legal card** every time. This is the clean, comparable baseline for **both** Linear and MLP.
-- **Untrained Linear model**: all weights start at 0, so every action scores 0.5 and the agent breaks ties randomly ⇒ it behaves essentially like the random baseline.
-- **Untrained MLP model**: weights are randomly initialized, so it is a **fixed random policy** (not uniform random). It can have accidental preferences even before training, which is why the GUI baseline uses the explicit uniform-random opponent instead of “checkpoint 0 MLP”.
-
-### Run from project root (no PYTHONPATH)
-
-Install once (editable), then you can run without `PYTHONPATH`:
+## Quick Start
 
 ```bash
-python3 -m pip install -e .
+# Install
+pip install -e .
+cd apps/web && npm install
+
+# Run
+uvicorn apps.api.main:app --reload   # backend
+cd apps/web && npm run dev            # frontend (dev)
 ```
 
-### Run (GUI: train + play)
+Open http://localhost:5173, press ESC to pick an opponent, and play.
+
+## What's Inside
+
+- **AlphaZero training** with MCTS, determinization for imperfect info, hybrid bootstrap
+- **Pure NumPy** neural networks (no PyTorch/TF) — dual-head SharedAlphaNet (value + policy)
+- **React web UI** with live play, speech bubbles, analysis mode (progressive MCTS evaluation)
+- **Strength ladder** — automated multi-tier training pipeline (T0-Direct through T8-Marshal)
+- **25-action space**: 20 cards + close talon + 4 marriage declarations
+
+## Trained Models
+
+| Model | Architecture | Training Games |
+|-------|-------------|----------------|
+| T4-Bishop | 128×2/h64 | 15k |
+| T5-Rook | 128×2/h64 | 20k |
+| T6-Captain | 128×3/h64 | 48k |
+
+## Documentation
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for full technical details — game rules, neural network architecture, MCTS implementation, training pipeline, API endpoints, and design decisions.
+
+## Training
 
 ```bash
-python3 -m trickster.gui
+# Train the full strength ladder
+python scripts/train_ladder.py
+
+# Train specific tiers
+python scripts/train_ladder.py --tiers 4
 ```
-
-### Run (headless training)
-
-```bash
-python3 -m trickster.cli --episodes 2000 --seed 0
-```
-
-This trains the selected model and writes rolling slots under its own folder:
-
-- `models/<model_id>/latest.pkl`
-- `models/<model_id>/prev.pkl`
-
-### Checkpoints ("pixels") + learning curve
-
-In the GUI Train tab you can set **Pixels (checkpoints)**. This saves models into:
-
-- `models/<model_id>/checkpoints/ckpt_XXXXXXXXX.pkl`
-
-Then in the Evaluate tab you can run a **checkpoint curve** that evaluates
-checkpoint \(i\) vs \(i+1\) to measure incremental improvement.
-

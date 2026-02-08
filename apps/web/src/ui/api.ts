@@ -20,6 +20,7 @@ export type GameState = {
   trickNo: number;
   terminal: boolean;
   canExchangeTrumpJack: boolean;
+  aiBubble?: string | null;
   talon: {
     size: number;
     drawPileSize: number;
@@ -30,6 +31,8 @@ export type GameState = {
   };
   announcements?: { marriages: { player: number; suit: Color; points: number }[] };
   available?: { canCloseTalon: boolean; marriages: { suit: Color; points: number }[] };
+  legalCards?: Card[];
+  mctsSettings?: { sims: number; dets: number };
   hands: {
     human: Card[];
   };
@@ -117,6 +120,41 @@ export async function apiActionDeclareMarriage(gameId: string, suit: Color): Pro
   });
   if (!res.ok) throw new Error(await res.text());
   return (await res.json()) as GameState;
+}
+
+export type AnalysisAction = {
+  type: "card" | "close_talon" | "marriage";
+  card?: Card;
+  suit?: string;
+  prob: number;
+};
+
+export type Analysis = {
+  value: number;
+  actions: AnalysisAction[];
+  progress: number;
+  total: number;
+  searching: boolean;
+};
+
+export async function apiAnalyze(gameId: string): Promise<Analysis> {
+  const res = await fetch(`/api/analyze/${encodeURIComponent(gameId)}`);
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as Analysis;
+}
+
+export async function apiUpdateSettings(
+  gameId: string,
+  sims: number,
+  dets: number,
+): Promise<{ sims: number; dets: number }> {
+  const res = await fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ gameId, sims, dets }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as { sims: number; dets: number };
 }
 
 export async function apiListModels(): Promise<string[]> {

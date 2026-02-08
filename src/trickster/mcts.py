@@ -106,8 +106,8 @@ def _random_rollout(
     _choice = rng.choice
     while not _is_terminal(state):
         actions = _legal(state)
-        # Skip close_talon in rollouts (random agent wouldn't know when)
-        card_actions = [a for a in actions if a != "close_talon"]
+        # Skip strategic string actions (close_talon, marry_*) in random rollouts
+        card_actions = [a for a in actions if not isinstance(a, str)]
         state = _apply(state, _choice(card_actions) if card_actions else _choice(actions))
     return game.outcome(state, perspective)
 
@@ -133,7 +133,7 @@ def _run_mcts(
     """
     actions = game.legal_actions(state)
     if len(actions) <= 1:
-        return {a: 1.0 for a in actions}
+        return {a: 1.0 for a in actions}, 0.0
 
     # Evaluate root: get policy priors
     player = game.current_player(state)
@@ -258,7 +258,9 @@ def _run_mcts(
                 node.value_sum -= value
             node = node.parent
 
-    return {ch.action: ch.visits for ch in root.children}
+    visits = {ch.action: ch.visits for ch in root.children}
+    root_value = root.value_sum / root.visits if root.visits > 0 else 0.0
+    return visits, root_value
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +285,7 @@ def alpha_mcts_choose(
     for _ in range(config.determinizations):
         det = game.determinize(state, player, rng)
         rollout_rng = random.Random(rng.randrange(1 << 30))
-        visits = _run_mcts(det, game, net, player, config, rollout_rng)
+        visits, _rv = _run_mcts(det, game, net, player, config, rollout_rng)
         for act, cnt in visits.items():
             total[act] = total.get(act, 0.0) + cnt
 
@@ -316,7 +318,7 @@ def alpha_mcts_policy(
     for _ in range(config.determinizations):
         det = game.determinize(state, player, rng)
         rollout_rng = random.Random(rng.randrange(1 << 30))
-        visits = _run_mcts(det, game, net, player, config, rollout_rng)
+        visits, _rv = _run_mcts(det, game, net, player, config, rollout_rng)
         for act, cnt in visits.items():
             total[act] = total.get(act, 0.0) + cnt
 

@@ -1,0 +1,10 @@
+{
+  "game": "snapszer",
+  "kind": "alphazero",
+  "method": "alphazero",
+  "params": {
+    "body_layers": 3,
+    "body_units": 128,
+    "head_units": 64
+  }
+}
