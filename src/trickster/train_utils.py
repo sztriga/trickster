@@ -4,15 +4,19 @@ Translates the Hungarian Ulti scoring system into normalised
 rewards suitable for neural network training (values in [-1, +1]).
 
 Key properties:
-  - **Asymmetry**: Soloist pays double on loss (standard Ulti rule).
+  - **Per-component evaluation**: Compound contracts (e.g. Ulti + Parti)
+    are scored independently — the soloist can win Parti but lose Ulti.
+  - **Asymmetry**: Soloist pays double on loss per component.
   - **Coalition**: Both defenders receive the same reward.
-  - **Normalization**: Rewards are squashed to [-1, +1] so the value
-    head output range matches.
+  - **Normalization**: Rewards are squashed to [-1, +1].
 
-Contract-value scaling:
-  Higher-value contracts (Ulti, 100, Durchmars) produce proportionally
-  larger raw rewards before normalisation.  This teaches the network
-  that losing an Ulti hurts more than losing a Simple.
+Component point values (win / loss):
+  parti:      1 /  2
+  ulti:       4 /  8
+  betli:      5 / 10
+  durchmars:  6 / 12
+  40-100:     4 /  8
+  20-100:     8 / 16
 """
 
 from __future__ import annotations
@@ -22,52 +26,55 @@ import numpy as np
 from trickster.games.ulti.adapter import UltiNode
 
 # ---------------------------------------------------------------------------
-#  Contract value table (for reward scaling)
+#  Per-component value table
 # ---------------------------------------------------------------------------
 
-# Maps contract component sets to (win_value, loss_value) per defender.
-# These are the "base" points before kontra/red multipliers.
-_CONTRACT_VALUES: dict[frozenset[str], tuple[float, float]] = {
-    frozenset({"parti"}):                     (1.0,  2.0),
-    frozenset({"parti", "ulti"}):             (5.0, 10.0),  # 4+1
-    frozenset({"betli"}):                     (5.0, 10.0),
-    frozenset({"parti", "durchmars"}):        (7.0, 14.0),  # 6+1
-    frozenset({"parti", "40", "100"}):        (5.0, 10.0),  # 4+1
-    frozenset({"parti", "20", "100"}):        (9.0, 18.0),  # 8+1
-    frozenset({"parti", "ulti", "durchmars"}): (11.0, 22.0), # 6+4+1
+# Each component: (win_value, loss_value)
+# These are additive — a "Parti + Ulti" contract evaluates both.
+_COMPONENT_VALUES: dict[str, tuple[float, float]] = {
+    "parti":      (1.0,  2.0),
+    "ulti":       (4.0,  8.0),
+    "betli":      (5.0, 10.0),
+    "durchmars":  (6.0, 12.0),
+    "40-100":     (4.0,  8.0),   # 40 + 100 combined
+    "20-100":     (8.0, 16.0),   # 20 + 100 combined
 }
-
-# Fallback for unknown/compound contracts
-_DEFAULT_WIN = 1.0
-_DEFAULT_LOSS = 2.0
 
 # Maximum possible raw reward (for normalisation)
 _MAX_RAW = 22.0
 
 
-def _contract_scale(components: frozenset[str] | None) -> tuple[float, float]:
-    """Look up (win_value, loss_value) for a contract."""
-    if components is None:
-        return _DEFAULT_WIN, _DEFAULT_LOSS
-    entry = _CONTRACT_VALUES.get(components)
-    if entry is not None:
-        return entry
-    # Fallback: sum up known component values
-    win = 0.0
-    loss = 0.0
-    if "parti" in components:
-        win += 1.0; loss += 2.0
-    if "ulti" in components:
-        win += 4.0; loss += 8.0
-    if "betli" in components:
-        win += 5.0; loss += 10.0
-    if "durchmars" in components:
-        win += 6.0; loss += 12.0
-    if "100" in components and "40" in components:
-        win += 4.0; loss += 8.0
-    elif "100" in components and "20" in components:
-        win += 8.0; loss += 16.0
-    return max(win, _DEFAULT_WIN), max(loss, _DEFAULT_LOSS)
+def _check_component_won(
+    component: str,
+    state: UltiNode,
+) -> bool:
+    """Did the soloist win a specific component?
+
+    Each component has its own win condition evaluated from
+    the terminal game state.
+    """
+    from trickster.games.ulti.game import (
+        last_trick_ulti_check,
+        soloist_lost_betli,
+        soloist_won_durchmars,
+        soloist_won_simple,
+    )
+
+    gs = state.gs
+    if component == "parti":
+        return soloist_won_simple(gs)
+    if component == "ulti":
+        side, won = last_trick_ulti_check(gs)
+        return side == "soloist" and won
+    if component == "betli":
+        return not soloist_lost_betli(gs)
+    if component == "durchmars":
+        return soloist_won_durchmars(gs)
+    if component in ("40-100", "20-100"):
+        # 100 = soloist collected ≥100 card points
+        # The 40/20 marriage part is auto-satisfied if they declared it
+        return soloist_won_simple(gs)  # points > defender = auto 100+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -79,49 +86,78 @@ def calculate_reward(
     state: UltiNode,
     soloist_won: bool,
 ) -> tuple[float, float, float]:
-    """Compute normalised rewards for all 3 players.
+    """Compute normalised per-component rewards for all 3 players.
 
-    Parameters
-    ----------
-    state : UltiNode
-        Terminal game state.
-    soloist_won : bool
-        Whether the soloist won the contract.
+    For compound contracts (e.g. ``{"parti", "ulti"}``), each component
+    is evaluated independently:
+      - Parti won + Ulti won  → full win (+5 for soloist)
+      - Parti won + Ulti lost → partial (+1 parti, -8 ulti → net -7)
+      - Parti lost + Ulti won → partial (-2 parti, +4 ulti → net +2)
+      - Both lost             → full loss (-10 for soloist)
+
+    The ``soloist_won`` parameter is used as a simple fallback when
+    there's only one component or for non-compound contracts.
 
     Returns
     -------
-    (r0, r1, r2) : tuple of float
-        Reward for each player, normalised to [-1, +1].
-
-    Reward model:
-      Soloist wins  → soloist gets +win_val, each defender gets -win_val/2
-      Soloist loses → soloist gets -loss_val, each defender gets +loss_val/2
-
-    Normalised by dividing by ``_MAX_RAW`` to keep everything in [-1, 1].
+    (r0, r1, r2) : tuple of float in [-1, +1]
     """
     gs = state.gs
     comps = state.contract_components
-    win_val, loss_val = _contract_scale(comps)
-
-    rewards = [0.0, 0.0, 0.0]
     soloist = gs.soloist
+    raw_reward = 0.0
 
-    if soloist_won:
-        rewards[soloist] = win_val
-        for i in range(3):
-            if i != soloist:
-                rewards[i] = -win_val / 2.0
+    if comps is None or len(comps) == 0:
+        # Unknown contract — simple win/loss
+        raw_reward = 1.0 if soloist_won else -2.0
+    elif len(comps) == 1:
+        # Single component — use simple evaluation
+        comp = next(iter(comps))
+        # Map compound keys like "40"+"100" to lookup key
+        if comp == "betli":
+            w, l = _COMPONENT_VALUES["betli"]
+        elif comp == "parti":
+            w, l = _COMPONENT_VALUES["parti"]
+        elif comp == "durchmars":
+            w, l = _COMPONENT_VALUES["durchmars"]
+        else:
+            w, l = (1.0, 2.0)
+        raw_reward = w if soloist_won else -l
     else:
-        rewards[soloist] = -loss_val
-        for i in range(3):
-            if i != soloist:
-                rewards[i] = loss_val / 2.0
+        # Multi-component: evaluate each independently
+        # Build lookup keys from component set
+        eval_components: list[str] = []
+        if "parti" in comps:
+            eval_components.append("parti")
+        if "ulti" in comps:
+            eval_components.append("ulti")
+        if "durchmars" in comps:
+            eval_components.append("durchmars")
+        if "betli" in comps:
+            eval_components.append("betli")
+        if "100" in comps and "40" in comps:
+            eval_components.append("40-100")
+        elif "100" in comps and "20" in comps:
+            eval_components.append("20-100")
+
+        if not eval_components:
+            raw_reward = 1.0 if soloist_won else -2.0
+        else:
+            for comp in eval_components:
+                w, l = _COMPONENT_VALUES.get(comp, (1.0, 2.0))
+                comp_won = _check_component_won(comp, state)
+                raw_reward += w if comp_won else -l
+
+    # Distribute to players
+    rewards = [0.0, 0.0, 0.0]
+    rewards[soloist] = raw_reward
+    for i in range(3):
+        if i != soloist:
+            rewards[i] = -raw_reward / 2.0
 
     # Normalise to [-1, +1]
     rewards = [r / _MAX_RAW for r in rewards]
-    # Clamp (shouldn't be needed, but safety)
     rewards = [max(-1.0, min(1.0, r)) for r in rewards]
-
     return (rewards[0], rewards[1], rewards[2])
 
 
@@ -130,7 +166,7 @@ def outcome_for_player(
     player: int,
     soloist_won: bool,
 ) -> float:
-    """Normalised reward for a single player.  Used to fill ``z`` in training samples."""
+    """Normalised reward for a single player."""
     r = calculate_reward(state, soloist_won)
     return r[player]
 
@@ -141,11 +177,7 @@ def outcome_for_player(
 
 
 def simple_outcome(state: UltiNode, player: int) -> float:
-    """Basic +1 / -1 outcome for curriculum training.
-
-    Uses the UltiGame.outcome() logic directly:
-      +1 if player's side won, -1 otherwise.
-    """
+    """Basic +1 / -1 outcome for curriculum training."""
     from trickster.games.ulti.game import soloist_lost_betli, soloist_won_simple
 
     gs = state.gs

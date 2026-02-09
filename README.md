@@ -1,49 +1,87 @@
 # Trickster
 
-AI framework for **Snapszer** (Hungarian Schnapsen) — a two-player imperfect-information trick-taking card game.
+AI framework for Hungarian trick-taking card games. Train AlphaZero-style agents using MCTS + neural networks, then play against them in a React web UI.
 
-Train AlphaZero-style agents using MCTS + neural networks, then play against them in a React web UI with live analysis mode.
+## Games
+
+**Ulti** (3-player, 32-card Tell deck) — the primary focus. Features asymmetric 1v2 play with a complex bidding system, contract types (Parti, Betli, Durchmars, Ulti), kontra/rekontra, and silent bonuses. See [ULTI_AI.md](ULTI_AI.md) for the training framework.
+
+**Snapszer** (2-player, 20-card) — the original game. Fully playable with trained models up to T6-Captain tier.
 
 ## Quick Start
 
 ```bash
-# Install
+# Install Python package
 pip install -e .
+
+# Install frontend
 cd apps/web && npm install
 
-# Run
-uvicorn apps.api.main:app --reload   # backend
-cd apps/web && npm run dev            # frontend (dev)
+# Run the API server
+PYTHONPATH=src uvicorn apps.api.main:app --reload --port 8000
+
+# Run the frontend dev server
+cd apps/web && npm run dev
 ```
 
-Open http://localhost:5173, press ESC to pick an opponent, and play.
+Open http://localhost:5173 to play.
 
-## What's Inside
+## Ulti AI
 
-- **AlphaZero training** with MCTS, determinization for imperfect info, hybrid bootstrap
-- **Pure NumPy** neural networks (no PyTorch/TF) — dual-head SharedAlphaNet (value + policy)
-- **React web UI** with live play, speech bubbles, analysis mode (progressive MCTS evaluation)
-- **Strength ladder** — automated multi-tier training pipeline (T0-Direct through T8-Marshal)
-- **25-action space**: 20 cards + close talon + 4 marriage declarations
-
-## Trained Models
-
-| Model | Architecture | Training Games |
-|-------|-------------|----------------|
-| T4-Bishop | 128×2/h64 | 15k |
-| T5-Rook | 128×2/h64 | 20k |
-| T6-Captain | 128×3/h64 | 48k |
-
-## Documentation
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for full technical details — game rules, neural network architecture, MCTS implementation, training pipeline, API endpoints, and design decisions.
-
-## Training
+The Ulti AI uses PyTorch with a shared-backbone AlphaZero architecture (UltiNet, 259-dim input, 308k params). It learns through MCTS self-play with determinization for imperfect information.
 
 ```bash
-# Train the full strength ladder
+# Train (mixed Simple + Betli curriculum)
+python scripts/train_baseline.py --mode mixed --steps 600 --sims 20 --def-sims 8
+
+# Evaluate two checkpoints head-to-head
+python scripts/eval_head2head.py \
+    --model-a models/checkpoints/mixed/step_00200.pt \
+    --model-b models/checkpoints/mixed/step_00600.pt \
+    --games 200
+
+# Play against the trained model in the React UI
+# (model auto-loads from models/ulti_mixed.pt)
+```
+
+See [ULTI_AI.md](ULTI_AI.md) for full documentation of the training pipeline, evaluation framework, and roadmap.
+
+## Snapszer AI
+
+```bash
+# Train the strength ladder (T0 through T6)
 python scripts/train_ladder.py
 
-# Train specific tiers
-python scripts/train_ladder.py --tiers 4
+# Play in the web UI — press ESC to pick an opponent
+```
+
+## Project Structure
+
+```
+src/trickster/
+  games/
+    ulti/                # Ulti game engine
+      game.py            # Core game logic (deal, tricks, scoring)
+      cards.py           # Card definitions, Tell deck
+      adapter.py         # UltiGame — MCTS interface + PIMC determinization
+      encoder.py         # 259-dim "detective" state encoder
+      auction_encoder.py # 116-dim auction phase encoder
+    snapszer/            # Snapszer game engine
+  model.py               # UltiNet (PyTorch) — policy + value + auction heads
+  evaluator.py           # Oracle hand evaluator (shallow MCTS)
+  train_utils.py         # Reward engine, replay buffer
+  mcts.py                # MCTS with PIMC determinization
+
+scripts/
+  train_baseline.py      # Ulti curriculum training (simple/betli/mixed/auto)
+  eval_head2head.py      # Head-to-head model comparison
+  train_ladder.py        # Snapszer strength ladder
+
+apps/
+  api/
+    main.py              # FastAPI backend (Snapszer)
+    ulti.py              # FastAPI backend (Ulti) — serves trained AI
+  web/                   # React + TypeScript frontend
+
+models/                  # Trained model checkpoints
 ```

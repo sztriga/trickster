@@ -110,6 +110,8 @@ export type UltiState = {
   settlement: Settlement | null;
   capturedTricks: UltiCard[][];
   bubbles: { player: number; text: string }[];
+  aiMode: "neural" | "mcts" | "random";
+  aiStrength: "fast" | "medium" | "strong";
 };
 
 const BASE = "/api/ulti";
@@ -169,4 +171,32 @@ export function ultiPlay(gameId: string, card: UltiCard): Promise<UltiState> {
 
 export function ultiContinue(gameId: string): Promise<UltiState> {
   return post(`/${gameId}/continue`);
+}
+
+export async function ultiAiSettings(
+  gameId: string,
+  aiMode?: string,
+  aiStrength?: string,
+): Promise<{ aiMode: string; aiStrength: string }> {
+  const body: Record<string, unknown> = {};
+  if (aiMode) body.aiMode = aiMode;
+  if (aiStrength) body.aiStrength = aiStrength;
+  const res = await fetch(`${BASE}/${gameId}/ai-settings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return (await res.json()) as { aiMode: string; aiStrength: string };
+}
+
+export async function ultiModelInfo(): Promise<{
+  loaded: boolean;
+  path: string | null;
+  params: number;
+  message?: string;
+}> {
+  const res = await fetch(`${BASE}/model-info`);
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
 }

@@ -1,28 +1,43 @@
 """FastAPI router for Ulti game sessions.
 
-Human is always player 0 (bottom of screen).  AI plays randomly.
+Human is always player 0 (bottom of screen).  AI uses trained UltiNet.
 Game flow: BID → AUCTION → TRUMP_SELECT → KONTRA → PLAY → DONE.
 
-BID         First bidder has 12 cards, discards 2 + announces a bid.
-AUCTION     Other players pick up the talon or pass.  When someone
-            picks up, they enter the BID phase (12 cards → discard + bid).
-TRUMP_SELECT  Winner of auction chooses trump suit (non-red games only).
-KONTRA      Defenders may double the stakes.
-PLAY        Trick-taking play.
-DONE        Deal finished.
+AI play modes (configurable per session):
+  - "neural"  : UltiNet policy head only — instant, no search.
+  - "mcts"    : UltiNet + MCTS search — stronger but slower.
+  - "random"  : Random legal card (legacy / fallback).
+
+The model is loaded lazily from ``models/ulti_mixed.pt`` on first use.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import random
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
+import torch
 from fastapi import APIRouter, HTTPException
 
+from trickster.games.ulti.adapter import (
+    UltiGame,
+    UltiNode,
+    _CARD_IDX,
+    _IDX_TO_CARD,
+    build_auction_constraints,
+)
 from trickster.games.ulti.cards import Card, Rank, Suit
+from trickster.mcts import MCTSConfig, alpha_mcts_policy
+from trickster.model import UltiNet, UltiNetWrapper
+
+log = logging.getLogger(__name__)
 from trickster.games.ulti.auction import (
     ALL_BIDS,
     AuctionState,
@@ -77,6 +92,147 @@ from trickster.games.ulti.game import (
     soloist_won_simple,
 )
 from trickster.games.ulti.rules import TrickResult
+
+# ---------------------------------------------------------------------------
+#  Neural AI — model loading (lazy singleton)
+# ---------------------------------------------------------------------------
+
+_MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
+_DEFAULT_MODEL = "ulti_mixed.pt"
+
+# Singleton: loaded once, shared across all sessions.
+_ulti_game: UltiGame | None = None
+_ulti_wrapper: UltiNetWrapper | None = None
+_model_path_loaded: str = ""
+
+
+def _get_ulti_game() -> UltiGame:
+    global _ulti_game
+    if _ulti_game is None:
+        _ulti_game = UltiGame()
+    return _ulti_game
+
+
+def _load_ulti_model(model_path: str | None = None) -> UltiNetWrapper | None:
+    """Load a trained UltiNet from disk (cached singleton).
+
+    Falls back through: explicit path → env var ``ULTI_MODEL`` →
+    ``models/ulti_mixed.pt`` → any ``models/ulti_*.pt``.
+    Returns ``None`` if no model file is found.
+    """
+    global _ulti_wrapper, _model_path_loaded
+
+    if model_path is None:
+        model_path = os.environ.get("ULTI_MODEL")
+    if model_path is None:
+        candidate = _MODEL_DIR / _DEFAULT_MODEL
+        if candidate.exists():
+            model_path = str(candidate)
+        else:
+            # Try any ulti_*.pt
+            for f in sorted(_MODEL_DIR.glob("ulti_*.pt")):
+                model_path = str(f)
+                break
+
+    if model_path is None:
+        log.warning("No Ulti model found — AI will play randomly.")
+        return None
+
+    # Return cached if same path
+    if _ulti_wrapper is not None and _model_path_loaded == model_path:
+        return _ulti_wrapper
+
+    try:
+        checkpoint = torch.load(model_path, weights_only=True, map_location="cpu")
+        body_units = checkpoint.get("body_units", 256)
+        body_layers = checkpoint.get("body_layers", 4)
+        input_dim = checkpoint.get("input_dim", 259)
+        action_dim = checkpoint.get("action_dim", 32)
+
+        net = UltiNet(
+            input_dim=input_dim,
+            body_units=body_units,
+            body_layers=body_layers,
+            action_dim=action_dim,
+        )
+        # Gracefully load (skip mismatched keys, init new ones)
+        model_dict = net.state_dict()
+        pretrained = {
+            k: v for k, v in checkpoint["model_state_dict"].items()
+            if k in model_dict and v.shape == model_dict[k].shape
+        }
+        model_dict.update(pretrained)
+        net.load_state_dict(model_dict)
+
+        _ulti_wrapper = UltiNetWrapper(net, device="cpu")
+        _model_path_loaded = model_path
+        log.info("Loaded Ulti model from %s (%d params)",
+                 model_path, sum(p.numel() for p in net.parameters()))
+        return _ulti_wrapper
+    except Exception:
+        log.exception("Failed to load Ulti model from %s", model_path)
+        return None
+
+
+def _session_to_node(sess: "UltiSession") -> UltiNode:
+    """Build a UltiNode from a live session for neural inference.
+
+    Populates known_voids, contract_components, kontras, and
+    auction constraints so the encoder produces a full 259-dim vector.
+    """
+    st = sess.state
+    bid = sess.winning_bid
+
+    # Contract components
+    comps: frozenset[str] | None = None
+    is_red = False
+    is_open = False
+    bid_rank = 0
+    if bid is not None:
+        comps = bid.components
+        is_red = bid.is_red
+        is_open = bid.is_open
+        bid_rank = bid.rank
+
+    # Build auction constraints
+    constraints = build_auction_constraints(st, comps)
+
+    # Known voids: not tracked in the UI session, start empty
+    # (could be inferred from trick history, but not critical)
+    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+
+    return UltiNode(
+        gs=st,
+        known_voids=empty_voids,
+        bid_rank=bid_rank,
+        is_red=is_red,
+        is_open=is_open,
+        contract_components=comps,
+        dealer=st.dealer,
+        component_kontras=dict(sess.component_kontras),
+        must_have=constraints,
+    )
+
+
+# MCTS configs for different AI strength levels
+_MCTS_CONFIGS: dict[str, MCTSConfig] = {
+    "fast": MCTSConfig(
+        simulations=5, determinizations=1,
+        c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
+        use_value_head=True, use_policy_priors=True, visit_temp=0.1,
+    ),
+    "medium": MCTSConfig(
+        simulations=20, determinizations=2,
+        c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
+        use_value_head=True, use_policy_priors=True, visit_temp=0.1,
+    ),
+    "strong": MCTSConfig(
+        simulations=50, determinizations=3,
+        c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
+        use_value_head=True, use_policy_priors=True, visit_temp=0.1,
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 #  JSON helpers
@@ -158,6 +314,10 @@ class UltiSession:
     log: list[dict[str, Any]] = field(default_factory=list)
     # Speech-bubble events: [{player: int, text: str}, ...]
     bubbles: list[dict[str, Any]] = field(default_factory=list)
+    # AI play mode: "neural" | "mcts" | "random"
+    ai_mode: str = "neural"
+    # MCTS strength level: "fast" | "medium" | "strong" (only for mcts mode)
+    ai_strength: str = "medium"
 
 
 _sessions: dict[str, UltiSession] = {}
@@ -346,6 +506,8 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         "settlement": settlement_data,
         "capturedTricks": captured_tricks,
         "bubbles": bubbles,
+        "aiMode": sess.ai_mode,
+        "aiStrength": sess.ai_strength,
     }
 
 
@@ -838,6 +1000,44 @@ def _start_play_phase(sess: UltiSession) -> None:
         _advance_ai_one(sess)
 
 
+def _ai_pick_card(sess: UltiSession) -> Card:
+    """Select a card for the AI using the configured mode.
+
+    Modes:
+      - "neural":  Pure policy head (instant, no search).
+      - "mcts":    MCTS search with configurable strength.
+      - "random":  Random legal card (fallback).
+    """
+    st = sess.state
+    actions = legal_actions(st)
+    if len(actions) == 1:
+        return actions[0]
+
+    mode = sess.ai_mode
+    wrapper = _load_ulti_model()
+
+    if wrapper is None or mode == "random":
+        rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
+        return rng.choice(actions)
+
+    game = _get_ulti_game()
+    node = _session_to_node(sess)
+    player = current_player(st)
+
+    if mode == "mcts":
+        config = _MCTS_CONFIGS.get(sess.ai_strength, _MCTS_CONFIGS["medium"])
+        rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
+        _pi, action = alpha_mcts_policy(node, game, wrapper, player, config, rng)
+        return action
+    else:
+        # "neural" — pure policy head, no search
+        feats = game.encode_state(node, player)
+        mask = game.legal_action_mask(node)
+        probs = wrapper.predict_policy(feats, mask)
+        best_idx = int(np.argmax(probs))
+        return _IDX_TO_CARD[best_idx]
+
+
 def _advance_ai_one(sess: UltiSession) -> None:
     """Play exactly ONE AI card."""
     st = sess.state
@@ -850,14 +1050,11 @@ def _advance_ai_one(sess: UltiSession) -> None:
     if cp == HUMAN:
         return
 
-    rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
-    actions = legal_actions(st)
-    card = rng.choice(actions)
+    card = _ai_pick_card(sess)
     result = play_card(st, card)
 
     if result is not None:
         sess.log.append({"trick": st.trick_no, "result": _trick_json(result)})
-        # Always pause to show the completed trick — even the last one.
         sess.needs_continue = True
         return
 
@@ -879,6 +1076,12 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
     The first bidder picks up the talon (12 cards) and must discard 2
     + bid.  If the first bidder is AI, they auto-bid and the talon
     passes around until it reaches the human.
+
+    Optional body fields:
+      - ``seed``:  int — deal seed
+      - ``dealer``: int — dealer index (0–2)
+      - ``aiMode``: "neural" | "mcts" | "random"
+      - ``aiStrength``: "fast" | "medium" | "strong" (for mcts mode)
     """
     seed = body.get("seed")
     if seed is None:
@@ -889,6 +1092,14 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         dealer = int(dealer_arg)
     else:
         dealer = random.randint(0, 2)
+
+    # AI configuration
+    ai_mode = body.get("aiMode", "neural")
+    if ai_mode not in ("neural", "mcts", "random"):
+        ai_mode = "neural"
+    ai_strength = body.get("aiStrength", "medium")
+    if ai_strength not in ("fast", "medium", "strong"):
+        ai_strength = "medium"
 
     st, talon = deal(seed=seed, dealer=dealer)
 
@@ -906,8 +1117,14 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         phase="bid",  # will be set by _advance_ai_auction
         seed=seed,
         auction=auction,
+        ai_mode=ai_mode,
+        ai_strength=ai_strength,
     )
     _sessions[sess.id] = sess
+
+    # Eagerly try to load the model on first game
+    if ai_mode != "random":
+        _load_ulti_model()
 
     if first_bidder == HUMAN:
         # Human has 12 cards — must discard 2 + bid.
@@ -1146,3 +1363,47 @@ def continue_game(game_id: str) -> dict[str, Any]:
 
     _advance_ai_one(sess)
     return _public_state(sess)
+
+
+@router.post("/{game_id}/ai-settings")
+def ai_settings(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Update AI play settings for this session.
+
+    Body: { aiMode: "neural"|"mcts"|"random", aiStrength: "fast"|"medium"|"strong" }
+    """
+    sess = _sessions.get(game_id)
+    if not sess:
+        raise HTTPException(404, "Game not found")
+
+    if "aiMode" in body:
+        mode = body["aiMode"]
+        if mode in ("neural", "mcts", "random"):
+            sess.ai_mode = mode
+    if "aiStrength" in body:
+        strength = body["aiStrength"]
+        if strength in ("fast", "medium", "strong"):
+            sess.ai_strength = strength
+
+    return {
+        "aiMode": sess.ai_mode,
+        "aiStrength": sess.ai_strength,
+    }
+
+
+@router.get("/model-info")
+def model_info() -> dict[str, Any]:
+    """Return info about the loaded AI model."""
+    wrapper = _load_ulti_model()
+    if wrapper is None:
+        return {
+            "loaded": False,
+            "path": None,
+            "params": 0,
+            "message": "No model found — AI plays randomly. "
+                       "Train one with: python scripts/train_baseline.py --mode mixed --steps 200",
+        }
+    return {
+        "loaded": True,
+        "path": _model_path_loaded,
+        "params": sum(p.numel() for p in wrapper.net.parameters()),
+    }

@@ -404,11 +404,15 @@ class UltiGame:
         ``training_mode`` can filter to specific contract types.
         ``_discard_fn`` overrides the default random discard with a
         callable ``(hand, betli, trump) -> [Card, Card]``.
+
+        In ``'auto'`` mode, the caller must provide ``_contract_idx``
+        (0-4) and ``_discard_fn`` — the AI chooses its own contract.
         """
         rng = random.Random(seed)
         dealer = kwargs.get("starting_leader", 0) % NUM_PLAYERS
         training_mode = kwargs.get("training_mode", None)
         discard_fn = kwargs.get("_discard_fn", None)
+        contract_idx = kwargs.get("_contract_idx", None)
 
         gs, talon = deal(seed=seed, dealer=dealer)
         gs.training_mode = training_mode
@@ -418,19 +422,35 @@ class UltiGame:
         pickup_talon(gs, soloist, talon)
 
         # Choose contract based on training_mode
-        if training_mode == "betli":
+        if training_mode == "auto" and contract_idx is not None:
+            # Auto mode: contract chosen externally by auction head
+            from trickster.model import CONTRACT_CLASSES
+            mode_str, suit_idx = CONTRACT_CLASSES[contract_idx]
+            if mode_str == "betli":
+                betli = True
+            else:
+                betli = False
+            if betli:
+                set_contract(gs, soloist, trump=None, betli=True)
+            else:
+                trump = list(ALL_SUITS)[suit_idx]
+                set_contract(gs, soloist, trump=trump)
+        elif training_mode == "betli":
             betli = True
+            set_contract(gs, soloist, trump=None, betli=True)
         elif training_mode in ("simple", "ulti"):
             betli = False
-        else:
-            betli = rng.random() < 0.1
-
-        if betli:
-            set_contract(gs, soloist, trump=None, betli=True)
-        else:
             suits_in_hand = list(set(c.suit for c in gs.hands[soloist]))
             trump = rng.choice(suits_in_hand)
             set_contract(gs, soloist, trump=trump)
+        else:
+            betli = rng.random() < 0.1
+            if betli:
+                set_contract(gs, soloist, trump=None, betli=True)
+            else:
+                suits_in_hand = list(set(c.suit for c in gs.hands[soloist]))
+                trump = rng.choice(suits_in_hand)
+                set_contract(gs, soloist, trump=trump)
 
         # Discard 2 cards — use provided heuristic or random
         if discard_fn is not None:
@@ -463,3 +483,15 @@ class UltiGame:
             dealer=dealer,
             must_have=constraints,
         )
+
+    def get_hand12(self, seed: int, dealer: int = 0) -> tuple[GameState, list[Card], int]:
+        """Deal and pickup talon, returning the 12-card hand before discard.
+
+        Returns ``(gs, talon, soloist)`` where ``gs.hands[soloist]``
+        has 12 cards.  The caller is responsible for choosing the
+        contract and discard.
+        """
+        gs, talon = deal(seed=seed, dealer=dealer)
+        soloist = next_player(dealer)
+        pickup_talon(gs, soloist, talon)
+        return gs, talon, soloist

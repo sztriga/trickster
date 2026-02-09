@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """Ulti baseline training — curriculum with PyTorch.
 
-Supports three curriculum modes:
+Supports four curriculum modes:
   --mode simple   Train only on Simple (Parti) contracts.
   --mode betli    Train only on Betli contracts.
   --mode mixed    Train on a 50/50 mix of Simple and Betli.
+  --mode auto     Soloist chooses contract via Auction Head + Oracle.
 
-Self-play loop:
-  1. Deal a game via ``UltiGame.new_game(training_mode=...)``.
-  2. All 3 players use MCTS (N=20 sims, 1 determinization) to pick cards.
-  3. Collect (state, mask, mcts_policy, reward) tuples in a ReplayBuffer.
-  4. Train the ``UltiNet`` on mini-batches of 64 with Adam.
-  5. Every 10 training steps, evaluate vs Random over 20 games.
+Self-play:
+  All 3 players use the same UltiNet.  Defenders use a lower MCTS
+  budget (--def-sims, default 8) for speed, while the soloist uses
+  --sims (default 20).  This replaces the old "vs Random" self-play.
 
-The "mixed" mode is the true test of the shared backbone: the Is_Betli
-bit in the Contract DNA must flip the AI's entire strategy from
-"win tricks with high cards" to "dump high cards to lose tricks".
+Neural discard (--neural-discard):
+  Evaluates all C(12,2)=66 possible discards through the value head.
+
+Auto mode (Level 3 curriculum):
+  The soloist uses the Auction Head to choose a contract.  The Oracle
+  provides the training target via cross-entropy loss.
+
+Elite Benchmark (--elite-interval):
+  Periodically evaluates the Neural Net (policy-only, 0 MCTS sims)
+  vs the Oracle (MCTS 50) to measure how close intuition is to search.
 
 Usage:
     python scripts/train_baseline.py [--mode simple] [--steps 200]
-    python scripts/train_baseline.py --mode betli --steps 100
-    python scripts/train_baseline.py --mode mixed --steps 200
+    python scripts/train_baseline.py --mode mixed --steps 200 --self-play
+    python scripts/train_baseline.py --mode auto --steps 200 --neural-discard
 """
 from __future__ import annotations
 
@@ -37,28 +43,38 @@ import torch
 import torch.nn.functional as F
 
 from trickster.games.ulti.adapter import UltiGame, UltiNode
-from trickster.games.ulti.cards import Card, Rank, Suit, BETLI_STRENGTH
+from trickster.games.ulti.cards import ALL_SUITS, Card, Rank, Suit, BETLI_STRENGTH
 from trickster.games.ulti.game import (
     discard_talon,
     soloist_lost_betli,
     soloist_won_simple,
 )
 from trickster.mcts import MCTSConfig, alpha_mcts_policy
-from trickster.model import UltiNet, UltiNetWrapper
-from trickster.train_utils import ReplayBuffer, outcome_for_player, simple_outcome
+from trickster.model import (
+    CONTRACT_CLASSES,
+    NUM_CONTRACTS,
+    NUM_FLAGS,
+    TRUMP_CLASSES,
+    UltiNet,
+    UltiNetWrapper,
+    legacy_to_auction_targets,
+)
+from trickster.train_utils import ReplayBuffer, outcome_for_player, simple_outcome, calculate_reward
 
 
 # ---------------------------------------------------------------------------
 #  Mode helpers
 # ---------------------------------------------------------------------------
 
-MODES = ("simple", "betli", "mixed")
+MODES = ("simple", "betli", "mixed", "auto")
 
 
 def _pick_training_mode(mode: str, rng: random.Random) -> str:
     """Return the training_mode string for a single game."""
     if mode == "mixed":
         return rng.choice(["simple", "betli"])
+    if mode == "auto":
+        return "auto"
     return mode
 
 
@@ -71,50 +87,180 @@ def _soloist_won(state: UltiNode) -> bool:
 
 
 # ---------------------------------------------------------------------------
-#  Greedy talon discard heuristics
+#  Greedy talon discard heuristics (fallback for early training)
 # ---------------------------------------------------------------------------
-
-
-def _betli_discard_key(card: Card) -> int:
-    """Sort key for Betli discard: highest Betli-strength first.
-
-    In Betli, the ranking is A(low) < K < Q < J < 10 < 9 < 8 < 7(high).
-    Discarding the highest-strength cards (7s, 8s, 9s) gives the soloist
-    a fighting chance by removing dangerous trick-winners.
-    """
-    return -BETLI_STRENGTH[card.rank]
-
-
-def _simple_discard_key(card: Card) -> int:
-    """Sort key for Simple discard: lowest-value / weakest first.
-
-    Discard low-value non-trump cards to tighten the hand.
-    We prefer keeping Aces and Tens (high point value).
-    Sort by rank ascending — first two will be discarded.
-    """
-    return card.rank.value
 
 
 def _greedy_discard(hand: list[Card], betli: bool, trump: Suit | None) -> list[Card]:
     """Pick 2 cards to discard from a 12-card hand using a heuristic.
 
-    Betli mode:  Discard the two highest-strength cards (7s, 8s, 9s).
-                 These are the most dangerous in Betli because they win tricks.
+    Betli mode:  Discard the two highest-strength cards (A, K, ...).
     Simple mode: Discard the two weakest non-trump cards.
-                 Keeps strong trump cards and point cards (A, 10).
     """
     candidates = list(hand)
-
     if betli:
-        candidates.sort(key=_betli_discard_key)
+        candidates.sort(key=lambda c: -BETLI_STRENGTH[c.rank])
     else:
-        # Prefer discarding non-trump, then by weakness
         def simple_key(c: Card) -> tuple[int, int]:
             is_trump = 1 if (trump is not None and c.suit == trump) else 0
             return (is_trump, c.rank.value)
         candidates.sort(key=simple_key)
-
     return candidates[:2]
+
+
+# ---------------------------------------------------------------------------
+#  Neural discard wrapper (for use as _discard_fn callback)
+# ---------------------------------------------------------------------------
+
+
+def make_neural_discard_fn(
+    wrapper: UltiNetWrapper,
+    game: UltiGame,
+    soloist: int,
+    dealer: int,
+):
+    """Create a discard callback that uses the value head."""
+    from trickster.evaluator import neural_discard
+
+    def _fn(hand: list[Card], betli: bool, trump: Suit | None) -> list[Card]:
+        return neural_discard(hand, wrapper, game, soloist, betli, trump, dealer)
+    return _fn
+
+
+# ---------------------------------------------------------------------------
+#  Auto-mode: auction head picks contract + neural discard
+# ---------------------------------------------------------------------------
+
+
+def _auto_play_one_game(
+    game: UltiGame,
+    wrapper: UltiNetWrapper,
+    config: MCTSConfig,
+    def_config: MCTSConfig,
+    seed: int,
+    use_oracle: bool = True,
+    oracle_rollouts: int = 3,
+    self_play_defenders: bool = True,
+) -> tuple[
+    list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]],
+    np.ndarray | None,
+    int | None,
+    np.ndarray | None,
+]:
+    """Play one game in auto mode with full self-play."""
+    from trickster.evaluator import (
+        neural_discard,
+        oracle_evaluate,
+        oracle_best_contract,
+    )
+
+    rng = random.Random(seed)
+    dealer = seed % 3
+    _gs, _talon, soloist = game.get_hand12(seed=seed, dealer=dealer)
+    hand12 = list(_gs.hands[soloist])
+
+    # --- Auction Head: pick contract ---
+    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+    auction_feats = game._enc.encode_state(
+        hand=hand12,
+        captured=[[], [], []],
+        trick_cards=[],
+        trump=None,
+        betli=False,
+        soloist=soloist,
+        player=soloist,
+        trick_no=0,
+        scores=[0, 0, 0],
+        known_voids=empty_voids,
+        dealer=dealer,
+    )
+
+    auction_probs = wrapper.predict_auction(auction_feats)
+    suits = list(ALL_SUITS)
+    for ci, (mode, suit_idx) in enumerate(CONTRACT_CLASSES):
+        if mode != "betli" and suit_idx is not None:
+            if not any(c.suit == suits[suit_idx] for c in hand12):
+                auction_probs[ci] = 0.0
+    p_sum = auction_probs.sum()
+    if p_sum > 0:
+        auction_probs /= p_sum
+    else:
+        auction_probs = np.ones(NUM_CONTRACTS) / NUM_CONTRACTS
+
+    chosen_ci = rng.choices(range(NUM_CONTRACTS), weights=auction_probs, k=1)[0]
+    mode_str, suit_idx = CONTRACT_CLASSES[chosen_ci]
+    betli = (mode_str == "betli")
+    trump = suits[suit_idx] if suit_idx is not None else None
+
+    discards = neural_discard(hand12, wrapper, game, soloist, betli, trump, dealer)
+
+    oracle_heatmap = None
+    oracle_target = None
+    if use_oracle:
+        oracle_heatmap = oracle_evaluate(
+            hand12, soloist, dealer, wrapper, game,
+            seed=seed + 100000,
+            num_rollouts=oracle_rollouts,
+        )
+        oracle_target = oracle_best_contract(oracle_heatmap)
+
+    discard_fn = lambda h, b, t: discards
+    state = game.new_game(
+        seed=seed,
+        training_mode="auto",
+        starting_leader=dealer,
+        _contract_idx=chosen_ci,
+        _discard_fn=discard_fn,
+    )
+    soloist_idx = state.gs.soloist
+
+    trajectory: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+
+    while not game.is_terminal(state):
+        player = game.current_player(state)
+        actions = game.legal_actions(state)
+
+        if len(actions) <= 1:
+            state = game.apply(state, actions[0])
+            continue
+
+        # Self-play: soloist uses full MCTS, defenders use lower budget
+        if player == soloist_idx:
+            pi, action = alpha_mcts_policy(
+                state, game, wrapper, player, config, rng,
+            )
+        elif self_play_defenders:
+            pi, action = alpha_mcts_policy(
+                state, game, wrapper, player, def_config, rng,
+            )
+        else:
+            action = rng.choice(actions)
+            pi = np.zeros(game.action_space_size, dtype=np.float32)
+            pi[game.action_to_index(action)] = 1.0
+
+        state_feats = game.encode_state(state, player)
+        mask = game.legal_action_mask(state)
+        trajectory.append((
+            state_feats.copy(),
+            mask.copy(),
+            pi.copy(),
+            player,
+        ))
+
+        state = game.apply(state, action)
+
+    won = _soloist_won(state)
+
+    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]] = []
+    for state_feats, mask, pi, player in trajectory:
+        # Use simple ±1 rewards that match game.outcome() / MCTS scale.
+        # The compound scaling (outcome_for_player) is only meaningful
+        # when compound contracts are actually being trained.
+        reward = simple_outcome(state, player)
+        is_sol = (player == soloist_idx)
+        samples.append((state_feats, mask, pi, reward, is_sol))
+
+    return samples, auction_feats, oracle_target, oracle_heatmap
 
 
 # ---------------------------------------------------------------------------
@@ -128,24 +274,30 @@ def play_one_game(
     config: MCTSConfig,
     seed: int,
     mode: str = "simple",
-    use_greedy_discard: bool = True,
+    use_neural_discard: bool = False,
+    def_config: MCTSConfig | None = None,
+    self_play_defenders: bool = True,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
-    """Play one self-play game.
+    """Play one self-play game (simple/betli/mixed modes).
 
-    Returns list of ``(state_feats, mask, pi, reward, is_soloist)``.
-    The ``is_soloist`` flag enables weighted replay sampling.
-
-    When ``use_greedy_discard`` is True (default), the soloist uses a
-    heuristic discard instead of random:
-    - Betli: discard highest-strength cards (7s, 8s, 9s)
-    - Simple: discard weakest non-trump cards
+    With ``self_play_defenders=True``, defenders use the same UltiNet
+    with ``def_config`` (lower MCTS budget) instead of random play.
     """
     rng = random.Random(seed)
     training_mode = _pick_training_mode(mode, rng)
+
+    if use_neural_discard:
+        dealer = seed % 3
+        from trickster.games.ulti.game import next_player
+        soloist = next_player(dealer)
+        discard_fn = make_neural_discard_fn(wrapper, game, soloist, dealer)
+    else:
+        discard_fn = _greedy_discard
+
     state = game.new_game(
         seed=seed,
         training_mode=training_mode,
-        _discard_fn=_greedy_discard if use_greedy_discard else None,
+        _discard_fn=discard_fn,
     )
     soloist_idx = state.gs.soloist
     trajectory: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
@@ -158,10 +310,21 @@ def play_one_game(
             state = game.apply(state, actions[0])
             continue
 
-        # MCTS search
-        pi, action = alpha_mcts_policy(
-            state, game, wrapper, player, config, rng,
-        )
+        # Soloist always uses full MCTS
+        if player == soloist_idx:
+            pi, action = alpha_mcts_policy(
+                state, game, wrapper, player, config, rng,
+            )
+        elif self_play_defenders and def_config is not None:
+            # Defenders use same net with fewer sims
+            pi, action = alpha_mcts_policy(
+                state, game, wrapper, player, def_config, rng,
+            )
+        else:
+            # Fallback: random play for defenders
+            action = rng.choice(actions)
+            pi = np.zeros(game.action_space_size, dtype=np.float32)
+            pi[game.action_to_index(action)] = 1.0
 
         state_feats = game.encode_state(state, player)
         mask = game.legal_action_mask(state)
@@ -174,13 +337,14 @@ def play_one_game(
 
         state = game.apply(state, action)
 
-    # Determine outcome (handles both simple and betli)
     won = _soloist_won(state)
 
-    # Fill in rewards, tagging each sample with is_soloist
     samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]] = []
     for state_feats, mask, pi, player in trajectory:
-        reward = outcome_for_player(state, player, won)
+        # Use simple ±1 rewards that match game.outcome() / MCTS scale.
+        # This gives a strong learning signal and ensures the value head
+        # predictions are on the same scale as MCTS backpropagation.
+        reward = simple_outcome(state, player)
         is_sol = (player == soloist_idx)
         samples.append((state_feats, mask, pi, reward, is_sol))
 
@@ -188,7 +352,7 @@ def play_one_game(
 
 
 # ---------------------------------------------------------------------------
-#  Evaluation: trained model vs random
+#  Evaluation: trained model vs random (standard benchmark)
 # ---------------------------------------------------------------------------
 
 
@@ -199,25 +363,9 @@ def eval_vs_random(
     mode: str = "simple",
     num_games: int = 20,
     seed: int = 99999,
-    use_greedy_discard: bool = True,
+    use_neural_discard: bool = False,
 ) -> dict[str, float]:
-    """Play trained agent (player 0) vs random opponents.
-
-    Returns a dict with per-role, per-contract-type win rates::
-
-        {
-            "simple": 0.70,         # combined WR for simple
-            "simple_sol": 0.45,     # soloist WR for simple
-            "simple_def": 0.82,     # defender WR for simple
-            "betli": 0.73,
-            "betli_sol": 0.20,
-            "betli_def": 0.97,
-            "all": 0.71,
-            "all_sol": 0.33,
-            "all_def": 0.90,
-        }
-    """
-    # Track wins and counts per (mode, role)
+    """Play trained agent (player 0) vs random opponents."""
     wins: dict[str, int] = {}
     counts: dict[str, int] = {}
     rng_mode = random.Random(seed)
@@ -227,16 +375,27 @@ def eval_vs_random(
         if won:
             wins[key] = wins.get(key, 0) + 1
 
+    eval_mode = mode if mode != "auto" else "mixed"
+
     for g in range(num_games):
         rng = random.Random(seed + g)
         rng_rand = random.Random(seed + g + 50000)
 
-        training_mode = _pick_training_mode(mode, rng_mode)
+        training_mode = _pick_training_mode(eval_mode, rng_mode)
+        dealer = g % 3
+
+        if use_neural_discard:
+            from trickster.games.ulti.game import next_player
+            soloist = next_player(dealer)
+            discard_fn = make_neural_discard_fn(wrapper, game, soloist, dealer)
+        else:
+            discard_fn = _greedy_discard
+
         state = game.new_game(
             seed=seed + g,
             training_mode=training_mode,
-            starting_leader=g % 3,
-            _discard_fn=_greedy_discard if use_greedy_discard else None,
+            starting_leader=dealer,
+            _discard_fn=discard_fn,
         )
         is_soloist = (state.gs.soloist == 0)
         role = "sol" if is_soloist else "def"
@@ -260,13 +419,105 @@ def eval_vs_random(
 
         p0_won = game.outcome(state, 0) > 0
 
-        # Track per (contract_type), per (contract_type + role), and global
         _inc(training_mode, p0_won)
         _inc(f"{training_mode}_{role}", p0_won)
         _inc("all", p0_won)
         _inc(f"all_{role}", p0_won)
 
-    # Build result dict
+    result: dict[str, float] = {}
+    for key in sorted(counts):
+        result[key] = wins.get(key, 0) / max(1, counts[key])
+    return result
+
+
+# ---------------------------------------------------------------------------
+#  Elite Benchmark: Neural Net (0 MCTS) vs Oracle (MCTS 50)
+# ---------------------------------------------------------------------------
+
+
+def eval_elite(
+    game: UltiGame,
+    wrapper: UltiNetWrapper,
+    mode: str = "simple",
+    num_games: int = 10,
+    seed: int = 88888,
+    oracle_sims: int = 50,
+) -> dict[str, float]:
+    """Compare 'Intuition' (policy-only, no MCTS) vs 'Search' (MCTS 50).
+
+    Player 0 = Neural Net (uses predict_policy directly, 0 sims).
+    Player 1,2 = Oracle (full MCTS with ``oracle_sims`` simulations).
+
+    This measures how close the NN's raw intuition is to proper search.
+    """
+    oracle_config = MCTSConfig(
+        simulations=oracle_sims,
+        determinizations=1,
+        c_puct=1.5,
+        dirichlet_alpha=0.0,
+        dirichlet_weight=0.0,
+        use_value_head=True,
+        use_policy_priors=True,
+        visit_temp=0.1,
+    )
+
+    wins: dict[str, int] = {}
+    counts: dict[str, int] = {}
+    rng_mode = random.Random(seed)
+
+    def _inc(key: str, won: bool) -> None:
+        counts[key] = counts.get(key, 0) + 1
+        if won:
+            wins[key] = wins.get(key, 0) + 1
+
+    eval_mode = mode if mode != "auto" else "mixed"
+
+    for g in range(num_games):
+        rng = random.Random(seed + g)
+        training_mode = _pick_training_mode(eval_mode, rng_mode)
+        dealer = g % 3
+
+        state = game.new_game(
+            seed=seed + g,
+            training_mode=training_mode,
+            starting_leader=dealer,
+            _discard_fn=_greedy_discard,
+        )
+        is_soloist = (state.gs.soloist == 0)
+        role = "sol" if is_soloist else "def"
+
+        while not game.is_terminal(state):
+            player = game.current_player(state)
+            actions = game.legal_actions(state)
+
+            if len(actions) <= 1:
+                state = game.apply(state, actions[0])
+                continue
+
+            if player == 0:
+                # Pure intuition: pick the highest-prob legal action
+                state_feats = game.encode_state(state, player)
+                mask = game.legal_action_mask(state)
+                probs = wrapper.predict_policy(state_feats, mask)
+                best_idx = int(np.argmax(probs))
+                # Convert card index → Card action
+                from trickster.games.ulti.adapter import _IDX_TO_CARD
+                action = _IDX_TO_CARD[best_idx]
+            else:
+                # Oracle: full MCTS search
+                _pi, action = alpha_mcts_policy(
+                    state, game, wrapper, player, oracle_config, rng,
+                )
+
+            state = game.apply(state, action)
+
+        p0_won = game.outcome(state, 0) > 0
+
+        _inc(training_mode, p0_won)
+        _inc(f"{training_mode}_{role}", p0_won)
+        _inc("all", p0_won)
+        _inc(f"all_{role}", p0_won)
+
     result: dict[str, float] = {}
     for key in sorted(counts):
         result[key] = wins.get(key, 0) / max(1, counts[key])
@@ -280,17 +531,19 @@ def eval_vs_random(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ulti Curriculum Training — simple / betli / mixed",
+        description="Ulti Curriculum Training — simple / betli / mixed / auto",
     )
     parser.add_argument("--mode", type=str, default="simple",
                         choices=MODES,
-                        help="Curriculum mode: simple, betli, or mixed (default simple)")
+                        help="Curriculum mode (default simple)")
     parser.add_argument("--steps", type=int, default=200,
                         help="Training iterations (default 200)")
     parser.add_argument("--games-per-step", type=int, default=4,
                         help="Self-play games per training step (default 4)")
     parser.add_argument("--sims", type=int, default=20,
-                        help="MCTS simulations per move (default 20)")
+                        help="MCTS simulations per move for soloist (default 20)")
+    parser.add_argument("--def-sims", type=int, default=8,
+                        help="MCTS simulations per move for defenders (default 8)")
     parser.add_argument("--dets", type=int, default=1,
                         help="MCTS determinizations per move (default 1)")
     parser.add_argument("--batch-size", type=int, default=64,
@@ -301,6 +554,12 @@ def main() -> None:
                         help="Evaluate every N steps (default 10)")
     parser.add_argument("--eval-games", type=int, default=20,
                         help="Games per evaluation (default 20)")
+    parser.add_argument("--elite-interval", type=int, default=0,
+                        help="Elite benchmark every N steps (0=disabled)")
+    parser.add_argument("--elite-games", type=int, default=10,
+                        help="Games per elite benchmark (default 10)")
+    parser.add_argument("--elite-sims", type=int, default=50,
+                        help="MCTS sims for Oracle in elite benchmark (default 50)")
     parser.add_argument("--buffer-size", type=int, default=50000,
                         help="Replay buffer capacity (default 50000)")
     parser.add_argument("--body-units", type=int, default=256,
@@ -315,6 +574,16 @@ def main() -> None:
                         help="Path to save the model (default models/ulti_{mode}.pt)")
     parser.add_argument("--load", type=str, default=None,
                         help="Path to load a pre-trained model to continue training")
+    parser.add_argument("--neural-discard", action="store_true",
+                        help="Use neural discard (value head) instead of greedy heuristic")
+    parser.add_argument("--oracle-rollouts", type=int, default=3,
+                        help="Rollouts per contract for Oracle (auto mode, default 3)")
+    parser.add_argument("--no-self-play", action="store_true",
+                        help="Use random defenders instead of self-play (legacy mode)")
+    parser.add_argument("--checkpoint-interval", type=int, default=0,
+                        help="Save checkpoint every N steps (0=disabled, e.g. 50)")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Directory for checkpoints (default: models/checkpoints/{mode})")
     args = parser.parse_args()
 
     if args.save is None:
@@ -325,6 +594,8 @@ def main() -> None:
     np.random.seed(args.seed)
     device = args.device
     mode = args.mode
+    use_neural = args.neural_discard or mode == "auto"
+    self_play = not args.no_self_play
 
     game = UltiGame()
     net = UltiNet(
@@ -332,12 +603,23 @@ def main() -> None:
         body_units=args.body_units,
         body_layers=args.body_layers,
         action_dim=game.action_space_size,
+        num_contracts=NUM_CONTRACTS,
     )
 
-    # Optionally load a pre-trained model (e.g. simple-trained → fine-tune on mixed)
+    # Optionally load a pre-trained model
     if args.load:
         checkpoint = torch.load(args.load, weights_only=True)
-        net.load_state_dict(checkpoint["model_state_dict"])
+        model_dict = net.state_dict()
+        pretrained = {k: v for k, v in checkpoint["model_state_dict"].items()
+                      if k in model_dict and v.shape == model_dict[k].shape}
+        model_dict.update(pretrained)
+        net.load_state_dict(model_dict)
+        skipped = set(checkpoint["model_state_dict"]) - set(pretrained)
+        new_keys = set(model_dict) - set(checkpoint["model_state_dict"])
+        if skipped:
+            print(f"  Skipped incompatible keys: {skipped}")
+        if new_keys:
+            print(f"  Randomly initialized new keys: {new_keys}")
         print(f"  Loaded pre-trained model from {args.load}")
 
     wrapper = UltiNetWrapper(net, device=device)
@@ -346,7 +628,12 @@ def main() -> None:
     buffer = ReplayBuffer(capacity=args.buffer_size)
     np_rng = np.random.default_rng(args.seed)
 
-    # MCTS config for self-play (exploration on)
+    # Auction training buffer (for auto mode)
+    # Stores (feats, trump_target, flags_target) for multi-component training
+    auction_buffer: list[tuple[np.ndarray, int, np.ndarray]] = []
+    AUCTION_BUF_MAX = 5000
+
+    # MCTS config for soloist self-play (exploration on)
     train_config = MCTSConfig(
         simulations=args.sims,
         determinizations=args.dets,
@@ -358,21 +645,38 @@ def main() -> None:
         visit_temp=1.0,
     )
 
+    # MCTS config for defender self-play (lower budget, less exploration)
+    def_config = MCTSConfig(
+        simulations=args.def_sims,
+        determinizations=args.dets,
+        c_puct=1.5,
+        dirichlet_alpha=0.1,
+        dirichlet_weight=0.15,
+        use_value_head=True,
+        use_policy_priors=True,
+        visit_temp=0.5,
+    )
+
     # MCTS config for evaluation (exploitation)
     eval_config = MCTSConfig(
         simulations=args.sims,
         determinizations=args.dets,
         c_puct=1.5,
-        dirichlet_alpha=0.0,   # no noise
+        dirichlet_alpha=0.0,
         dirichlet_weight=0.0,
         use_value_head=True,
         use_policy_priors=True,
-        visit_temp=0.1,        # near-greedy
+        visit_temp=0.1,
     )
 
     param_count = sum(p.numel() for p in net.parameters())
 
-    mode_label = {"simple": "Simple (Parti)", "betli": "Betli", "mixed": "Mixed (Simple + Betli)"}
+    mode_label = {
+        "simple": "Simple (Parti)",
+        "betli": "Betli",
+        "mixed": "Mixed (Simple + Betli)",
+        "auto": "Auto (Auction Head + Oracle)",
+    }
 
     print("=" * 64)
     print(f"  Ulti Training — {mode_label[mode]} Curriculum")
@@ -380,14 +684,28 @@ def main() -> None:
     print(f"  Mode: {mode}")
     print(f"  Model: UltiNet {args.body_units}x{args.body_layers} "
           f"({param_count:,} params)")
-    print(f"  MCTS: {args.sims} sims x {args.dets} dets")
+    print(f"  MCTS: soloist={args.sims} sims, "
+          f"defenders={'self-play ' + str(args.def_sims) + ' sims' if self_play else 'random'}")
     print(f"  Steps: {args.steps} x {args.games_per_step} games/step "
           f"= {args.steps * args.games_per_step} games")
     print(f"  LR: {args.lr}  Batch: {args.batch_size}  "
           f"Buffer: {args.buffer_size}")
     print(f"  Device: {device}")
+    print(f"  Discard: {'neural (value head)' if use_neural else 'greedy heuristic'}")
+    if mode == "auto":
+        print(f"  Oracle: {args.oracle_rollouts} rollouts/contract")
     print(f"  Eval: every {args.eval_interval} steps, "
           f"{args.eval_games} games vs Random")
+    if args.elite_interval > 0:
+        print(f"  Elite: every {args.elite_interval} steps, "
+              f"{args.elite_games} games — NN(0) vs Oracle({args.elite_sims})")
+    ckpt_dir: Path | None = None
+    if args.checkpoint_interval > 0:
+        ckpt_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else (
+            Path("models") / "checkpoints" / mode
+        )
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Checkpoints: every {args.checkpoint_interval} steps → {ckpt_dir}/")
     print()
 
     t0 = time.perf_counter()
@@ -400,9 +718,32 @@ def main() -> None:
 
         # ---- 1. Self-play: collect samples ----
         step_samples = 0
+        step_auction_samples = 0
         for g in range(args.games_per_step):
             game_seed = args.seed + step * 1000 + g
-            samples = play_one_game(game, wrapper, train_config, game_seed, mode=mode)
+
+            if mode == "auto":
+                samples, auc_feats, oracle_target, _ = _auto_play_one_game(
+                    game, wrapper, train_config, def_config, game_seed,
+                    use_oracle=True,
+                    oracle_rollouts=args.oracle_rollouts,
+                    self_play_defenders=self_play,
+                )
+                # Store multi-component auction training sample
+                if auc_feats is not None and oracle_target is not None:
+                    trump_t, flags_t = legacy_to_auction_targets(oracle_target)
+                    auction_buffer.append((auc_feats.copy(), trump_t, flags_t.copy()))
+                    if len(auction_buffer) > AUCTION_BUF_MAX:
+                        auction_buffer = auction_buffer[-AUCTION_BUF_MAX:]
+                    step_auction_samples += 1
+            else:
+                samples = play_one_game(
+                    game, wrapper, train_config, game_seed,
+                    mode=mode, use_neural_discard=use_neural,
+                    def_config=def_config,
+                    self_play_defenders=self_play,
+                )
+
             for s, m, p, r, is_sol in samples:
                 buffer.push(s, m, p, r, is_soloist=is_sol)
             step_samples += len(samples)
@@ -411,12 +752,17 @@ def main() -> None:
         total_samples += step_samples
 
         # ---- 2. Train on replay buffer ----
+        avg_vloss = 0.0
+        avg_ploss = 0.0
+        avg_aloss = 0.0
+
         if len(buffer) >= args.batch_size:
             net.train()
-            # Do multiple gradient steps per self-play batch
             train_steps = max(1, step_samples // args.batch_size)
             total_vloss = 0.0
             total_ploss = 0.0
+            total_aloss = 0.0
+            auction_train_count = 0
 
             for _ in range(train_steps):
                 states, masks, policies, rewards = buffer.sample(
@@ -430,14 +776,41 @@ def main() -> None:
 
                 log_probs, values = net(s_t, m_t)
 
-                # Value loss: MSE(predicted_value, reward)
                 value_loss = F.mse_loss(values, z_t)
-
-                # Policy loss: Cross-entropy(MCTS_policy, predicted_policy)
-                # = -sum(pi * log_probs)
                 policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
-
                 loss = value_loss + policy_loss
+
+                # ---- Multi-component auction head training (auto mode) ----
+                if mode == "auto" and len(auction_buffer) >= 8:
+                    auc_batch_size = min(16, len(auction_buffer))
+                    auc_indices = np_rng.choice(
+                        len(auction_buffer), size=auc_batch_size, replace=False,
+                    )
+                    auc_states = np.stack([auction_buffer[i][0] for i in auc_indices])
+                    auc_trump_targets = np.array(
+                        [auction_buffer[i][1] for i in auc_indices], dtype=np.int64,
+                    )
+                    auc_flag_targets = np.stack(
+                        [auction_buffer[i][2] for i in auc_indices],
+                    )
+
+                    auc_s = torch.from_numpy(auc_states).float().to(device)
+                    auc_tt = torch.from_numpy(auc_trump_targets).long().to(device)
+                    auc_ft = torch.from_numpy(auc_flag_targets).float().to(device)
+
+                    trump_lp, flag_logits = net.forward_auction(auc_s)
+
+                    # Trump loss: cross-entropy
+                    trump_loss = F.nll_loss(trump_lp, auc_tt)
+                    # Flags loss: binary cross-entropy
+                    flags_loss = F.binary_cross_entropy_with_logits(
+                        flag_logits, auc_ft,
+                    )
+                    auction_loss = trump_loss + flags_loss
+
+                    loss = loss + auction_loss
+                    total_aloss += auction_loss.item()
+                    auction_train_count += 1
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -449,39 +822,40 @@ def main() -> None:
 
             avg_vloss = total_vloss / train_steps
             avg_ploss = total_ploss / train_steps
-        else:
-            avg_vloss = 0.0
-            avg_ploss = 0.0
+            if auction_train_count > 0:
+                avg_aloss = total_aloss / auction_train_count
 
         elapsed = time.perf_counter() - t0
         step_time = time.perf_counter() - step_t
 
         # ---- 3. Progress ----
+        aloss_str = f"  aloss={avg_aloss:.4f}" if mode == "auto" else ""
         print(
             f"\r  step {step:3d}/{args.steps}  "
             f"games={total_games:4d}  "
             f"samples={total_samples:5d}  "
             f"buf={len(buffer):5d}  "
             f"vloss={avg_vloss:.4f}  "
-            f"ploss={avg_ploss:.4f}  "
+            f"ploss={avg_ploss:.4f}"
+            f"{aloss_str}  "
             f"[{step_time:.1f}s / {elapsed:.0f}s]",
             end="", flush=True,
         )
 
-        # ---- 4. Evaluate ----
+        # ---- 4. Evaluate vs Random ----
         if step % args.eval_interval == 0 or step == args.steps:
             wr_dict = eval_vs_random(
                 game, wrapper, eval_config,
                 mode=mode,
                 num_games=args.eval_games,
                 seed=step * 7777,
+                use_neural_discard=use_neural,
             )
             wr = wr_dict.get("all", 0.0)
             tag = " *BEST*" if wr > best_wr else ""
             if wr > best_wr:
                 best_wr = wr
 
-            # Format per-mode + per-role breakdown
             contract_types = sorted(
                 k for k in wr_dict
                 if k not in ("all", "all_sol", "all_def") and "_" not in k
@@ -511,6 +885,52 @@ def main() -> None:
                 f"  (best: {best_wr:.0%}){tag}"
             )
 
+        # ---- 5. Elite Benchmark: NN(0) vs Oracle(MCTS) ----
+        if args.elite_interval > 0 and (
+            step % args.elite_interval == 0 or step == args.steps
+        ):
+            elite_t = time.perf_counter()
+            elite_dict = eval_elite(
+                game, wrapper,
+                mode=mode,
+                num_games=args.elite_games,
+                seed=step * 3333,
+                oracle_sims=args.elite_sims,
+            )
+            elite_wr = elite_dict.get("all", 0.0)
+            elite_sol = elite_dict.get("all_sol")
+            elite_def = elite_dict.get("all_def")
+            e_sol = f"{elite_sol:.0%}" if elite_sol is not None else "n/a"
+            e_def = f"{elite_def:.0%}" if elite_def is not None else "n/a"
+            elite_time = time.perf_counter() - elite_t
+
+            print(
+                f"  >>> ELITE step {step}: "
+                f"NN(0) vs Oracle({args.elite_sims}) — "
+                f"WR={elite_wr:.0%} (sol={e_sol}, def={e_def})  "
+                f"[{elite_time:.1f}s]"
+            )
+
+        # ---- 6. Checkpoint ----
+        if ckpt_dir is not None and (
+            step % args.checkpoint_interval == 0 or step == args.steps
+        ):
+            ckpt_path = ckpt_dir / f"step_{step:05d}.pt"
+            torch.save({
+                "model_state_dict": net.state_dict(),
+                "body_units": args.body_units,
+                "body_layers": args.body_layers,
+                "input_dim": game.state_dim,
+                "action_dim": game.action_space_size,
+                "num_contracts": NUM_CONTRACTS,
+                "training_mode": mode,
+                "step": step,
+                "total_games": total_games,
+                "total_samples": total_samples,
+                "best_win_rate": best_wr,
+            }, ckpt_path)
+            print(f"  >>> CHECKPOINT saved: {ckpt_path}")
+
     # ---- Save ----
     total_time = time.perf_counter() - t0
     print()
@@ -520,6 +940,8 @@ def main() -> None:
     print(f"  Games: {total_games}  Samples: {total_samples}")
     print(f"  Time: {total_time:.0f}s ({total_time / 60:.1f} min)")
     print(f"  Best win rate: {best_wr:.0%}")
+    if mode == "auto":
+        print(f"  Auction buffer: {len(auction_buffer)} samples")
 
     save_path = Path(args.save)
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -529,6 +951,7 @@ def main() -> None:
         "body_layers": args.body_layers,
         "input_dim": game.state_dim,
         "action_dim": game.action_space_size,
+        "num_contracts": NUM_CONTRACTS,
         "training_mode": mode,
         "total_games": total_games,
         "best_win_rate": best_wr,

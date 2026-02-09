@@ -1584,3 +1584,20 @@ body {
 .ulti-row-win { background: rgba(76, 175, 80, 0.06); }
 .ulti-row-loss { background: rgba(239, 83, 80, 0.06); }
 
+/* AI mode selector */
+.ulti-ai-select {
+  font-size: 12px;
+  padding: 4px 8px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.ulti-no-model {
+  font-size: 11px;
+  color: #ff9800;
+  padding: 4px 6px;
+}
+

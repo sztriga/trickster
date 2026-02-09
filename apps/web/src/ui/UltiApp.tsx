@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ultiAiSettings,
   ultiAuction,
   ultiBid,
   ultiContinue,
   ultiKontra,
+  ultiModelInfo,
   ultiNewGame,
   ultiPlay,
   ultiTrump,
@@ -249,6 +251,26 @@ export function UltiApp() {
     finally { setBusy(false); }
   }
 
+  // AI mode
+  const [aiMode, setAiMode] = useState<string>("neural");
+  const [aiStrength, setAiStrength] = useState<string>("medium");
+  const [modelLoaded, setModelLoaded] = useState<boolean | null>(null);
+
+  // Check model on mount
+  useEffect(() => {
+    ultiModelInfo().then((info) => {
+      setModelLoaded(info.loaded);
+      if (!info.loaded) setAiMode("random");
+    }).catch(() => setModelLoaded(false));
+  }, []);
+
+  // Sync AI settings when changed
+  useEffect(() => {
+    if (!state?.gameId) return;
+    ultiAiSettings(state.gameId, aiMode, aiStrength).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiMode, aiStrength, state?.gameId]);
+
   // Captured cards reveal toggle
   const [showCaptured, setShowCaptured] = useState(false);
 
@@ -315,6 +337,33 @@ export function UltiApp() {
           </div>
         </div>
         <div className="controls">
+          <select
+            className="btn ulti-ai-select"
+            value={aiMode}
+            onChange={(e) => setAiMode(e.target.value)}
+            title="AI mód"
+          >
+            <option value="neural">AI: Neural</option>
+            <option value="mcts">AI: MCTS</option>
+            <option value="random">AI: Random</option>
+          </select>
+          {aiMode === "mcts" && (
+            <select
+              className="btn ulti-ai-select"
+              value={aiStrength}
+              onChange={(e) => setAiStrength(e.target.value)}
+              title="AI erősség"
+            >
+              <option value="fast">Gyors (5)</option>
+              <option value="medium">Közepes (20)</option>
+              <option value="strong">Erős (50)</option>
+            </select>
+          )}
+          {modelLoaded === false && (
+            <span className="ulti-no-model" title="Nincs modell — tanítsd be: python scripts/train_baseline.py --mode mixed --steps 200">
+              ⚠ Nincs modell
+            </span>
+          )}
           {roundHistory.length > 0 && (
             <button className="btn" onClick={() => setShowScorecard(true)} disabled={busy}>
               Pontszámok
