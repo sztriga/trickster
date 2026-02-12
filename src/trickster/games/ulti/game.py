@@ -67,12 +67,15 @@ class GameState:
     marriages_declared: bool = False  # True once declare_all_marriages() has run
     trick_history: list[tuple[int, int]] = None  # (leader, winner) for each completed trick
     training_mode: Optional[str] = None  # curriculum flag: "simple"|"betli"|"ulti"|None (all)
+    talon_discards: list[Card] = None  # 2 cards the soloist discarded (hidden from defenders)
 
     def __post_init__(self):
         if self.marriages is None:
             self.marriages = []
         if self.trick_history is None:
             self.trick_history = []
+        if self.talon_discards is None:
+            self.talon_discards = []
 
     def clone(self) -> GameState:
         """Lightweight copy — only mutable containers are duplicated."""
@@ -95,6 +98,7 @@ class GameState:
             marriages_declared=self.marriages_declared,
             trick_history=list(self.trick_history),
             training_mode=self.training_mode,
+            talon_discards=list(self.talon_discards),
         )
         return gs
 
@@ -174,15 +178,17 @@ def pickup_talon(state: GameState, soloist: int, talon: list[Card]) -> None:
 def discard_talon(state: GameState, discards: list[Card]) -> None:
     """Soloist discards 2 cards back down to 10.
 
-    Discarded cards count toward the soloist's captured pile for
-    scoring (Aces/Tens in the discard still earn points).
+    Discarded cards are stored separately in ``talon_discards``.
+    Their card-point value counts for the **defenders** (not the
+    soloist) — this is reflected in ``defender_points()``.
+    Only the soloist knows which cards were discarded; defenders
+    cannot see them.
     """
     assert len(discards) == TALON_SIZE
     soloist = state.soloist
     for c in discards:
         state.hands[soloist].remove(c)
-    state.captured[soloist].extend(discards)
-    state.scores[soloist] += sum(c.points() for c in discards)
+    state.talon_discards = list(discards)
 
 
 def set_contract(
@@ -385,13 +391,23 @@ def is_terminal(state: GameState) -> bool:
 
 
 def soloist_points(state: GameState) -> int:
-    """Total card points accumulated by the soloist (including discards)."""
+    """Total card points accumulated by the soloist (trick points only).
+
+    Does NOT include talon discard points — those count for the
+    defenders.
+    """
     return state.scores[state.soloist]
 
 
 def defender_points(state: GameState) -> int:
-    """Total card points accumulated by both defenders combined."""
-    return sum(s for i, s in enumerate(state.scores) if i != state.soloist)
+    """Total card points accumulated by both defenders combined.
+
+    Includes the card-point value of the soloist's talon discards,
+    since those points count for the defenders by rule.
+    """
+    trick_pts = sum(s for i, s in enumerate(state.scores) if i != state.soloist)
+    talon_pts = sum(c.points() for c in state.talon_discards) if state.talon_discards else 0
+    return trick_pts + talon_pts
 
 
 def soloist_won_simple(state: GameState) -> bool:

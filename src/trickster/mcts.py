@@ -242,13 +242,13 @@ def _run_mcts(
                 leaf.children.append(child)
                 # Lazy: do NOT compute child states here
 
-            # Evaluate the leaf position
+            # Evaluate the leaf position (coalition-aware: allies share value sign)
             if leaf_value_from_both is not None:
-                value = (leaf_value_from_both if leaf_player == perspective
+                value = (leaf_value_from_both if leaf_player in perspective_allies
                          else -leaf_value_from_both)
             elif use_value:
                 leaf_value = net.predict_value(leaf_feats)
-                value = leaf_value if leaf_player == perspective else -leaf_value
+                value = leaf_value if leaf_player in perspective_allies else -leaf_value
             else:
                 value = _random_rollout(
                     leaf_state, game, perspective,

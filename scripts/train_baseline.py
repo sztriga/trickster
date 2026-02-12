@@ -23,10 +23,17 @@ Elite Benchmark (--elite-interval):
   Periodically evaluates the Neural Net (policy-only, 0 MCTS sims)
   vs the Oracle (MCTS 50) to measure how close intuition is to search.
 
+Parallel self-play (--workers N):
+  With N > 1, self-play games within each step are distributed across N
+  worker processes using ProcessPoolExecutor.  Each worker has its own
+  copy of UltiNet; weights are synced from the main process every step.
+  Increase --games-per-step proportionally for best throughput.
+
 Usage:
     python scripts/train_baseline.py [--mode simple] [--steps 200]
     python scripts/train_baseline.py --mode mixed --steps 200 --self-play
     python scripts/train_baseline.py --mode auto --steps 200 --neural-discard
+    python scripts/train_baseline.py --mode mixed --workers 4 --games-per-step 16
 """
 from __future__ import annotations
 
@@ -59,7 +66,74 @@ from trickster.model import (
     UltiNetWrapper,
     legacy_to_auction_targets,
 )
-from trickster.train_utils import ReplayBuffer, outcome_for_player, simple_outcome, calculate_reward
+from trickster.train_utils import (
+    ReplayBuffer, CheckpointPool,
+    outcome_for_player, simple_outcome, calculate_reward,
+)
+
+
+# ---------------------------------------------------------------------------
+#  Multiprocessing helpers (must be at module level for pickling)
+# ---------------------------------------------------------------------------
+
+_WORKER_GAME: UltiGame | None = None
+_WORKER_NET: UltiNet | None = None
+_WORKER_WRAPPER: UltiNetWrapper | None = None
+_WORKER_OPP_NET: UltiNet | None = None
+_WORKER_OPP_WRAPPER: UltiNetWrapper | None = None
+
+
+def _init_self_play_worker(net_kwargs: dict, device: str) -> None:
+    """Called once per worker process to create game + 2 models.
+
+    Two networks are needed for league training: the current (soloist)
+    and the opponent (defenders, loaded from checkpoint pool).
+    """
+    global _WORKER_GAME, _WORKER_NET, _WORKER_WRAPPER
+    global _WORKER_OPP_NET, _WORKER_OPP_WRAPPER
+    _WORKER_GAME = UltiGame()
+    _WORKER_NET = UltiNet(**net_kwargs)
+    _WORKER_WRAPPER = UltiNetWrapper(_WORKER_NET, device=device)
+    _WORKER_OPP_NET = UltiNet(**net_kwargs)
+    _WORKER_OPP_WRAPPER = UltiNetWrapper(_WORKER_OPP_NET, device=device)
+
+
+def _play_game_in_worker(
+    args: tuple,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
+    """Worker entry-point for simple/betli/mixed self-play."""
+    (state_dict, opp_state_dict, config, def_config,
+     seed, mode, use_neural, self_play) = args
+    _WORKER_NET.load_state_dict(state_dict)
+    opp_wrapper = None
+    if opp_state_dict is not None:
+        _WORKER_OPP_NET.load_state_dict(opp_state_dict)
+        opp_wrapper = _WORKER_OPP_WRAPPER
+    return play_one_game(
+        _WORKER_GAME, _WORKER_WRAPPER, config, seed,
+        mode=mode, use_neural_discard=use_neural,
+        def_config=def_config,
+        self_play_defenders=self_play,
+        opponent_wrapper=opp_wrapper,
+    )
+
+
+def _auto_play_in_worker(args: tuple) -> tuple:
+    """Worker entry-point for auto-mode self-play."""
+    (state_dict, opp_state_dict, config, def_config, seed,
+     use_oracle, oracle_rollouts, self_play) = args
+    _WORKER_NET.load_state_dict(state_dict)
+    opp_wrapper = None
+    if opp_state_dict is not None:
+        _WORKER_OPP_NET.load_state_dict(opp_state_dict)
+        opp_wrapper = _WORKER_OPP_WRAPPER
+    return _auto_play_one_game(
+        _WORKER_GAME, _WORKER_WRAPPER, config, def_config, seed,
+        use_oracle=use_oracle,
+        oracle_rollouts=oracle_rollouts,
+        self_play_defenders=self_play,
+        opponent_wrapper=opp_wrapper,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,13 +215,18 @@ def _auto_play_one_game(
     use_oracle: bool = True,
     oracle_rollouts: int = 3,
     self_play_defenders: bool = True,
+    opponent_wrapper: UltiNetWrapper | None = None,
 ) -> tuple[
     list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]],
     np.ndarray | None,
     int | None,
     np.ndarray | None,
 ]:
-    """Play one game in auto mode with full self-play."""
+    """Play one game in auto mode with full self-play.
+
+    If ``opponent_wrapper`` is provided, defenders use that network
+    (from the checkpoint pool) instead of the current ``wrapper``.
+    """
     from trickster.evaluator import (
         neural_discard,
         oracle_evaluate,
@@ -224,14 +303,15 @@ def _auto_play_one_game(
             state = game.apply(state, actions[0])
             continue
 
-        # Self-play: soloist uses full MCTS, defenders use lower budget
+        # Self-play: soloist uses current net, defenders use opponent (or same)
         if player == soloist_idx:
             pi, action = alpha_mcts_policy(
                 state, game, wrapper, player, config, rng,
             )
         elif self_play_defenders:
+            def_w = opponent_wrapper if opponent_wrapper is not None else wrapper
             pi, action = alpha_mcts_policy(
-                state, game, wrapper, player, def_config, rng,
+                state, game, def_w, player, def_config, rng,
             )
         else:
             action = rng.choice(actions)
@@ -277,11 +357,14 @@ def play_one_game(
     use_neural_discard: bool = False,
     def_config: MCTSConfig | None = None,
     self_play_defenders: bool = True,
+    opponent_wrapper: UltiNetWrapper | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
     """Play one self-play game (simple/betli/mixed modes).
 
-    With ``self_play_defenders=True``, defenders use the same UltiNet
-    with ``def_config`` (lower MCTS budget) instead of random play.
+    With ``self_play_defenders=True``, defenders use ``def_config``
+    (lower MCTS budget).  If ``opponent_wrapper`` is provided,
+    defenders use that network (from the checkpoint pool) instead
+    of the current ``wrapper``.
     """
     rng = random.Random(seed)
     training_mode = _pick_training_mode(mode, rng)
@@ -310,15 +393,15 @@ def play_one_game(
             state = game.apply(state, actions[0])
             continue
 
-        # Soloist always uses full MCTS
+        # Soloist always uses current net; defenders use opponent (or same)
         if player == soloist_idx:
             pi, action = alpha_mcts_policy(
                 state, game, wrapper, player, config, rng,
             )
         elif self_play_defenders and def_config is not None:
-            # Defenders use same net with fewer sims
+            def_w = opponent_wrapper if opponent_wrapper is not None else wrapper
             pi, action = alpha_mcts_policy(
-                state, game, wrapper, player, def_config, rng,
+                state, game, def_w, player, def_config, rng,
             )
         else:
             # Fallback: random play for defenders
@@ -428,6 +511,96 @@ def eval_vs_random(
     for key in sorted(counts):
         result[key] = wins.get(key, 0) / max(1, counts[key])
     return result
+
+
+# ---------------------------------------------------------------------------
+#  Head-to-head: checkpoint A vs checkpoint B
+# ---------------------------------------------------------------------------
+
+
+def eval_head_to_head(
+    game: UltiGame,
+    wrapper_a: UltiNetWrapper,
+    wrapper_b: UltiNetWrapper,
+    config: MCTSConfig,
+    def_config: MCTSConfig,
+    mode: str = "simple",
+    num_games: int = 100,
+    seed: int = 55555,
+) -> dict[str, float]:
+    """Play wrapper_a (soloist) vs wrapper_b (defenders) and vice versa.
+
+    Each game is played twice with swapped roles so the result is
+    symmetric.  Returns win rates for agent A in each role.
+    """
+    wins_a = 0
+    total = 0
+    sol_wins_a = 0
+    sol_total = 0
+    def_wins_a = 0
+    def_total = 0
+    rng_mode = random.Random(seed)
+    eval_mode = mode if mode != "auto" else "mixed"
+
+    for g in range(num_games):
+        rng = random.Random(seed + g)
+        training_mode = _pick_training_mode(eval_mode, rng_mode)
+        dealer = g % 3
+
+        state = game.new_game(
+            seed=seed + g,
+            training_mode=training_mode,
+            starting_leader=dealer,
+            _discard_fn=_greedy_discard,
+        )
+        soloist_idx = state.gs.soloist
+
+        # First half: A=soloist, B=defenders
+        # Second half: B=soloist, A=defenders
+        a_is_soloist = (g % 2 == 0)
+        sol_w = wrapper_a if a_is_soloist else wrapper_b
+        def_w = wrapper_b if a_is_soloist else wrapper_a
+
+        while not game.is_terminal(state):
+            player = game.current_player(state)
+            actions = game.legal_actions(state)
+
+            if len(actions) <= 1:
+                state = game.apply(state, actions[0])
+                continue
+
+            if player == soloist_idx:
+                _, action = alpha_mcts_policy(
+                    state, game, sol_w, player, config, rng,
+                )
+            else:
+                _, action = alpha_mcts_policy(
+                    state, game, def_w, player, def_config, rng,
+                )
+
+            state = game.apply(state, action)
+
+        soloist_won = _soloist_won(state)
+        a_won = (soloist_won and a_is_soloist) or (not soloist_won and not a_is_soloist)
+
+        total += 1
+        if a_won:
+            wins_a += 1
+        if a_is_soloist:
+            sol_total += 1
+            if soloist_won:
+                sol_wins_a += 1
+        else:
+            def_total += 1
+            if not soloist_won:
+                def_wins_a += 1
+
+    return {
+        "a_wr": wins_a / max(1, total),
+        "a_sol_wr": sol_wins_a / max(1, sol_total),
+        "a_def_wr": def_wins_a / max(1, def_total),
+        "games": total,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +757,14 @@ def main() -> None:
                         help="Save checkpoint every N steps (0=disabled, e.g. 50)")
     parser.add_argument("--checkpoint-dir", type=str, default=None,
                         help="Directory for checkpoints (default: models/checkpoints/{mode})")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel self-play processes (default 1 = sequential). "
+                             "Tip: increase --games-per-step proportionally (e.g. 4x workers)")
+    parser.add_argument("--pool-interval", type=int, default=0,
+                        help="Add checkpoint to opponent pool every N steps (0=disabled, e.g. 100). "
+                             "Enables league-style training with PFSP opponent selection.")
+    parser.add_argument("--pool-size", type=int, default=10,
+                        help="Maximum opponent pool size (default 10)")
     args = parser.parse_args()
 
     if args.save is None:
@@ -625,8 +806,27 @@ def main() -> None:
     wrapper = UltiNetWrapper(net, device=device)
     optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    buffer = ReplayBuffer(capacity=args.buffer_size)
+    buffer = ReplayBuffer(capacity=args.buffer_size, seed=args.seed + 1)
     np_rng = np.random.default_rng(args.seed)
+
+    # ---- Opponent pool (league training) ----
+    pool = CheckpointPool(max_size=args.pool_size) if args.pool_interval > 0 else None
+    pool_rng = random.Random(args.seed + 2)
+    # Opponent network for sequential path (workers create their own)
+    opp_net: UltiNet | None = None
+    opp_wrapper: UltiNetWrapper | None = None
+    if pool is not None:
+        # Seed the pool with initial (random) weights
+        pool.add(0, net.state_dict())
+        if args.workers <= 1:
+            opp_net = UltiNet(
+                input_dim=game.state_dim,
+                body_units=args.body_units,
+                body_layers=args.body_layers,
+                action_dim=game.action_space_size,
+                num_contracts=NUM_CONTRACTS,
+            )
+            opp_wrapper = UltiNetWrapper(opp_net, device=device)
 
     # Auction training buffer (for auto mode)
     # Stores (feats, trump_target, flags_target) for multi-component training
@@ -683,7 +883,7 @@ def main() -> None:
     print("=" * 64)
     print(f"  Mode: {mode}")
     print(f"  Model: UltiNet {args.body_units}x{args.body_layers} "
-          f"({param_count:,} params)")
+          f"({param_count:,} params, dual-head)")
     print(f"  MCTS: soloist={args.sims} sims, "
           f"defenders={'self-play ' + str(args.def_sims) + ' sims' if self_play else 'random'}")
     print(f"  Steps: {args.steps} x {args.games_per_step} games/step "
@@ -691,6 +891,8 @@ def main() -> None:
     print(f"  LR: {args.lr}  Batch: {args.batch_size}  "
           f"Buffer: {args.buffer_size}")
     print(f"  Device: {device}")
+    if args.workers > 1:
+        print(f"  Workers: {args.workers} (parallel self-play)")
     print(f"  Discard: {'neural (value head)' if use_neural else 'greedy heuristic'}")
     if mode == "auto":
         print(f"  Oracle: {args.oracle_rollouts} rollouts/contract")
@@ -699,14 +901,36 @@ def main() -> None:
     if args.elite_interval > 0:
         print(f"  Elite: every {args.elite_interval} steps, "
               f"{args.elite_games} games — NN(0) vs Oracle({args.elite_sims})")
+    if pool is not None:
+        print(f"  League: pool size {args.pool_size}, "
+              f"snapshot every {args.pool_interval} steps (PFSP)")
     ckpt_dir: Path | None = None
     if args.checkpoint_interval > 0:
         ckpt_dir = Path(args.checkpoint_dir) if args.checkpoint_dir else (
             Path("models") / "checkpoints" / mode
         )
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  Checkpoints: every {args.checkpoint_interval} steps → {ckpt_dir}/")
+        print(f"  Checkpoints: every {args.checkpoint_interval} steps -> {ckpt_dir}/")
     print()
+
+    # Set up parallel self-play pool (created once, reused across steps).
+    # Each worker has its own UltiGame + UltiNet; weights are synced per step.
+    executor = None
+    if args.workers > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        net_kwargs = {
+            "input_dim": game.state_dim,
+            "body_units": args.body_units,
+            "body_layers": args.body_layers,
+            "action_dim": game.action_space_size,
+            "num_contracts": NUM_CONTRACTS,
+        }
+        executor = ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=_init_self_play_worker,
+            initargs=(net_kwargs, "cpu"),
+        )
 
     t0 = time.perf_counter()
     total_games = 0
@@ -719,35 +943,106 @@ def main() -> None:
         # ---- 1. Self-play: collect samples ----
         step_samples = 0
         step_auction_samples = 0
-        for g in range(args.games_per_step):
-            game_seed = args.seed + step * 1000 + g
+        sp_wins = 0   # soloist wins this step (learning signal)
+        sp_total = 0  # games with soloist samples this step
+
+        def _tally_soloist(game_samples):
+            """Check if soloist won from one game's samples."""
+            nonlocal sp_wins, sp_total
+            sol_r = [r for _, _, _, r, is_sol in game_samples if is_sol]
+            if sol_r:
+                sp_total += 1
+                if sol_r[0] > 0:
+                    sp_wins += 1
+
+        # ---- Select opponent from pool (PFSP) ----
+        opp_entry = None
+        opp_sd = None  # opponent state_dict for workers
+        if pool is not None:
+            opp_entry = pool.select(pool_rng)
+            if opp_entry is not None:
+                opp_sd = opp_entry["state_dict"]
+                # Load opponent for sequential path
+                if opp_net is not None:
+                    opp_net.load_state_dict(opp_sd)
+
+        if executor is not None:
+            # --- Parallel self-play across worker processes ---
+            state_dict = {k: v.cpu() for k, v in net.state_dict().items()}
 
             if mode == "auto":
-                samples, auc_feats, oracle_target, _ = _auto_play_one_game(
-                    game, wrapper, train_config, def_config, game_seed,
-                    use_oracle=True,
-                    oracle_rollouts=args.oracle_rollouts,
-                    self_play_defenders=self_play,
-                )
-                # Store multi-component auction training sample
-                if auc_feats is not None and oracle_target is not None:
-                    trump_t, flags_t = legacy_to_auction_targets(oracle_target)
-                    auction_buffer.append((auc_feats.copy(), trump_t, flags_t.copy()))
-                    if len(auction_buffer) > AUCTION_BUF_MAX:
-                        auction_buffer = auction_buffer[-AUCTION_BUF_MAX:]
-                    step_auction_samples += 1
+                tasks = [
+                    (state_dict, opp_sd, train_config, def_config,
+                     args.seed + step * 1000 + g,
+                     True, args.oracle_rollouts, self_play)
+                    for g in range(args.games_per_step)
+                ]
+                for result in executor.map(_auto_play_in_worker, tasks):
+                    samples, auc_feats, oracle_target, _ = result
+                    if auc_feats is not None and oracle_target is not None:
+                        trump_t, flags_t = legacy_to_auction_targets(oracle_target)
+                        auction_buffer.append((auc_feats.copy(), trump_t, flags_t.copy()))
+                        if len(auction_buffer) > AUCTION_BUF_MAX:
+                            auction_buffer = auction_buffer[-AUCTION_BUF_MAX:]
+                        step_auction_samples += 1
+                    _tally_soloist(samples)
+                    for s, m, p, r, is_sol in samples:
+                        buffer.push(s, m, p, r, is_soloist=is_sol)
+                    step_samples += len(samples)
+                    total_games += 1
             else:
-                samples = play_one_game(
-                    game, wrapper, train_config, game_seed,
-                    mode=mode, use_neural_discard=use_neural,
-                    def_config=def_config,
-                    self_play_defenders=self_play,
-                )
+                tasks = [
+                    (state_dict, opp_sd, train_config, def_config,
+                     args.seed + step * 1000 + g,
+                     mode, use_neural, self_play)
+                    for g in range(args.games_per_step)
+                ]
+                for samples in executor.map(_play_game_in_worker, tasks):
+                    _tally_soloist(samples)
+                    for s, m, p, r, is_sol in samples:
+                        buffer.push(s, m, p, r, is_soloist=is_sol)
+                    step_samples += len(samples)
+                    total_games += 1
+        else:
+            # --- Sequential self-play (original path) ---
+            seq_opp_w = opp_wrapper if opp_entry is not None else None
+            for g in range(args.games_per_step):
+                game_seed = args.seed + step * 1000 + g
 
-            for s, m, p, r, is_sol in samples:
-                buffer.push(s, m, p, r, is_soloist=is_sol)
-            step_samples += len(samples)
-            total_games += 1
+                if mode == "auto":
+                    samples, auc_feats, oracle_target, _ = _auto_play_one_game(
+                        game, wrapper, train_config, def_config, game_seed,
+                        use_oracle=True,
+                        oracle_rollouts=args.oracle_rollouts,
+                        self_play_defenders=self_play,
+                        opponent_wrapper=seq_opp_w,
+                    )
+                    # Store multi-component auction training sample
+                    if auc_feats is not None and oracle_target is not None:
+                        trump_t, flags_t = legacy_to_auction_targets(oracle_target)
+                        auction_buffer.append((auc_feats.copy(), trump_t, flags_t.copy()))
+                        if len(auction_buffer) > AUCTION_BUF_MAX:
+                            auction_buffer = auction_buffer[-AUCTION_BUF_MAX:]
+                        step_auction_samples += 1
+                else:
+                    samples = play_one_game(
+                        game, wrapper, train_config, game_seed,
+                        mode=mode, use_neural_discard=use_neural,
+                        def_config=def_config,
+                        self_play_defenders=self_play,
+                        opponent_wrapper=seq_opp_w,
+                    )
+
+                _tally_soloist(samples)
+                for s, m, p, r, is_sol in samples:
+                    buffer.push(s, m, p, r, is_soloist=is_sol)
+                step_samples += len(samples)
+                total_games += 1
+
+        # ---- Update PFSP stats (batch for this step) ----
+        if opp_entry is not None and sp_total > 0:
+            opp_entry["games"] += sp_total
+            opp_entry["wins"] += sp_wins
 
         total_samples += step_samples
 
@@ -765,7 +1060,7 @@ def main() -> None:
             auction_train_count = 0
 
             for _ in range(train_steps):
-                states, masks, policies, rewards = buffer.sample(
+                states, masks, policies, rewards, is_sol = buffer.sample(
                     args.batch_size, np_rng,
                 )
 
@@ -773,8 +1068,11 @@ def main() -> None:
                 m_t = torch.from_numpy(masks).bool().to(device)
                 pi_t = torch.from_numpy(policies).float().to(device)
                 z_t = torch.from_numpy(rewards).float().to(device)
+                is_sol_t = torch.from_numpy(is_sol).bool().to(device)
 
-                log_probs, values = net(s_t, m_t)
+                log_probs, values = net.forward_dual(
+                    s_t, m_t, is_sol_t,
+                )
 
                 value_loss = F.mse_loss(values, z_t)
                 policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
@@ -828,19 +1126,27 @@ def main() -> None:
         elapsed = time.perf_counter() - t0
         step_time = time.perf_counter() - step_t
 
-        # ---- 3. Progress ----
-        aloss_str = f"  aloss={avg_aloss:.4f}" if mode == "auto" else ""
-        print(
-            f"\r  step {step:3d}/{args.steps}  "
-            f"games={total_games:4d}  "
-            f"samples={total_samples:5d}  "
-            f"buf={len(buffer):5d}  "
-            f"vloss={avg_vloss:.4f}  "
-            f"ploss={avg_ploss:.4f}"
-            f"{aloss_str}  "
-            f"[{step_time:.1f}s / {elapsed:.0f}s]",
-            end="", flush=True,
-        )
+        # ---- 3. Progress (print every eval_interval steps) ----
+        if step % args.eval_interval == 0 or step == 1 or step == args.steps:
+            aloss_str = f"  aloss={avg_aloss:.4f}" if mode == "auto" else ""
+            sp_str = f"{sp_wins}/{sp_total}" if sp_total > 0 else "-"
+            buf_stats = buffer.stats()
+            buf_swr = buf_stats.get("sol_win_rate", 0.0)
+            buf_str = f"  buf_swr={buf_swr:.0%}" if buf_stats else ""
+            opp_str = ""
+            if opp_entry is not None:
+                opp_wr = opp_entry["wins"] / max(1, opp_entry["games"])
+                opp_str = f"  vs_s{opp_entry['step']}:{opp_wr:.0%}"
+            print(
+                f"  step {step:3d}/{args.steps}  "
+                f"games={total_games:4d}  "
+                f"samples={total_samples:5d}  "
+                f"sp={sp_str:>5s}  "
+                f"vloss={avg_vloss:.4f}  "
+                f"ploss={avg_ploss:.4f}"
+                f"{aloss_str}{buf_str}{opp_str}  "
+                f"[{step_time:.1f}s / {elapsed:.0f}s]"
+            )
 
         # ---- 4. Evaluate vs Random ----
         if step % args.eval_interval == 0 or step == args.steps:
@@ -879,7 +1185,7 @@ def main() -> None:
             def_str = f"{all_def:.0%}" if all_def is not None else "n/a"
 
             print(
-                f"\n  >>> EVAL step {step}: "
+                f"  >>> EVAL step {step}: "
                 f"WR={wr:.0%} (sol={sol_str}, def={def_str})"
                 f"  {' | '.join(parts)}"
                 f"  (best: {best_wr:.0%}){tag}"
@@ -931,6 +1237,17 @@ def main() -> None:
             }, ckpt_path)
             print(f"  >>> CHECKPOINT saved: {ckpt_path}")
 
+        # ---- 7. Add snapshot to opponent pool (PFSP) ----
+        if pool is not None and args.pool_interval > 0 and (
+            step % args.pool_interval == 0
+        ):
+            pool.add(step, net.state_dict())
+            print(f"  >>> POOL [{len(pool)}]: {pool.summary()}")
+
+    # ---- Shutdown parallel pool ----
+    if executor is not None:
+        executor.shutdown(wait=False)
+
     # ---- Save ----
     total_time = time.perf_counter() - t0
     print()
@@ -940,6 +1257,8 @@ def main() -> None:
     print(f"  Games: {total_games}  Samples: {total_samples}")
     print(f"  Time: {total_time:.0f}s ({total_time / 60:.1f} min)")
     print(f"  Best win rate: {best_wr:.0%}")
+    if pool is not None:
+        print(f"  Opponent pool: {pool.summary()}")
     if mode == "auto":
         print(f"  Auction buffer: {len(auction_buffer)} samples")
 
@@ -957,6 +1276,93 @@ def main() -> None:
         "best_win_rate": best_wr,
     }, save_path)
     print(f"  Model saved to {save_path}")
+
+    # ---- Head-to-head round-robin between checkpoints ----
+    if ckpt_dir is not None:
+        ckpt_files = sorted(ckpt_dir.glob("step_*.pt"))
+        if len(ckpt_files) >= 2:
+            print()
+            print("=" * 64)
+            print("  Head-to-Head Round-Robin (checkpoint vs checkpoint)")
+            print("=" * 64)
+
+            h2h_config = MCTSConfig(
+                simulations=args.sims,
+                determinizations=args.dets,
+                c_puct=1.5,
+                dirichlet_alpha=0.0,
+                dirichlet_weight=0.0,
+                use_value_head=True,
+                use_policy_priors=True,
+                visit_temp=0.1,
+            )
+            h2h_def_config = MCTSConfig(
+                simulations=args.def_sims,
+                determinizations=args.dets,
+                c_puct=1.5,
+                dirichlet_alpha=0.0,
+                dirichlet_weight=0.0,
+                use_value_head=True,
+                use_policy_priors=True,
+                visit_temp=0.1,
+            )
+
+            net_kwargs = {
+                "input_dim": game.state_dim,
+                "body_units": args.body_units,
+                "body_layers": args.body_layers,
+                "action_dim": game.action_space_size,
+                "num_contracts": NUM_CONTRACTS,
+            }
+
+            # Load each checkpoint into its own wrapper
+            ckpt_wrappers: list[tuple[str, UltiNetWrapper]] = []
+            for cp in ckpt_files:
+                cp_net = UltiNet(**net_kwargs)
+                cp_data = torch.load(cp, weights_only=True)
+                cp_net.load_state_dict(cp_data["model_state_dict"])
+                cp_w = UltiNetWrapper(cp_net, device=device)
+                label = cp.stem  # e.g. "step_00100"
+                ckpt_wrappers.append((label, cp_w))
+
+            # Also include the final model
+            final_w = UltiNetWrapper(
+                UltiNet(**net_kwargs).to(device), device=device,
+            )
+            final_w.net.load_state_dict(net.state_dict())
+            ckpt_wrappers.append(("final", final_w))
+
+            print(f"  Checkpoints: {', '.join(name for name, _ in ckpt_wrappers)}")
+            print(f"  Games per matchup: 100 (50 as soloist, 50 as defender)")
+            print()
+
+            # Play each consecutive pair
+            for i in range(len(ckpt_wrappers) - 1):
+                name_a, w_a = ckpt_wrappers[i]
+                name_b, w_b = ckpt_wrappers[-1]  # always compare against final
+                if name_a == name_b:
+                    continue
+
+                h2h_t = time.perf_counter()
+                result = eval_head_to_head(
+                    game, w_a, w_b,
+                    h2h_config, h2h_def_config,
+                    mode=mode, num_games=100,
+                    seed=12345 + i * 1000,
+                )
+                h2h_time = time.perf_counter() - h2h_t
+
+                wr_a = result["a_wr"]
+                sol_a = result["a_sol_wr"]
+                def_a = result["a_def_wr"]
+                print(
+                    f"  {name_a} vs {name_b}: "
+                    f"{name_a} WR={wr_a:.0%} "
+                    f"(sol={sol_a:.0%}, def={def_a:.0%})  "
+                    f"[{h2h_time:.1f}s]"
+                )
+
+            print()
 
 
 if __name__ == "__main__":

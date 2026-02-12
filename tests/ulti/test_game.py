@@ -116,23 +116,31 @@ class TestTalonExchange:
         discard_talon(state, discards)
         assert len(state.hands[1]) == 10
 
-    def test_discards_go_to_captured(self):
+    def test_discards_go_to_talon_discards(self):
         state, talon = deal(seed=42)
         pickup_talon(state, soloist=1, talon=talon)
         discards = state.hands[1][:2]
         discard_talon(state, discards)
-        assert all(c in state.captured[1] for c in discards)
+        # Discards are stored in talon_discards, NOT captured
+        assert all(c in state.talon_discards for c in discards)
+        assert all(c not in state.captured[1] for c in discards)
 
-    def test_discard_points_added_to_score(self):
+    def test_discard_points_not_added_to_soloist(self):
         state, talon = deal(seed=42)
         pickup_talon(state, soloist=1, talon=talon)
-        # Find cards with known points to discard
-        ace = C(H, Rank.ACE)
-        # Use first 2 cards from hand (might be 0-point cards)
+        discards = state.hands[1][:2]
+        discard_talon(state, discards)
+        # Talon discard points do NOT go to the soloist
+        assert state.scores[1] == 0
+
+    def test_discard_points_count_for_defenders(self):
+        state, talon = deal(seed=42)
+        pickup_talon(state, soloist=1, talon=talon)
         discards = state.hands[1][:2]
         expected_pts = sum(c.points() for c in discards)
         discard_talon(state, discards)
-        assert state.scores[1] == expected_pts
+        # Talon discard points count for the defenders
+        assert defender_points(state) == expected_pts
 
 
 # === Set contract ===
@@ -277,13 +285,20 @@ class TestFullGame:
     def test_all_cards_captured(self):
         state = self._play_full_game()
         total_captured = sum(len(state.captured[i]) for i in range(NUM_PLAYERS))
-        # 30 from tricks + 2 from talon discard = 32
-        assert total_captured == 32
+        # 30 from tricks (talon discards are separate)
+        assert total_captured == 30
+        assert len(state.talon_discards) == 2
+        assert total_captured + len(state.talon_discards) == 32
 
     def test_points_sum_to_90_plus_marriages(self):
+        """soloist_points + defender_points = TOTAL_POINTS + marriages.
+
+        Note: sum(scores) alone is less because talon discard points
+        are tracked separately and attributed to the defenders.
+        """
         state = self._play_full_game()
         total_marriage_pts = sum(pts for _, _, pts in state.marriages)
-        total = sum(state.scores)
+        total = soloist_points(state) + defender_points(state)
         expected = TOTAL_POINTS + total_marriage_pts
         assert total == expected, f"Total points should be {expected}, got {total}"
 
@@ -291,7 +306,7 @@ class TestFullGame:
         """The last trick winner gets +10 bonus (included in TOTAL_POINTS)."""
         state = self._play_full_game()
         total_marriage_pts = sum(pts for _, _, pts in state.marriages)
-        assert sum(state.scores) == TOTAL_POINTS + total_marriage_pts
+        assert soloist_points(state) + defender_points(state) == TOTAL_POINTS + total_marriage_pts
 
     def test_soloist_plus_defenders_equals_total(self):
         state = self._play_full_game()
@@ -305,9 +320,10 @@ class TestFullGame:
             assert is_terminal(state)
             assert state.trick_no == TRICKS_PER_GAME
             total_marriage_pts = sum(pts for _, _, pts in state.marriages)
-            assert sum(state.scores) == TOTAL_POINTS + total_marriage_pts
+            assert soloist_points(state) + defender_points(state) == TOTAL_POINTS + total_marriage_pts
             total_cap = sum(len(state.captured[i]) for i in range(NUM_PLAYERS))
-            assert total_cap == 32
+            assert total_cap == 30  # tricks only (talon discards are separate)
+            assert len(state.talon_discards) == 2
 
 
 # === Scoring queries ===
@@ -320,8 +336,9 @@ class TestScoringQueries:
         sol = state.soloist
         defs = [i for i in range(3) if i != sol]
 
-        # Reset scores to test cleanly.
+        # Reset scores and talon discards to test cleanly.
         state.scores = [0, 0, 0]
+        state.talon_discards = []
 
         # Soloist 50, defenders 40 → wins.
         state.scores[sol] = 50

@@ -6,6 +6,7 @@ Game flow: BID → AUCTION → TRUMP_SELECT → KONTRA → PLAY → DONE.
 AI play modes (configurable per session):
   - "neural"  : UltiNet policy head only — instant, no search.
   - "mcts"    : UltiNet + MCTS search — stronger but slower.
+  - "solver"  : PIMC with exact alpha-beta solver — strongest, may be slow.
   - "random"  : Random legal card (legacy / fallback).
 
 The model is loaded lazily from ``models/ulti_mixed.pt`` on first use.
@@ -36,6 +37,7 @@ from trickster.games.ulti.adapter import (
 from trickster.games.ulti.cards import Card, Rank, Suit
 from trickster.mcts import MCTSConfig, alpha_mcts_policy
 from trickster.model import UltiNet, UltiNetWrapper
+from trickster.solver import SolverPIMC
 
 log = logging.getLogger(__name__)
 from trickster.games.ulti.auction import (
@@ -212,6 +214,25 @@ def _session_to_node(sess: "UltiSession") -> UltiNode:
         component_kontras=dict(sess.component_kontras),
         must_have=constraints,
     )
+
+
+# Solver PIMC configs for different strength levels
+_SOLVER_CONFIGS: dict[str, dict[str, int]] = {
+    "fast": {"num_determinizations": 5, "max_exact_tricks": 5},
+    "medium": {"num_determinizations": 15, "max_exact_tricks": 6},
+    "strong": {"num_determinizations": 30, "max_exact_tricks": 6},
+}
+
+# Lazy singleton solver instances
+_solver_instances: dict[str, SolverPIMC] = {}
+
+
+def _get_solver(strength: str = "medium") -> SolverPIMC:
+    """Get or create a SolverPIMC instance for the given strength."""
+    if strength not in _solver_instances:
+        cfg = _SOLVER_CONFIGS.get(strength, _SOLVER_CONFIGS["medium"])
+        _solver_instances[strength] = SolverPIMC(**cfg)
+    return _solver_instances[strength]
 
 
 # MCTS configs for different AI strength levels
@@ -859,10 +880,10 @@ def _resolve_auction(sess: UltiSession) -> None:
         sess.phase = "done"
         return
 
-    # Score the final talon for the winner (their discards).
-    talon = a.talon
-    sess.state.captured[winner].extend(talon)
-    sess.state.scores[winner] += sum(c.points() for c in talon)
+    # Store the soloist's talon discards separately.
+    # Their card-point value counts for the defenders (not the soloist).
+    # Only the soloist knows which cards were discarded.
+    sess.state.talon_discards = list(a.talon)
 
     # Determine trump and proceed.
     if bid.is_colorless:
@@ -1006,6 +1027,7 @@ def _ai_pick_card(sess: UltiSession) -> Card:
     Modes:
       - "neural":  Pure policy head (instant, no search).
       - "mcts":    MCTS search with configurable strength.
+      - "solver":  PIMC with exact alpha-beta solver.
       - "random":  Random legal card (fallback).
     """
     st = sess.state
@@ -1014,6 +1036,15 @@ def _ai_pick_card(sess: UltiSession) -> Card:
         return actions[0]
 
     mode = sess.ai_mode
+
+    # Solver mode: no neural network needed
+    if mode == "solver":
+        solver = _get_solver(sess.ai_strength)
+        node = _session_to_node(sess)
+        player = current_player(st)
+        rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
+        return solver.choose_action(node, player, rng)
+
     wrapper = _load_ulti_model()
 
     if wrapper is None or mode == "random":
@@ -1095,7 +1126,7 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
 
     # AI configuration
     ai_mode = body.get("aiMode", "neural")
-    if ai_mode not in ("neural", "mcts", "random"):
+    if ai_mode not in ("neural", "mcts", "solver", "random"):
         ai_mode = "neural"
     ai_strength = body.get("aiStrength", "medium")
     if ai_strength not in ("fast", "medium", "strong"):
@@ -1377,7 +1408,7 @@ def ai_settings(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
 
     if "aiMode" in body:
         mode = body["aiMode"]
-        if mode in ("neural", "mcts", "random"):
+        if mode in ("neural", "mcts", "solver", "random"):
             sess.ai_mode = mode
     if "aiStrength" in body:
         strength = body["aiStrength"]
