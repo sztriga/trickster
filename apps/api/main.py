@@ -29,6 +29,14 @@ from trickster.games.snapszer.game import (
     play_trick,
     talon_size,
 )
+from trickster.games.snapszer.constants import (
+    DEFAULT_LATE_THRESHOLD,
+    DEFAULT_MCTS_DETS,
+    DEFAULT_MCTS_SIMS,
+    DEFAULT_PIMC_SAMPLES,
+)
+from trickster.games.snapszer.hybrid import HybridPlayer
+from trickster.games.snapszer.minimax import alphabeta, game_phase
 from trickster.mcts import MCTSConfig, alpha_mcts_choose, _run_mcts
 from trickster.models.alpha_net import SharedAlphaNet
 from trickster.training.model_spec import list_model_dirs, model_label_from_dir
@@ -45,8 +53,6 @@ def _card_from_json(obj: dict[str, Any]) -> Card:
         raise HTTPException(status_code=400, detail=f"Invalid card: {obj!r} ({e})")
 
 
-_DEFAULT_MCTS_SIMS = 50
-_DEFAULT_MCTS_DETS = 6
 
 
 @dataclass(slots=True)
@@ -62,8 +68,9 @@ class Session:
     seed: int = 0
     deal_starting_leader: int = 0
     ai_bubble: Optional[str] = None
-    mcts_sims: int = _DEFAULT_MCTS_SIMS
-    mcts_dets: int = _DEFAULT_MCTS_DETS
+    mcts_sims: int = DEFAULT_MCTS_SIMS
+    mcts_dets: int = DEFAULT_MCTS_DETS
+    play_mode: str = "mcts"  # "mcts" or "hybrid"
 
 
 _SESSIONS: dict[str, Session] = {}
@@ -125,8 +132,8 @@ def _alpha_choose_action(
     ai_player: int,
     rng: random.Random,
     *,
-    sims: int = _DEFAULT_MCTS_SIMS,
-    dets: int = _DEFAULT_MCTS_DETS,
+    sims: int = DEFAULT_MCTS_SIMS,
+    dets: int = DEFAULT_MCTS_DETS,
     model_label: str = "",
 ) -> Any:
     """Use MCTS search to pick a move for the AlphaZero agent."""
@@ -150,6 +157,62 @@ def _alpha_choose_action(
     )
     return alpha_mcts_choose(
         node, _ALPHA_GAME, net, ai_player, cfg, rng,
+    )
+
+
+def _hybrid_choose_action(
+    gs: object,
+    pending_lead: Optional[Card],
+    ai_player: int,
+    rng: random.Random,
+    *,
+    sims: int = DEFAULT_MCTS_SIMS,
+    dets: int = DEFAULT_MCTS_DETS,
+    model_label: str = "",
+) -> Any:
+    """Use the Hybrid player (MCTS + PIMC + Minimax) to pick a move."""
+    net = _load_alpha_net(model_label)
+    if net is None:
+        raise HTTPException(status_code=500, detail="AlphaZero net not found")
+    node = SnapszerNode(
+        gs=gs, pending_lead=pending_lead,
+        known_voids=(frozenset(), frozenset()),
+    )
+    actions = _ALPHA_GAME.legal_actions(node)
+    if len(actions) <= 1:
+        return actions[0]
+    cfg = MCTSConfig(
+        simulations=sims,
+        determinizations=dets,
+        use_value_head=True,
+        use_policy_priors=True,
+        dirichlet_alpha=0.0,
+        visit_temp=0.1,
+    )
+    hybrid = HybridPlayer(net=net, mcts_config=cfg, game=_ALPHA_GAME)
+    return hybrid.choose_action(node, ai_player, rng)
+
+
+def _choose_action(
+    gs: object,
+    pending_lead: Optional[Card],
+    ai_player: int,
+    rng: random.Random,
+    *,
+    sims: int = DEFAULT_MCTS_SIMS,
+    dets: int = DEFAULT_MCTS_DETS,
+    model_label: str = "",
+    play_mode: str = "mcts",
+) -> Any:
+    """Dispatch to MCTS or Hybrid based on play_mode."""
+    if play_mode == "hybrid":
+        return _hybrid_choose_action(
+            gs, pending_lead, ai_player, rng,
+            sims=sims, dets=dets, model_label=model_label,
+        )
+    return _alpha_choose_action(
+        gs, pending_lead, ai_player, rng,
+        sims=sims, dets=dets, model_label=model_label,
     )
 
 
@@ -234,6 +297,7 @@ def _public_state(sess: Session, *, consume_bubble: bool = True) -> dict[str, An
         "canExchangeTrumpJack": bool(sess.pending_lead is None and st.leader == 0 and can_exchange_trump_jack(st, 0)),
         "aiBubble": bubble,
         "mctsSettings": {"sims": sess.mcts_sims, "dets": sess.mcts_dets},
+        "playMode": sess.play_mode,
     }
 
 
@@ -291,7 +355,7 @@ def _advance_ai(sess: Session) -> str:
                 # MCTS decides close_talon, marriages, and lead card.
                 # Loop until we get a card action.
                 while True:
-                    action = _alpha_choose_action(st, None, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label)
+                    action = _choose_action(st, None, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label, play_mode=sess.play_mode)
                     if action == "close_talon":
                         close_talon(st, 1)
                         bubbles.append("Betakarok!")
@@ -313,7 +377,7 @@ def _advance_ai(sess: Session) -> str:
 
         lead = sess.pending_lead
         if responder == 1:
-            resp = _alpha_choose_action(st, lead, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label)
+            resp = _choose_action(st, lead, 1, ai_rng, sims=sess.mcts_sims, dets=sess.mcts_dets, model_label=sess.model_label, play_mode=sess.play_mode)
             st, _ = play_trick(st, lead, resp)
             sess.pending_lead = None
             sess.needs_continue = True
@@ -353,10 +417,13 @@ def new_game(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         seed = random.randint(0, 2_147_483_647)
     model_label = str(payload.get("modelLabel", "") or "")
+    play_mode = str(payload.get("playMode", "mcts") or "mcts")
+    if play_mode not in ("mcts", "hybrid"):
+        play_mode = "mcts"
     gid = str(uuid.uuid4())
     starting = random.Random(int(seed)).randrange(2)
     st = deal(seed=seed, starting_leader=starting)
-    sess = Session(state=st, pending_lead=None, model_label=model_label, created_at=time.time(), needs_continue=False)
+    sess = Session(state=st, pending_lead=None, model_label=model_label, created_at=time.time(), needs_continue=False, play_mode=play_mode)
     sess.match_points = [0, 0]
     sess.deal_over = False
     sess.last_award = None
@@ -440,13 +507,13 @@ def continue_game(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-#  Background analysis (progressive MCTS)
+#  Background analysis (progressive MCTS / Hybrid)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class _AnalysisState:
-    """Accumulated results from background MCTS determinizations."""
+    """Accumulated results from background analysis."""
     position_key: str  # identifies the position this analysis belongs to
     total_visits: dict[Any, float] = field(default_factory=dict)
     value_sum: float = 0.0
@@ -457,6 +524,7 @@ class _AnalysisState:
     cancel: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     thread: Optional[threading.Thread] = None
+    algorithm: str = "mcts"  # which algorithm produced the results
 
 
 _ANALYSIS: dict[str, _AnalysisState] = {}  # game_id -> analysis state
@@ -472,10 +540,10 @@ def _cancel_analysis(game_id: str) -> None:
 def _position_key(sess: Session) -> str:
     """Cheap key that changes whenever the board position changes."""
     st = sess.state
-    return f"{id(st)}:{getattr(st, 'trick_number', 0)}:{hash(sess.pending_lead)}"
+    return f"{id(st)}:{getattr(st, 'trick_number', 0)}:{hash(sess.pending_lead)}:{sess.play_mode}"
 
 
-def _analysis_worker(
+def _analysis_worker_mcts(
     game_id: str,
     analysis: _AnalysisState,
     node: SnapszerNode,
@@ -483,12 +551,12 @@ def _analysis_worker(
     sims: int,
     dets: int,
 ) -> None:
-    """Run determinizations one at a time, accumulating visit counts."""
+    """Run MCTS determinizations one at a time, accumulating visit counts."""
     game = SnapszerGame()
     rng = random.Random()
     cfg = MCTSConfig(
         simulations=sims,
-        determinizations=1,  # we do one det per iteration for progressive updates
+        determinizations=1,
         use_value_head=True,
         use_policy_priors=True,
         dirichlet_alpha=0.0,
@@ -503,25 +571,98 @@ def _analysis_worker(
         with analysis.lock:
             for act, cnt in visits.items():
                 analysis.total_visits[act] = analysis.total_visits.get(act, 0.0) + cnt
-            analysis.value_sum += root_val  # MCTS-backed value, not raw NN
+            analysis.value_sum += root_val
             analysis.value_count += 1
             analysis.dets_done = i + 1
     with analysis.lock:
         analysis.running = False
 
 
+def _analysis_worker_hybrid(
+    game_id: str,
+    analysis: _AnalysisState,
+    node: SnapszerNode,
+    net: SharedAlphaNet,
+    sims: int,
+    dets: int,
+) -> None:
+    """Run hybrid analysis: use the phase-appropriate algorithm."""
+    game = SnapszerGame()
+    rng = random.Random()
+    phase = game_phase(node, late_threshold=DEFAULT_LATE_THRESHOLD)
+
+    if phase == "phase2":
+        # Pure minimax — instant, no progressive updates needed
+        with analysis.lock:
+            analysis.algorithm = "minimax"
+        val, best = alphabeta(node, game, 0)
+        actions = game.legal_actions(node)
+        with analysis.lock:
+            if best is not None:
+                # Give 100% to the best action
+                analysis.total_visits[best] = 1.0
+                # Show small values for other actions so UI can display them
+                for a in actions:
+                    if a != best:
+                        child = game.apply(node, a)
+                        cv, _ = alphabeta(child, game, 0)
+                        # Map minimax value to a probability-like weight
+                        analysis.total_visits[a] = max(0.001, (cv + 1.0) / 2.0)
+            analysis.value_sum = val
+            analysis.value_count = 1
+            analysis.dets_done = 1
+            analysis.dets_target = 1
+            analysis.running = False
+        return
+
+    if phase == "phase1_late":
+        # PIMC — run samples progressively
+        with analysis.lock:
+            analysis.algorithm = "pimc"
+        actions = game.legal_actions(node)
+        action_wins: dict = {a: 0 for a in actions}
+        action_value: dict = {a: 0.0 for a in actions}
+        n_samples = max(dets, DEFAULT_PIMC_SAMPLES)
+        with analysis.lock:
+            analysis.dets_target = n_samples
+        for i in range(n_samples):
+            if analysis.cancel.is_set():
+                break
+            det = game.determinize(node, 0, rng)
+            val, best = alphabeta(det, game, 0)
+            if best is not None and best in action_wins:
+                action_wins[best] += 1
+                action_value[best] += val
+            with analysis.lock:
+                # Update visits as win counts (will be normalised later)
+                for a in actions:
+                    analysis.total_visits[a] = float(action_wins.get(a, 0))
+                total_wins = sum(action_wins.values()) or 1
+                # Average value of the leading action
+                leader = max(actions, key=lambda a: (action_wins[a], action_value[a]))
+                n_leader = action_wins[leader] or 1
+                analysis.value_sum = action_value[leader] / n_leader
+                analysis.value_count = 1
+                analysis.dets_done = i + 1
+        with analysis.lock:
+            analysis.running = False
+        return
+
+    # phase1_early — use MCTS (same as pure MCTS analysis)
+    with analysis.lock:
+        analysis.algorithm = "mcts"
+    _analysis_worker_mcts(game_id, analysis, node, net, sims, dets)
+
+
 def _build_analysis_response(analysis: _AnalysisState) -> dict[str, Any]:
     """Convert accumulated visit counts into a response dict."""
-    from trickster.games.snapszer.adapter import _IDX_TO_CARD, _ACTION_IDX
-    from trickster.games.snapszer.cards import ALL_COLORS
-    from trickster.games.snapszer.adapter import _MARRY_ACTIONS
-
     with analysis.lock:
         total = dict(analysis.total_visits)
         val = analysis.value_sum / analysis.value_count if analysis.value_count > 0 else 0.0
         dets_done = analysis.dets_done
         dets_target = analysis.dets_target
         running = analysis.running
+        algo = analysis.algorithm
 
     # Convert visit counts to probabilities
     visit_sum = sum(total.values())
@@ -554,25 +695,25 @@ def _build_analysis_response(analysis: _AnalysisState) -> dict[str, Any]:
         "progress": dets_done,
         "total": dets_target,
         "searching": running,
+        "algorithm": algo,
     }
 
 
 @app.get("/api/analyze/{game_id}")
 def analyze(game_id: str) -> dict[str, Any]:
-    """Return progressive MCTS analysis for the current position."""
+    """Return progressive analysis for the current position."""
     sess = _SESSIONS.get(game_id)
     if sess is None:
         raise HTTPException(status_code=404, detail="Unknown gameId")
     net = _load_alpha_net(sess.model_label)
     if net is None:
-        return {"value": 0.0, "actions": [], "progress": 0, "total": 0, "searching": False}
+        return {"value": 0.0, "actions": [], "progress": 0, "total": 0, "searching": False, "algorithm": "none"}
 
     pos_key = _position_key(sess)
 
     # Check if we already have an analysis running for this position
     existing = _ANALYSIS.get(game_id)
     if existing is not None and existing.position_key == pos_key:
-        # Return current accumulated results
         return _build_analysis_response(existing)
 
     # Cancel any old analysis
@@ -586,7 +727,6 @@ def analyze(game_id: str) -> dict[str, Any]:
         gs=sess.state.clone(), pending_lead=sess.pending_lead,
         known_voids=(frozenset(), frozenset()),
     )
-    # Use more determinizations for analysis (progressive reveal)
     dets = max(sess.mcts_dets, 12)
     sims = sess.mcts_sims
     analysis = _AnalysisState(
@@ -595,15 +735,21 @@ def analyze(game_id: str) -> dict[str, Any]:
         running=True,
     )
     _ANALYSIS[game_id] = analysis
+
+    # Pick the right analysis worker based on play mode
+    if sess.play_mode == "hybrid":
+        worker = _analysis_worker_hybrid
+    else:
+        worker = _analysis_worker_mcts
+
     t = threading.Thread(
-        target=_analysis_worker,
+        target=worker,
         args=(game_id, analysis, node, net, sims, dets),
         daemon=True,
     )
     analysis.thread = t
     t.start()
-    # Return empty initial state — frontend will poll
-    return {"value": 0.0, "actions": [], "progress": 0, "total": dets, "searching": True}
+    return {"value": 0.0, "actions": [], "progress": 0, "total": dets, "searching": True, "algorithm": "mcts"}
 
 
 @app.post("/api/settings")
@@ -616,7 +762,11 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         sess.mcts_sims = max(1, min(500, int(payload["sims"])))
     if "dets" in payload:
         sess.mcts_dets = max(1, min(30, int(payload["dets"])))
-    return {"sims": sess.mcts_sims, "dets": sess.mcts_dets}
+    if "playMode" in payload:
+        pm = str(payload["playMode"])
+        if pm in ("mcts", "hybrid"):
+            sess.play_mode = pm
+    return {"sims": sess.mcts_sims, "dets": sess.mcts_dets, "playMode": sess.play_mode}
 
 
 @app.post("/api/action")

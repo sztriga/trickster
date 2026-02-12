@@ -33,6 +33,7 @@ export type GameState = {
   available?: { canCloseTalon: boolean; marriages: { suit: Color; points: number }[] };
   legalCards?: Card[];
   mctsSettings?: { sims: number; dets: number };
+  playMode?: "mcts" | "hybrid";
   hands: {
     human: Card[];
   };
@@ -42,9 +43,10 @@ export type GameState = {
   };
 };
 
-export async function apiNewGame(modelLabel: string, seed?: number | null): Promise<GameState> {
+export async function apiNewGame(modelLabel: string, seed?: number | null, playMode?: string): Promise<GameState> {
   const body: Record<string, unknown> = { modelLabel };
   if (seed !== undefined && seed !== null) body.seed = seed;
+  if (playMode) body.playMode = playMode;
   const res = await fetch("/api/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -129,6 +131,7 @@ export type Analysis = {
   progress: number;
   total: number;
   searching: boolean;
+  algorithm?: "mcts" | "pimc" | "minimax" | "none";
 };
 
 export async function apiAnalyze(gameId: string): Promise<Analysis> {
@@ -141,14 +144,17 @@ export async function apiUpdateSettings(
   gameId: string,
   sims: number,
   dets: number,
-): Promise<{ sims: number; dets: number }> {
+  playMode?: string,
+): Promise<{ sims: number; dets: number; playMode: string }> {
+  const body: Record<string, unknown> = { gameId, sims, dets };
+  if (playMode) body.playMode = playMode;
   const res = await fetch("/api/settings", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ gameId, sims, dets }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text());
-  return (await res.json()) as { sims: number; dets: number };
+  return (await res.json()) as { sims: number; dets: number; playMode: string };
 }
 
 export async function apiListModels(): Promise<string[]> {

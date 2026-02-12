@@ -33,6 +33,7 @@ export function App() {
   const [seedText, setSeedText] = useState<string>("");
   const [mctsSims, setMctsSims] = useState<number>(50);
   const [mctsDets, setMctsDets] = useState<number>(6);
+  const [playMode, setPlayMode] = useState<"mcts" | "hybrid">("mcts");
   const [analysisOn, setAnalysisOn] = useState<boolean>(false);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [state, setState] = useState<GameState | null>(null);
@@ -152,11 +153,11 @@ export function App() {
     try {
       const trimmed = seedText.trim();
       const seed = trimmed === "" ? null : Number(trimmed);
-      const st = await apiNewGame(model, Number.isFinite(seed as number) ? (seed as number) : null);
+      const st = await apiNewGame(model, Number.isFinite(seed as number) ? (seed as number) : null, playMode);
       setState(st);
       setShowCaptured(false);
       aiBubble.clear(); playerBubble.clear();
-      if (st.gameId) await apiUpdateSettings(st.gameId, mctsSims, mctsDets);
+      if (st.gameId) await apiUpdateSettings(st.gameId, mctsSims, mctsDets, playMode);
     } catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
@@ -218,7 +219,9 @@ export function App() {
         <div className="brand">
           <div className="title">Trickster</div>
           <div className="subtitle">
-            {state && model ? `vs ${modelDisplayName(model)}` : "Játék a gép ellen"}
+            {state && model
+              ? `vs ${modelDisplayName(model)} \u2022 ${playMode === "hybrid" ? "Hybrid" : "MCTS"}`
+              : "Játék a gép ellen"}
           </div>
         </div>
         <div className="controls">
@@ -347,6 +350,9 @@ export function App() {
                 title="Pozíció értékelés (neked)"
               >
                 {hasAnalysisData ? `${analysis!.value > 0 ? "+" : ""}${analysis!.value.toFixed(2)}` : "..."}
+                {analysis?.algorithm && analysis.algorithm !== "mcts" && (
+                  <span className="eval-algo"> {analysis.algorithm.toUpperCase()}</span>
+                )}
                 {analysis?.searching && <span className="eval-progress"> ({analysis.progress}/{analysis.total})</span>}
               </span>
             )}
@@ -388,11 +394,13 @@ export function App() {
           onSimsChange={setMctsSims}
           mctsDets={mctsDets}
           onDetsChange={setMctsDets}
+          playMode={playMode}
+          onPlayModeChange={setPlayMode}
           analysisOn={analysisOn}
           onAnalysisChange={setAnalysisOn}
           onSaveSettings={async () => {
             if (state) {
-              try { await apiUpdateSettings(state.gameId, mctsSims, mctsDets); }
+              try { await apiUpdateSettings(state.gameId, mctsSims, mctsDets, playMode); }
               catch (e) { setErr(String(e)); }
             }
             setMenuTab("main");

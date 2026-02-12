@@ -7,6 +7,17 @@ export function modelDisplayName(label: string): string {
   return idx > 0 ? label.substring(0, idx).trim() : label;
 }
 
+/** Detect if the model was trained with the hybrid approach. */
+export function isHybridModel(label: string): boolean {
+  return label.toLowerCase().includes("hybrid");
+}
+
+/** Short architecture description: "128x3 head=64" */
+function modelArchDesc(label: string): string {
+  const m = label.match(/alphazero\s+(.+?)(?:\s+hybrid)?[)]/);
+  return m ? m[1].trim() : "";
+}
+
 export type MenuModalProps = {
   tab: "main" | "newgame" | "settings";
   setTab: (t: "main" | "newgame" | "settings") => void;
@@ -24,6 +35,8 @@ export type MenuModalProps = {
   onSimsChange: (v: number) => void;
   mctsDets: number;
   onDetsChange: (v: number) => void;
+  playMode: "mcts" | "hybrid";
+  onPlayModeChange: (v: "mcts" | "hybrid") => void;
   analysisOn: boolean;
   onAnalysisChange: (v: boolean) => void;
   onSaveSettings: () => void;
@@ -35,6 +48,7 @@ export function MenuModal(props: MenuModalProps) {
     tab, setTab, onClose,
     models, selectedModel, onSelectModel, onStartGame, busy,
     seedText, onSeedChange, mctsSims, onSimsChange, mctsDets, onDetsChange,
+    playMode, onPlayModeChange,
     analysisOn, onAnalysisChange, onSaveSettings, state,
   } = props;
 
@@ -70,20 +84,29 @@ export function MenuModal(props: MenuModalProps) {
           <>
             <div className="menu-title">Válassz ellenfelet</div>
             <div className="menu-opponents">
-              {models.map((m) => (
-                <button
-                  key={m}
-                  className={`menu-opponent${selectedModel === m ? " menu-opponent-active" : ""}`}
-                  onClick={() => onSelectModel(m)}
-                >
-                  <span className="menu-opponent-name">{modelDisplayName(m)}</span>
-                </button>
-              ))}
+              {models.map((m) => {
+                const hybrid = isHybridModel(m);
+                const arch = modelArchDesc(m);
+                return (
+                  <button
+                    key={m}
+                    className={`menu-opponent${selectedModel === m ? " menu-opponent-active" : ""}`}
+                    onClick={() => onSelectModel(m)}
+                  >
+                    <span className="menu-opponent-name">{modelDisplayName(m)}</span>
+                    <span className={`model-tag${hybrid ? " model-tag-hybrid" : " model-tag-classic"}`}>
+                      {hybrid ? "hybrid" : "classic"}
+                    </span>
+                    {arch && <span className="model-arch">{arch}</span>}
+                  </button>
+                );
+              })}
               <button
                 className={`menu-opponent${selectedModel === "" ? " menu-opponent-active" : ""}`}
                 onClick={() => onSelectModel("")}
               >
                 <span className="menu-opponent-name">Véletlen</span>
+                <span className="model-tag model-tag-classic">random</span>
               </button>
             </div>
             <div className="modal-actions">
@@ -118,7 +141,30 @@ export function MenuModal(props: MenuModalProps) {
 
             <div className="modal-divider" />
 
-            <div className="modal-subtitle">AI gondolkodás (MCTS)</div>
+            <div className="modal-subtitle">Motor</div>
+            <div className="modal-help" style={{ marginTop: 0, marginBottom: 10 }}>
+              Meghatározza hogyan gondolkodik az AI — játék és elemzés egyaránt.
+            </div>
+            <div className="modal-play-modes">
+              <button
+                className={`play-mode-btn${playMode === "mcts" ? " play-mode-active" : ""}`}
+                onClick={() => onPlayModeChange("mcts")}
+              >
+                <span className="play-mode-label">MCTS</span>
+                <span className="play-mode-desc">Monte Carlo fa-keresés minden fázisban</span>
+              </button>
+              <button
+                className={`play-mode-btn${playMode === "hybrid" ? " play-mode-active" : ""}`}
+                onClick={() => onPlayModeChange("hybrid")}
+              >
+                <span className="play-mode-label">Hybrid</span>
+                <span className="play-mode-desc">MCTS nyitásban, minimax végjátékban</span>
+              </button>
+            </div>
+
+            <div className="modal-divider" />
+
+            <div className="modal-subtitle">Keresés paraméterek</div>
             <div className="modal-sliders">
               <label className="field field-short">
                 <span>Szimulációk: {mctsSims}</span>

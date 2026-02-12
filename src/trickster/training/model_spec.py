@@ -99,7 +99,8 @@ def model_label_from_dir(d: Path) -> str:
             body = params.get("body_units", "?")
             blayers = params.get("body_layers", "?")
             head = params.get("head_units", "?")
-            return f"{d.name}  (alphazero {body}x{blayers} head={head})"
+            method_tag = " hybrid" if m == "hybrid" else ""
+            return f"{d.name}  (alphazero {body}x{blayers} head={head}{method_tag})"
         return f"{d.name}  ({k}{tag})"
     except Exception:
         return d.name

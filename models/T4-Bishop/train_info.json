@@ -3,7 +3,7 @@
   "iterations": 300,
   "games_per_iter": 50,
   "total_games": 15000,
-  "total_samples": 183553,
+  "total_samples": 176291,
   "bootstrap_games": 6000,
   "sims": 60,
   "dets": 5,
@@ -14,7 +14,7 @@
   "l2": 0.0001,
   "seed": 42,
   "workers": 4,
-  "vmse": 0.341932,
-  "pce": 1.338423,
-  "train_time_s": 663.9
+  "vmse": 0.349053,
+  "pce": 1.341494,
+  "train_time_s": 792.3
 }
