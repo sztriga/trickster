@@ -264,6 +264,16 @@ class UltiGame:
         for _, c in gs.trick_cards:
             known.add(c)
 
+        # Talon discards: only the soloist knows which cards were
+        # discarded.  For the soloist they go into ``known`` (removing
+        # them from the pool).  For defenders, talon discards stay in
+        # the unknown pool — but only opponent-hand-count cards are
+        # drawn, so the 2 leftover discards are naturally unused.
+        if gs.talon_discards:
+            if player == gs.soloist:
+                known.update(gs.talon_discards)
+            # else: defenders don't know — cards stay in the unknown pool
+
         # Terített: soloist's hand is visible to everyone
         if state.is_open and state.gs.soloist != player:
             known.update(gs.hands[state.gs.soloist])

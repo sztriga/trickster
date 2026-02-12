@@ -163,9 +163,10 @@ class UltiEncoder:
 
         # ── Section 2: Per-player captured cards (3 × 32 binary) ─────
         # Card-counting brain: who captured what.
+        # Relative encoding: [my captures, left opp, right opp]
         offsets = [_CAP0_OFF, _CAP1_OFF, _CAP2_OFF]
-        for p in range(NUM_PLAYERS):
-            off = offsets[p]
+        for section_idx, p in enumerate([player, (player + 1) % NUM_PLAYERS, (player + 2) % NUM_PLAYERS]):
+            off = offsets[section_idx]
             for c in captured[p]:
                 x[off + _ci[c]] = 1.0
 

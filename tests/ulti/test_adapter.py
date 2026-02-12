@@ -323,7 +323,9 @@ class TestDeterminize:
         game = UltiGame()
         rng = random.Random(789)
 
-        det = game.determinize(state, 0, rng)
+        # Determinize as soloist — talon discards are known and excluded
+        sol = state.gs.soloist
+        det = game.determinize(state, sol, rng)
         all_cards: list[Card] = []
         for h in det.gs.hands:
             all_cards.extend(h)
@@ -331,8 +333,56 @@ class TestDeterminize:
             all_cards.extend(pile)
         for _, c in det.gs.trick_cards:
             all_cards.append(c)
+        all_cards.extend(det.gs.talon_discards)
 
         assert len(all_cards) == len(set(all_cards)), "Duplicate card detected"
+
+        # Determinize as defender — in-play cards (hands + captured + trick)
+        # should have no duplicates. Talon discards may overlap with hands
+        # since defenders don't know the discards.
+        defs = [i for i in range(3) if i != sol]
+        det_d = game.determinize(state, defs[0], rng)
+        in_play: list[Card] = []
+        for h in det_d.gs.hands:
+            in_play.extend(h)
+        for pile in det_d.gs.captured:
+            in_play.extend(pile)
+        for _, c in det_d.gs.trick_cards:
+            in_play.append(c)
+        assert len(in_play) == len(set(in_play)), "Duplicate in-play card"
+
+    def test_talon_hidden_from_defenders(self):
+        """Defenders should not know the talon discards; soloist should."""
+        game = UltiGame()
+        rng = random.Random(555)
+
+        for seed in range(5):
+            state = game.new_game(seed=seed)
+            gs = state.gs
+            sol = gs.soloist
+            talon = gs.talon_discards
+            if not talon:
+                continue
+
+            defs = [i for i in range(3) if i != sol]
+
+            # For soloist: talon cards should NOT appear in any opponent's hand
+            # because they're known to be discarded.
+            det_sol = game.determinize(state, sol, rng)
+            for d in defs:
+                for c in talon:
+                    assert c not in det_sol.gs.hands[d], (
+                        f"Talon card {c} appeared in defender {d}'s "
+                        f"hand during soloist determinization"
+                    )
+
+            # For defenders: talon cards COULD appear in opponent hands
+            # (they don't know the discards), so we just verify hand sizes
+            # are correct and no duplicates.
+            for d in defs:
+                det_def = game.determinize(state, d, rng)
+                for i in range(3):
+                    assert len(det_def.gs.hands[i]) == len(gs.hands[i])
 
     def test_respects_void_constraints(self):
         """If a player is void in Hearts, determinize should not give them Hearts."""

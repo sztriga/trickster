@@ -187,9 +187,8 @@ def _build_state(
         last_trick=None,
         training_mode="betli" if betli else "simple",
     )
-    # Add discard points to soloist's captured/score
-    gs.captured[soloist] = list(discards)
-    gs.scores[soloist] = discard_points
+    # Store talon discards — their points count for the defenders
+    gs.talon_discards = list(discards)
 
     # Declare marriages
     declare_all_marriages(gs)

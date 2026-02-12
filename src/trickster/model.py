@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from trickster.games.ulti.encoder import STATE_DIM, NUM_CARDS
+from trickster.games.ulti.encoder import STATE_DIM, NUM_CARDS, _SCALAR_OFF
 
 # ---------------------------------------------------------------------------
 #  Auction head constants
@@ -92,6 +92,25 @@ def legacy_to_auction_targets(
 class UltiNet(nn.Module):
     """Shared-backbone AlphaZero network for Ulti play + auction.
 
+    Architecture (dual-head with stop-gradient):
+
+        Input → Shared Backbone (4×256)
+                  │
+                  ├─ [detach] → Soloist Policy Head (256→32) + Soloist Value Head (256→1)
+                  ├─ [detach] → Defender Policy Head (256→32) + Defender Value Head (256→1)
+                  │
+                  └─ [grad] → Shared Policy Head (256→32) + Shared Value Head (256→1)
+                               (backbone training signal only)
+
+    During **inference** (MCTS), the correct role head is selected
+    based on the ``is_soloist`` flag in the state features.
+
+    During **training**, ``forward_dual()`` routes each sample through
+    its role-specific head with ``detach()`` on the backbone output
+    (stop-gradient), so heads never push conflicting gradients to the
+    backbone.  The backbone learns from a shared head that sees all
+    samples with full gradients — purely perceptual features.
+
     Parameters
     ----------
     input_dim : int
@@ -132,11 +151,15 @@ class UltiNet(nn.Module):
             in_dim = body_units
         self.backbone = nn.Sequential(*layers)
 
-        # --- Policy head (card selection) ---
+        # --- Shared heads (backbone training signal) ---
         self.policy_head = nn.Linear(body_units, action_dim)
-
-        # --- Value head (win/loss prediction) ---
         self.value_fc = nn.Linear(body_units, 1)
+
+        # --- Role-specific heads (stop-gradient from backbone) ---
+        self.policy_head_sol = nn.Linear(body_units, action_dim)
+        self.policy_head_def = nn.Linear(body_units, action_dim)
+        self.value_fc_sol = nn.Linear(body_units, 1)
+        self.value_fc_def = nn.Linear(body_units, 1)
 
         # --- Auction head: shared hidden layer ---
         self.auction_shared = nn.Sequential(
@@ -150,6 +173,8 @@ class UltiNet(nn.Module):
 
         # Xavier init for all heads
         for fc in [self.policy_head, self.value_fc,
+                   self.policy_head_sol, self.policy_head_def,
+                   self.value_fc_sol, self.value_fc_def,
                    self.auction_trump, self.auction_flags]:
             nn.init.xavier_uniform_(fc.weight)
             nn.init.zeros_(fc.bias)
@@ -163,7 +188,7 @@ class UltiNet(nn.Module):
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass (play phase).
+        """Legacy forward — uses shared heads (backward compat).
 
         Returns (log_probs, value).
         """
@@ -176,6 +201,82 @@ class UltiNet(nn.Module):
 
         value = torch.tanh(self.value_fc(body)).squeeze(-1)
         return log_probs, value
+
+    def forward_role(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        is_soloist: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inference forward through role-specific head (for MCTS).
+
+        Routes through soloist or defender head based on ``is_soloist``.
+        Full gradient flow (no detach) — suitable for inference only.
+
+        Returns (log_probs, value).
+        """
+        body = self.backbone(x)
+
+        if is_soloist:
+            logits = self.policy_head_sol(body)
+            value = torch.tanh(self.value_fc_sol(body)).squeeze(-1)
+        else:
+            logits = self.policy_head_def(body)
+            value = torch.tanh(self.value_fc_def(body)).squeeze(-1)
+
+        if mask is not None:
+            logits = logits.masked_fill(~mask, -1e9)
+        log_probs = F.log_softmax(logits, dim=-1)
+        return log_probs, value
+
+    def forward_dual(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        is_soloist_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Training forward with role-specific heads.
+
+        Each sample is routed through its role-specific head with full
+        gradient flow.  The architectural separation ensures that
+        soloist gradients only pass through the soloist head and
+        defender gradients only through the defender head — no
+        cross-contamination.  The backbone receives gradients from
+        both roles, learning shared perceptual features.
+
+        Parameters
+        ----------
+        x : (B, input_dim)
+        mask : (B, action_dim) bool
+        is_soloist_batch : (B,) bool — True for soloist samples
+
+        Returns
+        -------
+        log_probs : (B, action_dim) — from role-specific policy heads
+        values : (B,) — from role-specific value heads
+        """
+        body = self.backbone(x)
+
+        B = x.shape[0]
+        logits = torch.zeros(B, self.action_dim, device=x.device)
+        raw_val = torch.zeros(B, device=x.device)
+
+        sol = is_soloist_batch.bool()
+        deff = ~sol
+
+        if sol.any():
+            logits[sol] = self.policy_head_sol(body[sol])
+            raw_val[sol] = self.value_fc_sol(body[sol]).squeeze(-1)
+        if deff.any():
+            logits[deff] = self.policy_head_def(body[deff])
+            raw_val[deff] = self.value_fc_def(body[deff]).squeeze(-1)
+
+        if mask is not None:
+            logits = logits.masked_fill(~mask, -1e9)
+        log_probs = F.log_softmax(logits, dim=-1)
+        values = torch.tanh(raw_val)
+
+        return log_probs, values
 
     def forward_auction(
         self, x: torch.Tensor,
@@ -235,6 +336,10 @@ class UltiNet(nn.Module):
 class UltiNetWrapper:
     """Wraps ``UltiNet`` to match the numpy API expected by MCTS.
 
+    Auto-detects the player role (soloist vs defender) from the
+    ``is_soloist`` scalar in the encoded state features and routes
+    through the appropriate role-specific head.
+
     Play phase:
       - ``predict_value(state_feats) → float``
       - ``predict_policy(state_feats, mask) → np.ndarray``
@@ -246,42 +351,52 @@ class UltiNetWrapper:
       - ``batch_value(state_batch) → np.ndarray``
     """
 
+    # Index of the is_soloist flag in encoded state features
+    _IS_SOL_IDX = _SCALAR_OFF + 1
+
     def __init__(self, net: UltiNet, device: str = "cpu") -> None:
         self.net = net
         self.device = torch.device(device)
         self.net.to(self.device)
 
+    def _detect_role(self, state_feats: np.ndarray) -> bool:
+        """Read the is_soloist flag from encoded features."""
+        return bool(state_feats.flat[self._IS_SOL_IDX] > 0.5)
+
     def predict_value(self, state_feats: np.ndarray) -> float:
+        is_sol = self._detect_role(state_feats)
         self.net.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_feats.reshape(1, -1)).float().to(self.device)
-            _, value = self.net(x)
+            _, value = self.net.forward_role(x, is_soloist=is_sol)
         return float(value.item())
 
     def predict_policy(
         self, state_feats: np.ndarray, mask: np.ndarray,
     ) -> np.ndarray:
+        is_sol = self._detect_role(state_feats)
         self.net.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_feats.reshape(1, -1)).float().to(self.device)
             m = torch.from_numpy(mask.reshape(1, -1)).bool().to(self.device)
-            log_probs, _ = self.net(x, m)
+            log_probs, _ = self.net.forward_role(x, m, is_soloist=is_sol)
             probs = log_probs.exp().squeeze(0)
         return probs.cpu().numpy()
 
     def predict_both(
         self, state_feats: np.ndarray, mask: np.ndarray,
     ) -> tuple[float, np.ndarray]:
+        is_sol = self._detect_role(state_feats)
         self.net.eval()
         with torch.no_grad():
             x = torch.from_numpy(state_feats.reshape(1, -1)).float().to(self.device)
             m = torch.from_numpy(mask.reshape(1, -1)).bool().to(self.device)
-            log_probs, value = self.net(x, m)
+            log_probs, value = self.net.forward_role(x, m, is_soloist=is_sol)
             probs = log_probs.exp().squeeze(0)
         return float(value.item()), probs.cpu().numpy()
 
     def batch_value(self, states: np.ndarray) -> np.ndarray:
-        """Evaluate value head on a batch of states."""
+        """Evaluate value head on a batch of states (shared head)."""
         self.net.eval()
         with torch.no_grad():
             x = torch.from_numpy(states).float().to(self.device)

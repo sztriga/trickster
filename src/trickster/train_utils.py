@@ -197,32 +197,44 @@ def simple_outcome(state: UltiNode, player: int) -> float:
 
 
 class ReplayBuffer:
-    """Fixed-capacity FIFO replay buffer with priority-weighted sampling.
+    """Fixed-capacity replay buffer with reservoir sampling and outcome-balanced batching.
 
-    Each sample is a tuple:
-      (state_feats, mask, mcts_policy, reward, is_soloist)
-    stored as numpy arrays for efficient batch sampling.
+    Uses **reservoir sampling** (Algorithm R, Vitter 1985) instead of
+    FIFO eviction.  Every sample ever pushed has an equal probability
+    of being retained, preserving diversity across training history.
+    This is what the NFSP paper recommends for the average strategy
+    memory (Lanctot et al. 2017).
 
-    Soloist experiences are sampled ``soloist_weight`` times more
-    frequently than defender experiences.  This corrects the
-    "defender bias" where ~67% of games are easy defender wins.
+    Sampling strategy (prevents self-play collapse):
+      1. Soloist experiences are sampled ``soloist_weight`` times more
+         frequently than defender experiences.
+      2. Each mini-batch guarantees at least ``min_positive_frac`` of
+         its samples come from *winning* soloist outcomes (reward > 0).
     """
 
     def __init__(
         self,
         capacity: int = 50_000,
         soloist_weight: float = 3.0,
+        min_positive_frac: float = 0.15,
+        seed: int | None = None,
     ) -> None:
         self.capacity = capacity
         self.soloist_weight = soloist_weight
-        self.states: list[np.ndarray] = []
-        self.masks: list[np.ndarray] = []
-        self.policies: list[np.ndarray] = []
-        self.rewards: list[float] = []
-        self.is_soloist: list[bool] = []
+        self.min_positive_frac = min_positive_frac
+
+        self._size = 0
+        self._total_seen = 0
+        self._allocated = False
+        self._states: np.ndarray | None = None
+        self._masks: np.ndarray | None = None
+        self._policies: np.ndarray | None = None
+        self._rewards = np.zeros(capacity, dtype=np.float64)
+        self._is_soloist = np.zeros(capacity, dtype=bool)
+        self._rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
-        return len(self.states)
+        return self._size
 
     def push(
         self,
@@ -232,28 +244,70 @@ class ReplayBuffer:
         reward: float,
         is_soloist: bool = False,
     ) -> None:
-        self.states.append(state)
-        self.masks.append(mask)
-        self.policies.append(policy)
-        self.rewards.append(reward)
-        self.is_soloist.append(is_soloist)
+        if not self._allocated:
+            self._states = np.zeros(
+                (self.capacity,) + state.shape, dtype=state.dtype,
+            )
+            self._masks = np.zeros(
+                (self.capacity,) + mask.shape, dtype=mask.dtype,
+            )
+            self._policies = np.zeros(
+                (self.capacity,) + policy.shape, dtype=policy.dtype,
+            )
+            self._allocated = True
 
-        # FIFO eviction
-        if len(self.states) > self.capacity:
-            self.states = self.states[-self.capacity:]
-            self.masks = self.masks[-self.capacity:]
-            self.policies = self.policies[-self.capacity:]
-            self.rewards = self.rewards[-self.capacity:]
-            self.is_soloist = self.is_soloist[-self.capacity:]
+        self._total_seen += 1
+
+        if self._size < self.capacity:
+            # Buffer not full — add directly
+            pos = self._size
+            self._size += 1
+        else:
+            # Reservoir sampling: replace random slot with prob capacity/total_seen
+            j = int(self._rng.integers(0, self._total_seen))
+            if j < self.capacity:
+                pos = j
+            else:
+                return  # discard this sample
+
+        self._states[pos] = state
+        self._masks[pos] = mask
+        self._policies[pos] = policy
+        self._rewards[pos] = reward
+        self._is_soloist[pos] = is_soloist
+
+    def stats(self) -> dict[str, float]:
+        """Return buffer composition diagnostics."""
+        n = self._size
+        if n == 0:
+            return {}
+        sol = self._is_soloist[:n]
+        rew = self._rewards[:n]
+        n_sol = int(sol.sum())
+        n_def = n - n_sol
+        sol_win = int((sol & (rew > 0)).sum())
+        sol_lose = n_sol - sol_win
+        def_win = int((~sol & (rew > 0)).sum())
+        def_lose = n_def - def_win
+        return {
+            "size": n,
+            "total_seen": self._total_seen,
+            "soloist_frac": n_sol / n,
+            "sol_win": sol_win,
+            "sol_lose": sol_lose,
+            "def_win": def_win,
+            "def_lose": def_lose,
+            "sol_win_rate": sol_win / max(1, n_sol),
+        }
 
     def sample(
         self, batch_size: int, rng: np.random.Generator,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Priority-weighted mini-batch sampling.
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Outcome-balanced mini-batch sampling.
 
-        Soloist samples receive ``soloist_weight`` times higher
-        probability than defender samples.  Weights are normalised
-        to form a proper distribution.
+        Guarantees a minimum fraction of soloist-win samples in each
+        batch to prevent self-play collapse.  Falls back to pure
+        weighted sampling when there aren't enough winning samples.
 
         Returns
         -------
@@ -261,21 +315,138 @@ class ReplayBuffer:
         masks : (B, action_dim)
         policies : (B, action_dim)
         rewards : (B,)
+        is_soloist : (B,) bool
         """
-        n = len(self.states)
+        n = self._size
         B = min(batch_size, n)
 
-        # Build sampling weights: soloist_weight for soloists, 1.0 for defenders
-        weights = np.array(
-            [self.soloist_weight if s else 1.0 for s in self.is_soloist],
-            dtype=np.float64,
-        )
-        weights /= weights.sum()
+        sol = self._is_soloist[:n]
+        rew = self._rewards[:n]
 
-        indices = rng.choice(n, size=B, replace=False, p=weights)
+        # Identify soloist-win indices (the scarce, valuable samples)
+        sol_win_mask = sol & (rew > 0)
+        sol_win_idx = np.where(sol_win_mask)[0]
+        other_idx = np.where(~sol_win_mask)[0]
+
+        # Guarantee a minimum number of soloist-win samples per batch
+        min_sol_win = max(1, int(B * self.min_positive_frac))
+
+        if len(sol_win_idx) >= min_sol_win and len(other_idx) >= (B - min_sol_win):
+            # Stratified draw: reserve min_sol_win slots for soloist wins
+            sw_chosen = rng.choice(
+                sol_win_idx, size=min_sol_win, replace=False,
+            )
+
+            # Fill remaining slots from other samples with role weighting
+            remaining = B - min_sol_win
+            other_weights = np.where(
+                self._is_soloist[other_idx], self.soloist_weight, 1.0,
+            )
+            other_weights /= other_weights.sum()
+            ot_chosen = rng.choice(
+                other_idx, size=remaining, replace=False, p=other_weights,
+            )
+
+            indices = np.concatenate([sw_chosen, ot_chosen])
+        else:
+            # Not enough soloist-win samples — fall back to weighted sampling
+            weights = np.where(sol, self.soloist_weight, 1.0)
+            weights /= weights.sum()
+            indices = rng.choice(n, size=B, replace=False, p=weights)
+
         return (
-            np.stack([self.states[i] for i in indices]),
-            np.stack([self.masks[i] for i in indices]),
-            np.stack([self.policies[i] for i in indices]),
-            np.array([self.rewards[i] for i in indices], dtype=np.float64),
+            self._states[indices].copy(),
+            self._masks[indices].copy(),
+            self._policies[indices].copy(),
+            self._rewards[indices].copy(),
+            self._is_soloist[indices].copy(),
         )
+
+
+# ---------------------------------------------------------------------------
+#  Checkpoint pool with PFSP opponent selection
+# ---------------------------------------------------------------------------
+
+
+class CheckpointPool:
+    """Pool of frozen model checkpoints for league-style training.
+
+    Stores snapshots of model weights taken at intervals.  During
+    self-play the soloist uses the latest network while defenders
+    are sampled from this pool.
+
+    Implements **Prioritized Fictitious Self-Play** (PFSP):
+    opponents are selected with probability weighted toward a ~50%
+    win rate against the current agent — neither too easy nor too
+    hard.  Based on Vinyals et al., "Grandmaster level in StarCraft
+    II using multi-agent reinforcement learning" (Nature, 2019).
+    """
+
+    def __init__(self, max_size: int = 10) -> None:
+        self.max_size = max_size
+        self._pool: list[dict] = []
+
+    def __len__(self) -> int:
+        return len(self._pool)
+
+    def add(self, step: int, state_dict: dict) -> None:
+        """Snapshot current weights into the pool."""
+        entry = {
+            "step": step,
+            "state_dict": {k: v.cpu().clone() for k, v in state_dict.items()},
+            "games": 0,
+            "wins": 0,  # current agent's soloist wins against this opponent
+        }
+        self._pool.append(entry)
+
+        if len(self._pool) > self.max_size:
+            # Evict the checkpoint with WR furthest from 50%
+            worst_idx = 0
+            worst_dist = -1.0
+            for i, cp in enumerate(self._pool):
+                if cp["games"] < 5:
+                    continue
+                wr = cp["wins"] / cp["games"]
+                dist = abs(wr - 0.5)
+                if dist > worst_dist:
+                    worst_dist = dist
+                    worst_idx = i
+            self._pool.pop(worst_idx)
+
+    def select(self, rng) -> dict | None:
+        """Select an opponent via PFSP weighting.
+
+        New/untested checkpoints get uniform weight (exploration).
+        Tested checkpoints are weighted by a bell curve peaking at
+        50% win rate.
+        """
+        if not self._pool:
+            return None
+
+        weights = []
+        for cp in self._pool:
+            if cp["games"] < 5:
+                w = 1.0  # explore new checkpoints
+            else:
+                wr = cp["wins"] / cp["games"]
+                # Bell curve: 1.0 at WR=50%, ~0 at WR=0% or 100%
+                w = max(0.01, 1.0 - 4.0 * (wr - 0.5) ** 2)
+            weights.append(w)
+
+        return rng.choices(self._pool, weights=weights, k=1)[0]
+
+    def update(self, entry: dict, current_won: bool) -> None:
+        """Record a game result for PFSP weight updates."""
+        entry["games"] += 1
+        if current_won:
+            entry["wins"] += 1
+
+    def summary(self) -> str:
+        """One-line summary for logging."""
+        if not self._pool:
+            return "empty"
+        parts = []
+        for cp in self._pool:
+            wr = cp["wins"] / max(1, cp["games"])
+            parts.append(f"s{cp['step']}:{wr:.0%}({cp['games']}g)")
+        return " ".join(parts)

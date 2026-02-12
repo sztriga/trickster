@@ -12,6 +12,7 @@ dependencies = ["fastapi", "uvicorn", "numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest==8.3.4"]
+fast = ["cython"]
 
 [project.scripts]
 trickster-gui = "trickster.gui:main"
