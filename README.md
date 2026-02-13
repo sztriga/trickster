@@ -64,7 +64,7 @@ Each decision point uses one of two engines depending on game phase:
 
 | Tricks remaining | Engine | Labels |
 |---|---|---|
-| 5-10 (opening) | Neural MCTS (20 sims soloist, 8 defenders) | Noisy (visit counts) |
+| 5-10 (opening) | Neural MCTS (20-30 sims soloist, 8-12 defenders) | Noisy (visit counts) |
 | 1-4 (endgame) | PIMC + Cython alpha-beta (20 determinizations) | Exact |
 
 The solver produces **exact game-theoretic values** for ~60% of training positions (tricks 5-10). The network gets clean, perfect targets for the endgame, while MCTS handles the imperfect-information opening where exact solving is too expensive.
@@ -76,28 +76,30 @@ A single `UltiNet` plays all 3 seats. The state encoder uses relative positionin
 2. Record `(state, legal_mask, policy_target, reward)` for every non-forced decision
 3. Push samples into a replay buffer (reservoir sampling, outcome-balanced batching)
 4. Train on mini-batches: `loss = MSE(value, outcome) + CrossEntropy(policy, target)`
-5. Evaluate periodically against random opponents
+5. Evaluate periodically via round-robin against other tiers and random opponents
+
+**Tiered training** (`scripts/train_ulti.py`) trains 3 progressively stronger models:
+
+| Tier | Games | MCTS (sol/def) | LR | Status |
+|---|---|---|---|---|
+| U1-Scout | 4,000 | 20s / 8s | 1e-3 → 2e-4 | Trained |
+| U2-Knight | 16,000 | 30s / 12s | 1e-3 → 1e-4 | Trained |
+| U3-Bishop | 64,000 | 30s / 12s | 1e-3 → 5e-5 | Next target |
+
+All tiers use a 256×4 UltiNet with cosine LR annealing and decoupled SGD steps.
 
 ```bash
-# Quick training run
-python scripts/train_baseline.py --steps 200
+# Train all 3 tiers + round-robin eval
+python scripts/train_ulti.py
 
-# Full training with checkpoints
-python scripts/train_baseline.py \
-    --steps 5000 \
-    --games-per-step 4 \
-    --sims 20 --def-sims 8 \
-    --endgame-tricks 6 --pimc-dets 20 \
-    --lr 1e-3 \
-    --checkpoint-interval 500 \
-    --eval-interval 100 \
-    --eval-games 30
+# Train a single tier
+python scripts/train_ulti.py --tiers knight
 
-# Continue from checkpoint
-python scripts/train_baseline.py --steps 5000 --load models/checkpoints/simple/step_02000.pt
+# Evaluate existing models only
+python scripts/train_ulti.py --eval-only
 
-# Parallel self-play
-python scripts/train_baseline.py --workers 4 --games-per-step 16
+# Single-run training (original script, supports deal enrichment + parallel workers)
+python scripts/train_baseline.py --steps 2000 --workers 4 --games-per-step 16
 ```
 
 ### Stage 2: Auction + Discard (future)
@@ -208,10 +210,17 @@ src/trickster/
   _solver_core.pyx         # Cython alpha-beta solver
 
 scripts/
-  train_baseline.py        # Hybrid training (Parti)
+  train_ulti.py            # Tiered Ulti Parti training (Scout/Knight/Bishop)
+  train_baseline.py        # Single-run Ulti hybrid training (Parti)
+  train_ladder.py          # Snapszer AlphaZero strength ladder (T1-T7)
+  train_hybrid.py          # Snapszer hybrid MCTS+Minimax training (H1-H5)
+  train_alpha_zero.py      # Snapszer AlphaZero core training loop
   train_solver_nets.py     # Hand evaluator + policy from solver data
-  test_cython_solver.py    # Solver verification + benchmark
+  tournament.py            # Tournament evaluation between models
+  eval_hybrid.py           # Hybrid agent evaluation
   eval_head2head.py        # Head-to-head model comparison
+  eval_mcts_strength.py    # MCTS strength evaluation
+  test_cython_solver.py    # Solver verification + benchmark
 
 apps/
   api/ulti.py              # FastAPI backend (Ulti)
@@ -219,4 +228,8 @@ apps/
   web/                     # React + TypeScript frontend
 
 models/                    # Trained model checkpoints
+  ulti/U1-Scout/           #   Ulti Scout (4k games)
+  ulti/U2-Knight/          #   Ulti Knight (16k games)
+  T1-Pawn/ .. T6-Captain/  #   Snapszer AlphaZero ladder
+  H2-Knight-v1..v3/        #   Snapszer hybrid models
 ```

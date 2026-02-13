@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Train Ulti Parti models at 3 strength tiers and evaluate head-to-head.
 
-Mirrors the Snapszer hybrid training workflow:
-  1. Train 3 tiers (Scout / Knight / Bishop) with increasing budgets.
-  2. Round-robin evaluation: every model plays every other model.
-  3. Print a ranking table so you can confirm learning is happening.
+Thin configuration wrapper around the shared training engine
+(``trickster.training.ulti_hybrid``).  Each tier defines a set of
+hyperparameters; the engine handles the full training loop with
+parallel workers, cosine LR, deal enrichment, etc.
 
-Each tier uses the HybridPlayer (MCTS + Cython alpha-beta solver).
-Models are saved to ``models/ulti/<tier-name>/``.
+Tiers:
+  Scout  — 500 steps, 4k games  (baseline / fast iteration)
+  Knight — 2000 steps, 16k games (medium)
+  Bishop — 8000 steps, 64k games (strong, overnight run)
 
 Usage:
     # Train all 3 tiers + eval (default)
@@ -21,6 +23,18 @@ Usage:
 
     # Single tier
     python scripts/train_ulti.py --tiers scout
+
+    # Parallel self-play (4 workers)
+    python scripts/train_ulti.py --workers 4
+
+    # Override solver settings
+    python scripts/train_ulti.py --endgame-tricks 7 --pimc-dets 30
+
+    # Enable deal enrichment
+    python scripts/train_ulti.py --enrichment
+
+    # Continue from checkpoint
+    python scripts/train_ulti.py --tiers knight --load models/ulti/U1-Scout/model.pt
 """
 from __future__ import annotations
 
@@ -36,19 +50,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from trickster.games.ulti.adapter import UltiGame, UltiNode
-from trickster.games.ulti.cards import Suit
 from trickster.games.ulti.game import soloist_won_simple
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 from trickster.mcts import MCTSConfig
 from trickster.model import UltiNet, UltiNetWrapper
-from trickster.train_utils import ReplayBuffer, simple_outcome
+from trickster.training.ulti_hybrid import (
+    UltiTrainConfig,
+    UltiTrainStats,
+    train_ulti_hybrid,
+)
 
 
 # ---------------------------------------------------------------------------
-#  Tier definitions
+#  Tier definitions (parameters only — no training logic)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -56,8 +72,8 @@ class UltiTier:
     name: str
     steps: int
     games_per_step: int
-    train_steps: int          # SGD steps per iteration (decoupled from games)
-    sims: int
+    train_steps: int
+    sol_sims: int
     def_sims: int
     endgame_tricks: int
     pimc_dets: int
@@ -65,7 +81,7 @@ class UltiTier:
     body_units: int
     body_layers: int
     lr_start: float
-    lr_end: float             # cosine decay target
+    lr_end: float
     batch_size: int
     buffer_size: int
     description: str
@@ -79,7 +95,7 @@ TIERS: dict[str, UltiTier] = {
     "scout": UltiTier(
         name="U1-Scout",
         steps=500, games_per_step=8, train_steps=50,
-        sims=20, def_sims=8,
+        sol_sims=20, def_sims=8,
         endgame_tricks=6, pimc_dets=20, solver_temp=0.5,
         body_units=256, body_layers=4,
         lr_start=1e-3, lr_end=2e-4,
@@ -89,7 +105,7 @@ TIERS: dict[str, UltiTier] = {
     "knight": UltiTier(
         name="U2-Knight",
         steps=2000, games_per_step=8, train_steps=80,
-        sims=30, def_sims=12,
+        sol_sims=30, def_sims=12,
         endgame_tricks=6, pimc_dets=20, solver_temp=0.5,
         body_units=256, body_layers=4,
         lr_start=1e-3, lr_end=1e-4,
@@ -99,7 +115,7 @@ TIERS: dict[str, UltiTier] = {
     "bishop": UltiTier(
         name="U3-Bishop",
         steps=8000, games_per_step=8, train_steps=100,
-        sims=30, def_sims=12,
+        sol_sims=30, def_sims=12,
         endgame_tricks=6, pimc_dets=20, solver_temp=0.5,
         body_units=256, body_layers=4,
         lr_start=1e-3, lr_end=5e-5,
@@ -112,308 +128,183 @@ TIER_ORDER = ["scout", "knight", "bishop"]
 
 
 # ---------------------------------------------------------------------------
-#  Self-play: one game → training samples
+#  Tier -> UltiTrainConfig conversion
 # ---------------------------------------------------------------------------
 
 
-def play_one_game(
-    game: UltiGame,
-    wrapper: UltiNetWrapper,
-    sol_cfg: MCTSConfig,
-    def_cfg: MCTSConfig,
-    seed: int,
-    endgame_tricks: int = 6,
-    pimc_dets: int = 20,
-    solver_temp: float = 0.5,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
-    """Play one hybrid self-play game (Parti, random trump).
-
-    Returns list of (state, mask, policy, reward, is_soloist).
-    """
-    rng = random.Random(seed)
-    state = game.new_game(
+def _tier_to_config(
+    tier: UltiTier,
+    *,
+    seed: int = 42,
+    device: str = "cpu",
+    num_workers: int = 1,
+    enrichment: bool = False,
+    endgame_tricks: int | None = None,
+    pimc_dets: int | None = None,
+    solver_temp: float | None = None,
+) -> UltiTrainConfig:
+    """Build a UltiTrainConfig from a tier definition + CLI overrides."""
+    return UltiTrainConfig(
+        steps=tier.steps,
+        games_per_step=tier.games_per_step,
+        train_steps=tier.train_steps,
+        batch_size=tier.batch_size,
+        buffer_size=tier.buffer_size,
+        lr_start=tier.lr_start,
+        lr_end=tier.lr_end,
+        sol_sims=tier.sol_sims,
+        sol_dets=1,
+        def_sims=tier.def_sims,
+        def_dets=1,
+        endgame_tricks=endgame_tricks if endgame_tricks is not None else tier.endgame_tricks,
+        pimc_dets=pimc_dets if pimc_dets is not None else tier.pimc_dets,
+        solver_temp=solver_temp if solver_temp is not None else tier.solver_temp,
+        body_units=tier.body_units,
+        body_layers=tier.body_layers,
+        num_workers=num_workers,
+        enrichment=enrichment,
         seed=seed,
-        training_mode="simple",
-        starting_leader=seed % 3,
+        device=device,
     )
-    soloist_idx = state.gs.soloist
-
-    sol_hybrid = HybridPlayer(
-        game, wrapper,
-        mcts_config=sol_cfg,
-        endgame_tricks=endgame_tricks,
-        pimc_determinizations=pimc_dets,
-        solver_temperature=solver_temp,
-    )
-    def_hybrid = HybridPlayer(
-        game, wrapper,
-        mcts_config=def_cfg,
-        endgame_tricks=endgame_tricks,
-        pimc_determinizations=pimc_dets,
-        solver_temperature=solver_temp,
-    )
-
-    trajectory: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
-
-    while not game.is_terminal(state):
-        player = game.current_player(state)
-        actions = game.legal_actions(state)
-
-        if len(actions) <= 1:
-            state = game.apply(state, actions[0])
-            continue
-
-        if player == soloist_idx:
-            pi, action = sol_hybrid.choose_action_with_policy(state, player, rng)
-        else:
-            pi, action = def_hybrid.choose_action_with_policy(state, player, rng)
-
-        state_feats = game.encode_state(state, player)
-        mask = game.legal_action_mask(state)
-        trajectory.append((
-            state_feats.copy(),
-            mask.copy(),
-            np.asarray(pi, dtype=np.float32).copy(),
-            player,
-        ))
-
-        state = game.apply(state, action)
-
-    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]] = []
-    for state_feats, mask, pi, player in trajectory:
-        reward = simple_outcome(state, player)
-        is_sol = (player == soloist_idx)
-        samples.append((state_feats, mask, pi, reward, is_sol))
-
-    return samples
 
 
 # ---------------------------------------------------------------------------
-#  Training loop for one tier
+#  Progress callback (pretty-printing)
 # ---------------------------------------------------------------------------
 
 
-def _cosine_lr(step: int, total_steps: int, lr_start: float, lr_end: float) -> float:
-    """Cosine annealing from lr_start to lr_end."""
-    if total_steps <= 1:
-        return lr_start
-    frac = step / total_steps
-    return lr_end + 0.5 * (lr_start - lr_end) * (1 + np.cos(np.pi * frac))
+def _make_progress_cb(
+    tier: UltiTier,
+) -> tuple[callable, dict]:
+    """Create a progress callback and a mutable context dict."""
+    report_interval = max(1, tier.steps // 20)
+    ctx = {"report_interval": report_interval}
+
+    def on_progress(stats: UltiTrainStats) -> None:
+        step = stats.step
+        ri = ctx["report_interval"]
+        if step % ri != 0 and step != 1 and step != stats.total_steps:
+            return
+
+        pct = step / stats.total_steps * 100
+        elapsed = stats.train_time_s
+
+        # Trend arrows
+        window = max(1, ri)
+        h_v = stats.history_vloss
+        h_p = stats.history_ploss
+        recent_v = np.mean(h_v[-window:]) if h_v else 0
+        prev_v = np.mean(h_v[-2*window:-window]) if len(h_v) > window else recent_v
+        recent_p = np.mean(h_p[-window:]) if h_p else 0
+        prev_p = np.mean(h_p[-2*window:-window]) if len(h_p) > window else recent_p
+        recent_acc = np.mean(stats.history_pacc[-window:]) if stats.history_pacc else 0
+
+        v_arrow = "↓" if recent_v < prev_v - 0.005 else ("↑" if recent_v > prev_v + 0.005 else "→")
+        p_arrow = "↓" if recent_p < prev_p - 0.01 else ("↑" if recent_p > prev_p + 0.01 else "→")
+
+        print(
+            f"    step {step:>5d}/{stats.total_steps} ({pct:4.0f}%)  "
+            f"games={stats.total_games:>5d}  "
+            f"vloss={stats.vloss:.4f}{v_arrow} "
+            f"(sol={stats.sol_vloss:.3f} def={stats.def_vloss:.3f})  "
+            f"ploss={stats.ploss:.4f}{p_arrow}  "
+            f"pacc={recent_acc:.0%}  "
+            f"lr={stats.lr:.1e}  "
+            f"[{elapsed:.0f}s]",
+            flush=True,
+        )
+
+    return on_progress, ctx
+
+
+# ---------------------------------------------------------------------------
+#  Train one tier
+# ---------------------------------------------------------------------------
 
 
 def train_tier(
     tier: UltiTier,
+    *,
     seed: int = 42,
     device: str = "cpu",
+    num_workers: int = 1,
+    enrichment: bool = False,
+    load_path: str | None = None,
+    endgame_tricks: int | None = None,
+    pimc_dets: int | None = None,
+    solver_temp: float | None = None,
 ) -> tuple[UltiNet, Path]:
-    """Train one tier. Returns (net, model_dir)."""
-
+    """Train one tier using the shared engine. Returns (net, model_dir)."""
     model_dir = Path("models") / "ulti" / tier.name
     model_dir.mkdir(parents=True, exist_ok=True)
 
     game = UltiGame()
-    net = UltiNet(
-        input_dim=game.state_dim,
-        body_units=tier.body_units,
-        body_layers=tier.body_layers,
-        action_dim=game.action_space_size,
-    )
-    wrapper = UltiNetWrapper(net, device=device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=tier.lr_start, weight_decay=1e-4)
-    buffer = ReplayBuffer(capacity=tier.buffer_size, seed=seed + 1)
-    np_rng = np.random.default_rng(seed)
-
-    sol_cfg = MCTSConfig(
-        simulations=tier.sims, determinizations=1,
-        c_puct=1.5, dirichlet_alpha=0.3, dirichlet_weight=0.25,
-        use_value_head=True, use_policy_priors=True, visit_temp=1.0,
-    )
-    def_cfg = MCTSConfig(
-        simulations=tier.def_sims, determinizations=1,
-        c_puct=1.5, dirichlet_alpha=0.1, dirichlet_weight=0.15,
-        use_value_head=True, use_policy_priors=True, visit_temp=0.5,
+    cfg = _tier_to_config(
+        tier, seed=seed, device=device,
+        num_workers=num_workers,
+        enrichment=enrichment,
+        endgame_tricks=endgame_tricks,
+        pimc_dets=pimc_dets,
+        solver_temp=solver_temp,
     )
 
-    param_count = sum(p.numel() for p in net.parameters())
-    report_interval = max(1, tier.steps // 20)
+    # Load checkpoint if provided
+    initial_net = None
+    if load_path is not None:
+        cp = torch.load(load_path, weights_only=False, map_location=device)
+        initial_net = UltiNet(
+            input_dim=game.state_dim,
+            body_units=cfg.body_units,
+            body_layers=cfg.body_layers,
+            action_dim=game.action_space_size,
+        )
+        initial_net.load_state_dict(cp["model_state_dict"])
+        print(f"    Loaded checkpoint from {load_path}")
 
-    print(f"    Net: {tier.body_units}x{tier.body_layers} ({param_count:,} params)")
-    print(f"    MCTS: sol={tier.sims}s def={tier.def_sims}s | "
-          f"Solver: {SOLVER_ENGINE} (endgame={tier.endgame_tricks}t, "
-          f"PIMC={tier.pimc_dets}d)")
-    print(f"    LR: {tier.lr_start} → {tier.lr_end} (cosine)  "
-          f"batch={tier.batch_size}  SGD/step={tier.train_steps}  "
-          f"buffer={tier.buffer_size:,}")
+    # Print config
+    param_count = sum(
+        p.numel() for p in (initial_net or UltiNet(
+            input_dim=game.state_dim,
+            body_units=cfg.body_units,
+            body_layers=cfg.body_layers,
+            action_dim=game.action_space_size,
+        )).parameters()
+    )
+    print(f"    Net: {cfg.body_units}x{cfg.body_layers} ({param_count:,} params)")
+    print(f"    MCTS: sol={cfg.sol_sims}s def={cfg.def_sims}s | "
+          f"Solver: {SOLVER_ENGINE} (endgame={cfg.endgame_tricks}t, "
+          f"PIMC={cfg.pimc_dets}d)")
+    print(f"    LR: {cfg.lr_start} → {cfg.lr_end} (cosine)  "
+          f"batch={cfg.batch_size}  SGD/step={cfg.train_steps}  "
+          f"buffer={cfg.buffer_size:,}")
+    workers_str = f"{cfg.num_workers} (parallel)" if cfg.num_workers > 1 else "1 (sequential)"
+    print(f"    Workers: {workers_str}")
+    if cfg.enrichment:
+        print(f"    Enrichment: ON (warmup={cfg.enrich_warmup}, "
+              f"random_frac={cfg.enrich_random_frac:.0%})")
     print()
 
-    t0 = time.perf_counter()
-    total_games = 0
-    total_samples = 0
-    total_sgd_steps = 0
+    # Train
+    on_progress, _ctx = _make_progress_cb(tier)
+    net, stats = train_ulti_hybrid(
+        cfg,
+        initial_net=initial_net,
+        on_progress=on_progress,
+    )
 
-    # Track metrics over time
-    history_vloss: list[float] = []
-    history_ploss: list[float] = []
-    history_pacc: list[float] = []
-    history_sol_vloss: list[float] = []
-    history_def_vloss: list[float] = []
-
-    for step in range(1, tier.steps + 1):
-        # ---- 0. Update learning rate (cosine schedule) ----
-        lr = _cosine_lr(step, tier.steps, tier.lr_start, tier.lr_end)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-
-        # ---- 1. Self-play ----
-        step_samples = 0
-        sp_wins = 0
-        sp_total = 0
-
-        for g in range(tier.games_per_step):
-            game_seed = seed + step * 1000 + g
-            samples = play_one_game(
-                game, wrapper, sol_cfg, def_cfg, game_seed,
-                endgame_tricks=tier.endgame_tricks,
-                pimc_dets=tier.pimc_dets,
-                solver_temp=tier.solver_temp,
-            )
-
-            # Track soloist self-play win rate
-            sol_rewards = [r for _, _, _, r, is_sol in samples if is_sol]
-            if sol_rewards:
-                sp_total += 1
-                if sol_rewards[0] > 0:
-                    sp_wins += 1
-
-            for s, m, p, r, is_sol in samples:
-                buffer.push(s, m, p, r, is_soloist=is_sol)
-            step_samples += len(samples)
-            total_games += 1
-
-        total_samples += step_samples
-
-        # ---- 2. Train (decoupled SGD steps) ----
-        avg_vloss = 0.0
-        avg_ploss = 0.0
-        avg_pacc = 0.0
-        avg_sol_vloss = 0.0
-        avg_def_vloss = 0.0
-
-        if len(buffer) >= tier.batch_size:
-            net.train()
-            n_train = tier.train_steps
-            total_vloss = 0.0
-            total_ploss = 0.0
-            total_pacc = 0.0
-            total_sol_vloss = 0.0
-            total_def_vloss = 0.0
-            sol_count = 0
-            def_count = 0
-
-            for _ in range(n_train):
-                states, masks, policies, rewards, is_sol = buffer.sample(
-                    tier.batch_size, np_rng,
-                )
-
-                s_t = torch.from_numpy(states).float().to(device)
-                m_t = torch.from_numpy(masks).bool().to(device)
-                pi_t = torch.from_numpy(policies).float().to(device)
-                z_t = torch.from_numpy(rewards).float().to(device)
-                is_sol_t = torch.from_numpy(is_sol).bool().to(device)
-
-                log_probs, values = net.forward_dual(s_t, m_t, is_sol_t)
-
-                value_loss = F.mse_loss(values, z_t)
-                policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
-                loss = value_loss + policy_loss
-
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
-                optimizer.step()
-
-                total_vloss += value_loss.item()
-                total_ploss += policy_loss.item()
-
-                # Policy accuracy: does top-1 prediction match target's argmax?
-                with torch.no_grad():
-                    pred_top1 = log_probs.argmax(dim=-1)
-                    target_top1 = pi_t.argmax(dim=-1)
-                    total_pacc += (pred_top1 == target_top1).float().mean().item()
-
-                # Per-role value loss
-                with torch.no_grad():
-                    sol_mask = is_sol_t
-                    def_mask = ~is_sol_t
-                    if sol_mask.any():
-                        sv = F.mse_loss(values[sol_mask], z_t[sol_mask]).item()
-                        total_sol_vloss += sv
-                        sol_count += 1
-                    if def_mask.any():
-                        dv = F.mse_loss(values[def_mask], z_t[def_mask]).item()
-                        total_def_vloss += dv
-                        def_count += 1
-
-            total_sgd_steps += n_train
-            avg_vloss = total_vloss / n_train
-            avg_ploss = total_ploss / n_train
-            avg_pacc = total_pacc / n_train
-            avg_sol_vloss = total_sol_vloss / max(1, sol_count)
-            avg_def_vloss = total_def_vloss / max(1, def_count)
-
-        history_vloss.append(avg_vloss)
-        history_ploss.append(avg_ploss)
-        history_pacc.append(avg_pacc)
-        history_sol_vloss.append(avg_sol_vloss)
-        history_def_vloss.append(avg_def_vloss)
-        sp_wr = sp_wins / max(1, sp_total)
-
-        # ---- 3. Report ----
-        if step % report_interval == 0 or step == 1 or step == tier.steps:
-            elapsed = time.perf_counter() - t0
-            pct = step / tier.steps * 100
-            rate = total_games / elapsed if elapsed > 0 else 0
-
-            # Trend: compare current window to previous window
-            window = max(1, report_interval)
-            recent_v = np.mean(history_vloss[-window:])
-            prev_v = np.mean(history_vloss[-2*window:-window]) if len(history_vloss) > window else recent_v
-            recent_p = np.mean(history_ploss[-window:])
-            prev_p = np.mean(history_ploss[-2*window:-window]) if len(history_ploss) > window else recent_p
-            recent_acc = np.mean(history_pacc[-window:])
-
-            v_arrow = "↓" if recent_v < prev_v - 0.005 else ("↑" if recent_v > prev_v + 0.005 else "→")
-            p_arrow = "↓" if recent_p < prev_p - 0.01 else ("↑" if recent_p > prev_p + 0.01 else "→")
-
-            buf_stats = buffer.stats()
-            buf_swr = buf_stats.get("sol_win_rate", 0.0) if buf_stats else 0.0
-
-            print(
-                f"    step {step:>5d}/{tier.steps} ({pct:4.0f}%)  "
-                f"games={total_games:>5d}  "
-                f"vloss={avg_vloss:.4f}{v_arrow} "
-                f"(sol={avg_sol_vloss:.3f} def={avg_def_vloss:.3f})  "
-                f"ploss={avg_ploss:.4f}{p_arrow}  "
-                f"pacc={recent_acc:.0%}  "
-                f"lr={lr:.1e}  "
-                f"[{elapsed:.0f}s]",
-                flush=True,
-            )
-
-    train_time = time.perf_counter() - t0
-
-    # ---- Summary ----
-    final_v = np.mean(history_vloss[-report_interval:])
-    final_p = np.mean(history_ploss[-report_interval:])
-    final_acc = np.mean(history_pacc[-report_interval:])
-    start_v = np.mean(history_vloss[:report_interval]) if len(history_vloss) > report_interval else final_v
-    start_p = np.mean(history_ploss[:report_interval]) if len(history_ploss) > report_interval else final_p
-    start_acc = np.mean(history_pacc[:report_interval]) if len(history_pacc) > report_interval else final_acc
+    # Summary
+    ri = _ctx["report_interval"]
+    final_v = np.mean(stats.history_vloss[-ri:]) if stats.history_vloss else 0
+    final_p = np.mean(stats.history_ploss[-ri:]) if stats.history_ploss else 0
+    final_acc = np.mean(stats.history_pacc[-ri:]) if stats.history_pacc else 0
+    start_v = np.mean(stats.history_vloss[:ri]) if len(stats.history_vloss) > ri else final_v
+    start_p = np.mean(stats.history_ploss[:ri]) if len(stats.history_ploss) > ri else final_p
+    start_acc = np.mean(stats.history_pacc[:ri]) if len(stats.history_pacc) > ri else final_acc
 
     print()
     print(f"    ┌─ TRAINING SUMMARY ──────────────────────────────────────")
-    print(f"    │  Games: {total_games:,}  Samples: {total_samples:,}  "
-          f"SGD steps: {total_sgd_steps:,}  Time: {train_time:.0f}s")
+    print(f"    │  Games: {stats.total_games:,}  Samples: {stats.total_samples:,}  "
+          f"SGD steps: {stats.total_sgd_steps:,}  Time: {stats.train_time_s:.0f}s")
     print(f"    │  Value head:   {start_v:.4f} → {final_v:.4f}  "
           f"({'improved' if final_v < start_v - 0.001 else 'plateau'})")
     print(f"    │  Policy head:  {start_p:.4f} → {final_p:.4f}  "
@@ -422,22 +313,22 @@ def train_tier(
           f"({'improved' if final_acc > start_acc + 0.01 else 'plateau'})")
     print(f"    └──────────────────────────────────────────────────────────")
 
-    # ---- Save ----
+    # Save
     save_path = model_dir / "model.pt"
     torch.save({
         "model_state_dict": net.state_dict(),
-        "body_units": tier.body_units,
-        "body_layers": tier.body_layers,
+        "body_units": cfg.body_units,
+        "body_layers": cfg.body_layers,
         "input_dim": game.state_dim,
         "action_dim": game.action_space_size,
-        "training_mode": "simple",
+        "training_mode": cfg.training_mode,
         "method": "hybrid",
-        "endgame_tricks": tier.endgame_tricks,
-        "pimc_dets": tier.pimc_dets,
-        "total_games": total_games,
-        "total_samples": total_samples,
-        "total_sgd_steps": total_sgd_steps,
-        "train_time_s": round(train_time, 1),
+        "endgame_tricks": cfg.endgame_tricks,
+        "pimc_dets": cfg.pimc_dets,
+        "total_games": stats.total_games,
+        "total_samples": stats.total_samples,
+        "total_sgd_steps": stats.total_sgd_steps,
+        "train_time_s": round(stats.train_time_s, 1),
         "final_vloss": round(final_v, 6),
         "final_ploss": round(final_p, 6),
         "final_pacc": round(final_acc, 4),
@@ -448,19 +339,21 @@ def train_tier(
         "steps": tier.steps,
         "games_per_step": tier.games_per_step,
         "train_steps_per_iter": tier.train_steps,
-        "total_games": total_games,
-        "total_samples": total_samples,
-        "total_sgd_steps": total_sgd_steps,
-        "sims": tier.sims,
+        "total_games": stats.total_games,
+        "total_samples": stats.total_samples,
+        "total_sgd_steps": stats.total_sgd_steps,
+        "sol_sims": tier.sol_sims,
         "def_sims": tier.def_sims,
-        "endgame_tricks": tier.endgame_tricks,
-        "pimc_dets": tier.pimc_dets,
+        "endgame_tricks": cfg.endgame_tricks,
+        "pimc_dets": cfg.pimc_dets,
         "body_units": tier.body_units,
         "body_layers": tier.body_layers,
         "lr_start": tier.lr_start,
         "lr_end": tier.lr_end,
+        "num_workers": cfg.num_workers,
+        "enrichment": cfg.enrichment,
         "solver": SOLVER_ENGINE,
-        "train_time_s": round(train_time, 1),
+        "train_time_s": round(stats.train_time_s, 1),
         "final_vloss": round(final_v, 6),
         "final_ploss": round(final_p, 6),
         "final_pacc": round(final_acc, 4),
@@ -564,18 +457,13 @@ def play_match(
     endgame_tricks: int = 6,
     pimc_dets: int = 20,
 ) -> dict:
-    """Play a match: A as soloist vs B as defenders, then swap.
-
-    Returns detailed results dict.
-    """
-
+    """Play a match: A as soloist vs B as defenders, then swap."""
     mcts_cfg = MCTSConfig(
         simulations=20, determinizations=1,
         c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
         use_value_head=True, use_policy_priors=True, visit_temp=0.1,
     )
 
-    # A as soloist, B defends
     a_sol_wins = 0
     a_sol_total = deals // 2
     for g in range(a_sol_total):
@@ -588,7 +476,6 @@ def play_match(
         if won:
             a_sol_wins += 1
 
-    # B as soloist, A defends
     b_sol_wins = 0
     b_sol_total = deals - a_sol_total
     for g in range(b_sol_total):
@@ -601,7 +488,6 @@ def play_match(
         if won:
             b_sol_wins += 1
 
-    # A wins when: A is soloist and wins, OR B is soloist and loses
     a_wins = a_sol_wins + (b_sol_total - b_sol_wins)
     b_wins = deals - a_wins
 
@@ -627,29 +513,22 @@ def run_evaluation(
 ) -> None:
     """Round-robin evaluation of all trained tiers + random baseline."""
     game = UltiGame()
-
-    # Build agent list: (name, wrapper_or_none)
     agents: list[tuple[str, UltiNetWrapper | None]] = []
-
-    # Random baseline
     agents.append(("Random", None))
 
-    # Load each tier's model
     for tier_key in tier_names:
         tier = TIERS[tier_key]
         model_dir = Path("models") / "ulti" / tier.name
         if not (model_dir / "model.pt").exists():
-            print(f"  ⚠ Skipping {tier.name} — no model found at {model_dir}")
+            print(f"  Skipping {tier.name} — no model found at {model_dir}")
             continue
         _, wrapper = load_model(model_dir, device)
 
-        # Read training info for the label
         info_path = model_dir / "train_info.json"
         label = tier.name
         if info_path.exists():
             info = json.loads(info_path.read_text())
             label = f"{tier.name} ({info.get('total_games', '?')}g)"
-
         agents.append((label, wrapper))
 
     n = len(agents)
@@ -692,7 +571,6 @@ def run_evaluation(
             total_deals[i] += result["deals"]
             total_deals[j] += result["deals"]
 
-            margin = a_wr - 0.5  # positive = A stronger
             margin_table[i][j] = f"{a_wr:.0%}"
             margin_table[j][i] = f"{b_wr:.0%}"
 
@@ -703,12 +581,16 @@ def run_evaluation(
                 f"→ {winner}  [{elapsed:.1f}s]"
             )
 
-    # ── Ranking ───────────────────────────────────────────────────────
+    # Ranking
     print()
     print("  ┌─ RANKING " + "─" * 55)
     print("  │")
 
-    ranking = sorted(range(n), key=lambda k: total_wins[k] / max(1, total_deals[k]), reverse=True)
+    ranking = sorted(
+        range(n),
+        key=lambda k: total_wins[k] / max(1, total_deals[k]),
+        reverse=True,
+    )
     max_name = max(len(agents[k][0]) for k in ranking)
 
     print(f"  │  {'Rank':<5} {'Agent':<{max_name+2}} {'Wins':>6} {'/ Deals':>8}  {'Win rate':>8}")
@@ -741,14 +623,6 @@ def run_evaluation(
     print("  └" + "─" * 65)
     print()
 
-    # ── What to look for ──────────────────────────────────────────────
-    print("  WHAT TO LOOK FOR:")
-    print("  • Each tier should beat the one below it (Bishop > Knight > Scout > Random)")
-    print("  • Soloist win rates should be well above 50% vs Random (soloist has position advantage)")
-    print("  • Value loss (vloss) should decrease during training → the value head is learning")
-    print("  • Policy loss (ploss) should decrease during training → the policy head is learning")
-    print()
-
 
 # ---------------------------------------------------------------------------
 #  Main
@@ -759,15 +633,36 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train Ulti Parti models at 3 tiers + head-to-head eval",
     )
+    # Tier selection
     parser.add_argument("--tiers", type=str, nargs="+", default=TIER_ORDER,
                         choices=list(TIERS.keys()),
                         help="Which tiers to train (default: all 3)")
+
+    # Overrides (applied to all tiers)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Parallel self-play processes (default: 1)")
+    parser.add_argument("--endgame-tricks", type=int, default=None,
+                        help="Override endgame solver depth")
+    parser.add_argument("--pimc-dets", type=int, default=None,
+                        help="Override PIMC determinizations")
+    parser.add_argument("--solver-temp", type=float, default=None,
+                        help="Override solver temperature")
+    parser.add_argument("--enrichment", action="store_true",
+                        help="Enable deal enrichment via value head")
+
+    # Checkpoint
+    parser.add_argument("--load", type=str, default=None,
+                        help="Load pre-trained model to continue training")
+
+    # Evaluation
     parser.add_argument("--eval-deals", type=int, default=200,
                         help="Deals per evaluation matchup (default 200)")
     parser.add_argument("--eval-only", action="store_true",
                         help="Skip training, evaluate existing models")
     parser.add_argument("--no-eval", action="store_true",
                         help="Skip evaluation (training only)")
+
+    # General
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default 42)")
     parser.add_argument("--device", type=str, default="cpu",
@@ -781,24 +676,41 @@ def main() -> None:
         print()
         print("╔══════════════════════════════════════════════════════════════════╗")
         print("║         ULTI PARTI — TIERED TRAINING                            ║")
-        print("║         Hybrid self-play: MCTS + Cython alpha-beta solver       ║")
+        print("║         Hybrid self-play: MCTS + alpha-beta solver              ║")
         print("╚══════════════════════════════════════════════════════════════════╝")
         total_games = sum(TIERS[k].total_games for k in tier_keys)
         print(f"  Tiers: {', '.join(TIERS[k].name for k in tier_keys)}")
         print(f"  Total budget: {total_games:,} games")
         print(f"  Solver: {SOLVER_ENGINE}")
+        workers_str = f"{args.workers} (parallel)" if args.workers > 1 else "1 (sequential)"
+        print(f"  Workers: {workers_str}")
+        if args.enrichment:
+            print(f"  Deal enrichment: ON")
         print()
 
         for tier_key in tier_keys:
             tier = TIERS[tier_key]
             print(f"  ┌─ {tier.name}: {tier.description} " + "─" * 20)
-            print(f"  │  Budget: {tier.steps} steps × {tier.games_per_step} gpi = {tier.total_games:,} games, "
-                  f"{tier.train_steps} SGD/step")
+            print(f"  │  Budget: {tier.steps} steps × {tier.games_per_step} gpi = "
+                  f"{tier.total_games:,} games, {tier.train_steps} SGD/step")
 
-            train_tier(tier, seed=args.seed, device=args.device)
+            train_tier(
+                tier,
+                seed=args.seed,
+                device=args.device,
+                num_workers=args.workers,
+                enrichment=args.enrichment,
+                load_path=args.load,
+                endgame_tricks=args.endgame_tricks,
+                pimc_dets=args.pimc_dets,
+                solver_temp=args.solver_temp,
+            )
 
             print(f"  └─ {tier.name} complete")
             print()
+
+            # Only apply --load to the first tier
+            args.load = None
 
     # ── Evaluation ────────────────────────────────────────────────────
     if not args.no_eval:
