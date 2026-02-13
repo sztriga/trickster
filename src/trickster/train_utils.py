@@ -172,12 +172,21 @@ def outcome_for_player(
 
 
 # ---------------------------------------------------------------------------
-#  Simple outcome (used when we don't need contract scaling)
+#  Game-point outcome (matches UltiGame.outcome)
 # ---------------------------------------------------------------------------
+
+# Max game-point outcome (piros Parti soloist win: 2 × 2 defenders)
+_GAME_PTS_MAX = 4
 
 
 def simple_outcome(state: UltiNode, player: int) -> float:
-    """Basic +1 / -1 outcome for curriculum training."""
+    """Game-point reward normalised to [-1, +1].
+
+    Parti: soloist collects/pays 1 point per defender (2 total).
+    Piros (Hearts trump): all stakes doubled (4 total).
+    Normalised by _GAME_PTS_MAX so piros soloist maps to +/-1.0.
+    """
+    from trickster.games.ulti.cards import Suit
     from trickster.games.ulti.game import soloist_lost_betli, soloist_won_simple
 
     gs = state.gs
@@ -186,9 +195,15 @@ def simple_outcome(state: UltiNode, player: int) -> float:
     else:
         soloist_wins = soloist_won_simple(gs)
 
+    is_red = gs.trump is not None and gs.trump == Suit.HEARTS
+    stake = 2 if is_red else 1  # per-defender stake
+
     if player == gs.soloist:
-        return 1.0 if soloist_wins else -1.0
-    return -1.0 if soloist_wins else 1.0
+        raw = (stake * 2) if soloist_wins else -(stake * 2)
+    else:
+        raw = -stake if soloist_wins else stake
+
+    return raw / _GAME_PTS_MAX
 
 
 # ---------------------------------------------------------------------------

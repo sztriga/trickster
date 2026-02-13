@@ -59,6 +59,10 @@ _ALL_CARDS: frozenset[Card] = frozenset(make_deck())
 
 _IDX_TO_CARD: dict[int, Card] = {idx: card for card, idx in _CARD_IDX.items()}
 
+# Maximum game-point outcome (piros Parti soloist win: 2 stake × 2 defenders)
+# Used to normalise outcome() to [-1, +1].
+_GAME_PTS_MAX = 4
+
 
 # ---------------------------------------------------------------------------
 #  State wrapper (v2 — carries auction context)
@@ -216,16 +220,38 @@ class UltiGame:
         return _is_terminal(state.gs)
 
     def outcome(self, state: UltiNode, player: int) -> float:
-        """Outcome in [-1, +1]: +1 for the winning side, -1 for the losing."""
+        """Game-point outcome, normalised to [-1, +1].
+
+        Parti scoring: each defender pays/receives *stake* to/from the
+        soloist.  Hearts trump (piros) doubles the stake.
+
+        ========  ===========  =========  ===========  =========
+                   Normal Parti            Piros Parti
+        --------  -----------------------  -----------------------
+        Result    Soloist      Defender    Soloist      Defender
+        ========  ===========  =========  ===========  =========
+        Win       +0.50        -0.25      +1.00        -0.50
+        Loss      -0.50        +0.25      -1.00        +0.50
+        ========  ===========  =========  ===========  =========
+
+        Normalised by ``_GAME_PTS_MAX`` (4) so that the maximum
+        possible outcome (piros soloist win) maps to +1.0.
+        """
         gs = state.gs
         if gs.betli:
             soloist_wins = not soloist_lost_betli(gs)
         else:
             soloist_wins = soloist_won_simple(gs)
 
+        is_red = state.is_red
+        stake = 2 if is_red else 1  # per-defender stake
+
         if player == gs.soloist:
-            return 1.0 if soloist_wins else -1.0
-        return -1.0 if soloist_wins else 1.0
+            raw = (stake * 2) if soloist_wins else -(stake * 2)
+        else:
+            raw = -stake if soloist_wins else stake
+
+        return raw / _GAME_PTS_MAX
 
     # -- coalition / team --------------------------------------------------
 
@@ -381,6 +407,8 @@ class UltiGame:
             soloist_saw_talon=True,
             dealer=state.dealer,
             component_kontras=state.component_kontras if state.component_kontras else None,
+            # v3: soloist sees talon cards
+            talon_cards=gs.talon_discards,
         )
 
     # -- fixed action space ------------------------------------------------
@@ -403,57 +431,45 @@ class UltiGame:
     def new_game(self, seed: int, **kwargs: Any) -> UltiNode:
         """Deal and auto-setup a game for the play phase.
 
-        Performs the full pre-play sequence automatically:
-        1. Deal 10 cards each + 2-card talon.
-        2. First bidder becomes soloist (simplified — no bidding).
-        3. Soloist picks up talon, discards 2 cards.
-        4. Trump is chosen randomly from soloist's suits
-           (10 % chance of Betli for variety).
+        For ``training_mode="simple"`` (Parti training):
+        1. Deal 10 cards to each player + 2-card talon.
+        2. First bidder becomes soloist (no bidding).
+        3. Talon goes directly into ``talon_discards`` — its card
+           points count for defenders, but the soloist never sees
+           those cards.  No pickup/discard step.
+        4. Trump is chosen randomly from soloist's suits.
 
         The ``starting_leader`` kwarg is interpreted as dealer index.
         ``training_mode`` can filter to specific contract types.
-        ``_discard_fn`` overrides the default random discard with a
-        callable ``(hand, betli, trump) -> [Card, Card]``.
-
-        In ``'auto'`` mode, the caller must provide ``_contract_idx``
-        (0-4) and ``_discard_fn`` — the AI chooses its own contract.
         """
         rng = random.Random(seed)
         dealer = kwargs.get("starting_leader", 0) % NUM_PLAYERS
         training_mode = kwargs.get("training_mode", None)
-        discard_fn = kwargs.get("_discard_fn", None)
-        contract_idx = kwargs.get("_contract_idx", None)
 
         gs, talon = deal(seed=seed, dealer=dealer)
         gs.training_mode = training_mode
         soloist = next_player(dealer)  # first bidder
+        gs.soloist = soloist
 
-        # Soloist picks up talon
-        pickup_talon(gs, soloist, talon)
+        if training_mode in ("simple", "ulti"):
+            # ---- Simple Parti / Ulti: no talon interaction ----
+            # Talon cards go straight to talon_discards (defender pts).
+            gs.talon_discards = list(talon)
 
-        # Choose contract based on training_mode
-        if training_mode == "auto" and contract_idx is not None:
-            # Auto mode: contract chosen externally by auction head
-            from trickster.model import CONTRACT_CLASSES
-            mode_str, suit_idx = CONTRACT_CLASSES[contract_idx]
-            if mode_str == "betli":
-                betli = True
-            else:
-                betli = False
-            if betli:
-                set_contract(gs, soloist, trump=None, betli=True)
-            else:
-                trump = list(ALL_SUITS)[suit_idx]
-                set_contract(gs, soloist, trump=trump)
-        elif training_mode == "betli":
-            betli = True
-            set_contract(gs, soloist, trump=None, betli=True)
-        elif training_mode in ("simple", "ulti"):
-            betli = False
             suits_in_hand = list(set(c.suit for c in gs.hands[soloist]))
             trump = rng.choice(suits_in_hand)
             set_contract(gs, soloist, trump=trump)
+            betli = False
+        elif training_mode == "betli":
+            # Betli still needs pickup/discard to select 10 cards
+            pickup_talon(gs, soloist, talon)
+            set_contract(gs, soloist, trump=None, betli=True)
+            discards = rng.sample(gs.hands[soloist], 2)
+            discard_talon(gs, discards)
+            betli = True
         else:
+            # Mixed / legacy modes — full pickup/discard
+            pickup_talon(gs, soloist, talon)
             betli = rng.random() < 0.1
             if betli:
                 set_contract(gs, soloist, trump=None, betli=True)
@@ -461,13 +477,12 @@ class UltiGame:
                 suits_in_hand = list(set(c.suit for c in gs.hands[soloist]))
                 trump = rng.choice(suits_in_hand)
                 set_contract(gs, soloist, trump=trump)
-
-        # Discard 2 cards — use provided heuristic or random
-        if discard_fn is not None:
-            discards = discard_fn(gs.hands[soloist], betli, gs.trump)
-        else:
-            discards = rng.sample(gs.hands[soloist], 2)
-        discard_talon(gs, discards)
+            discard_fn = kwargs.get("_discard_fn", None)
+            if discard_fn is not None:
+                discards = discard_fn(gs.hands[soloist], betli, gs.trump)
+            else:
+                discards = rng.sample(gs.hands[soloist], 2)
+            discard_talon(gs, discards)
 
         # Declare all marriages before the play phase begins.
         declare_all_marriages(gs)
@@ -484,11 +499,15 @@ class UltiGame:
         # Build auction constraints from marriages/contract
         constraints = build_auction_constraints(gs, comps)
 
+        # Detect red (Hearts trump) — doubled stakes in real Ulti
+        is_red = (gs.trump is not None and gs.trump == Suit.HEARTS)
+
         empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
         return UltiNode(
             gs=gs,
             known_voids=empty_voids,
             bid_rank=1,  # Passz rank as default for training
+            is_red=is_red,
             contract_components=comps,
             dealer=dealer,
             must_have=constraints,

@@ -1,131 +1,171 @@
-# Solver-to-NN Training Pipeline — Design Notes & Concerns
-
-This document captures design decisions and open concerns for the
-`scripts/train_solver_nets.py` pipeline that trains neural networks
-from solver-generated Parti data.
+# Training Notes & Future Plans
 
 ---
 
-## 1. Policy data is collected from ALL players, not just the soloist
+## Current: Stage 1 — Play Phase Training
 
-The solver makes decisions for all three seats (1 soloist + 2 defenders).
-Every non-forced move by any player is recorded as a policy training
-example.  This is intentional and correct:
+**Script**: `scripts/train_baseline.py`
 
-- The policy network sees a **relative** state encoding (position 0 =
-  "me"), so a single network can learn to play any seat.
-- Defender moves are just as informative as soloist moves.
-- With ~30 moves per game and many being forced (single legal card),
-  collecting only soloist moves would yield very few training examples
-  per game (~3-5 non-forced moves).
+Trains the UltiNet to play Parti (Simple) contracts using hybrid
+self-play: neural MCTS for the opening + exact Cython alpha-beta
+solver for the endgame.
 
-Collecting from all three players roughly triples the policy dataset.
-For 2 000 games this should produce approximately 20 000–30 000 useful
-policy samples.
+- Contract: Parti only, all 4 trump suits (including Hearts/red)
+- No auction — contract is forced on random deals
+- Greedy discard heuristic — not learning to discard
+- Single network plays all 3 seats (relative encoding)
+- Solver provides exact labels for ~60% of decisions (tricks 5-10)
 
----
+### Solver engine choice
 
-## 2. Hand evaluator sample size may be insufficient
+The `--endgame-tricks` parameter controls when the solver takes over.
+With the Cython solver:
 
-The hand evaluator gets exactly **one sample per game** (the soloist's
-hand + trump + win/loss outcome).  With the default 2 000 games, that
-is only 2 000 training examples for a 36-dimensional input.
+| endgame-tricks | MCTS tricks | Solver tricks | Exact label % | Per-game overhead |
+|---|---|---|---|---|
+| 4 | 1-6 | 7-10 | ~40% | minimal |
+| 6 (default) | 1-4 | 5-10 | ~60% | ~12ms at trick 5 |
+| 7 | 1-3 | 4-10 | ~70% | ~100ms at trick 4 |
+| 8 | 1-2 | 3-10 | ~80% | ~1s at trick 3 |
 
-**Risk:** The network may overfit or show poor calibration in the
-extreme buckets (0–20 % and 80–100 %).
-
-**Mitigation options (in order of preference):**
-
-1. Increase `--num-games` to 5 000–10 000 if wall-clock time allows.
-2. Data augment by permuting the non-trump suits in the hand encoding
-   (there are up to 6 permutations of 3 off-suits, each producing a
-   valid training example with the same label).
-3. Use stronger regularisation (dropout, weight decay) during training.
-
-The script already prints calibration buckets so this issue will be
-immediately visible after training.
+Higher values = cleaner training signal but slower self-play. 6 is
+the practical default; 7-8 require the Cython solver to be feasible.
 
 ---
 
-## 3. Solver quality ceiling
+## Future: Stage 2 — Auction + Discard Training
 
-The solver uses a **depth-limited PIMC** approach:
+Trains the network to evaluate hands, choose discards, and bid
+contracts. This is **separate** from play training.
 
-- The last `--solver-depth` tricks (default 6) are solved exactly via
-  alpha-beta.
-- Earlier tricks rely on PIMC averaging over determinisations.
+### Why separate?
 
-This means the training data has an inherent quality ceiling: the
-solver is not perfect, especially in the opening tricks where heuristic
-playout (or shallow evaluation) is used.  The neural networks can only
-be as good as the data they learn from.
+The play network only sees the post-discard 10-card hand. It doesn't
+need to learn which cards to discard or which contract to bid. Those
+are pre-play decisions that can be trained independently:
 
-This is acceptable for the first iteration.  Later, the trained policy
-network can itself be used as the MCTS prior in the hybrid player,
-generating stronger data in a self-improvement loop.
+1. **Hand evaluator**: Given 12 cards + trump suit, predict P(win).
+   Trained from solver self-play with binary cross-entropy.
 
----
+2. **Discard network**: Given 12 cards, evaluate all C(12,2)=66
+   possible discards via the hand evaluator or value head. The network
+   learns which 10-card hands lead to wins.
 
-## 4. Greedy discard heuristic limits hand diversity
+3. **Auction/bidding**: Given hand + position, choose contract type
+   and trump suit. Trained via an Oracle teacher that evaluates each
+   contract option using the play network.
 
-The data generation uses a simple heuristic for talon discards ("discard
-the two weakest non-trump cards").  This means:
+### Why the discard training needs bad examples
 
-- The distribution of starting hands seen during training is biased
-  towards a particular discard style.
-- In real play (with a learned or human-like discard strategy), the
-  soloist's 10-card hand may look different.
+The greedy heuristic in Stage 1 always discards the weakest non-trump
+cards.  This means the play training data never includes games where
+the soloist gave away Aces/Tens (20 points) to the defenders via the
+talon.
 
-For the hand evaluator this is a moderate concern — the network may
-calibrate well for heuristic discards but poorly for creative ones.
+For discard training, the network needs to see **both good and bad
+discards** and learn from the outcomes. The solver plays games with
+different discard choices; games where the soloist discarded a Ten
+will tend to lose, teaching "don't put Tens in the talon."
 
-For the policy network this is a minor concern — the play-phase state
-space is large enough that individual discard choices only slightly
-shift the distribution.
+### Talon rules (for reference)
 
-**Future fix:** Replace the greedy discard with a neural discard model
-(already exists in `train_baseline.py` as `make_neural_discard_fn`)
-once the first iteration is trained.
+- Soloist picks up 2-card talon (sees 12 cards)
+- Soloist discards 2 cards face-down
+- Discarded cards' **points count for the defenders** (not the soloist)
+- Only the soloist knows which cards were discarded
+- Defenders must infer from the unknown pool during PIMC determinization
 
----
+### Infrastructure
 
-## 5. Forced moves are excluded from policy training
+`scripts/train_solver_nets.py` has the foundation:
+- Phase 1: Generate data (solver vs solver self-play)
+- Phase 2: Train hand evaluator (36-dim input, binary CE)
+- Phase 3: Train card play policy (259-dim input, CE over 32 actions)
 
-When a player has only one legal card, that move is recorded for game
-progression but **not** added to the policy dataset (there is no
-decision to learn).  This is correct and reduces noise, but it means
-the policy dataset is smaller than `num_games × 30`.
-
-The script logs the count of skipped forced moves for transparency.
-
----
-
-## 6. No marriage-conditional hand evaluation (yet)
-
-The hand evaluator input (36-dim) does not encode potential marriages.
-Two hands with identical cards but different marriage potential have the
-same feature vector.
-
-For Parti this is a minor issue because marriages contribute relatively
-few points (20 or 40) compared to the 90-point total.  For contracts
-where marriages are critical (e.g. 100-as Parti), the hand evaluator
-input would need to be extended.
+Not yet connected to the main training pipeline.
 
 ---
 
-## 7. Calibration validation is essential before deployment
+## Future: Stage 3 — Additional Contracts
 
-The script prints a 5-bucket calibration table after training the hand
-evaluator.  **This must be checked before using the network in
-production.**  Good calibration means:
+Once Parti play is strong, extend to other contract types:
 
-| Bucket   | Expected actual WR |
-|----------|--------------------|
-| 0–20 %   | ~10 %              |
-| 20–40 %  | ~30 %              |
-| 40–60 %  | ~50 %              |
-| 60–80 %  | ~70 %              |
-| 80–100 % | ~90 %              |
+| Contract | Training approach | Notes |
+|---|---|---|
+| Betli | Forced curriculum, separate value targets | Opposite strategy — avoid tricks |
+| Durchmars | Forced curriculum, rare natural occurrence | Need overwhelming hand strength |
+| Ulti | As compound with Parti, 7-of-trumps tracking | Trump 7 management |
+| 40-100 | Marriage-conditional, needs auction | K+Q of trump required |
+| 20-100 | Marriage-conditional, needs auction | K+Q of off-suit required |
+| Piros (red) | Hearts trump, doubled stakes | Structurally ready (Contract DNA has is_red flag) |
+| Teritett (open) | Soloist hand visible | PIMC already handles it |
 
-If calibration is poor (e.g. all predictions cluster around 50 %),
-the most likely cause is insufficient data — increase `--num-games`.
+The Contract DNA encoding (8 bits in the state vector) acts as a
+context switch, telling the network which contract is active. A single
+network can learn multiple contract strategies.
+
+---
+
+## Design Decisions
+
+### Relative encoding (single network for all seats)
+
+The state encoder uses relative player positions (me / left / right)
+rather than absolute indices. This means the same network plays all
+3 seats. Samples from all seats go into the same replay buffer,
+tripling the effective training data.
+
+### Solver as anchor
+
+The hybrid approach provides **exact** training labels for endgame
+positions. The value head learns that certain mid-game positions
+reliably lead to wins/losses (because the solver proved it), which
+improves MCTS quality at earlier tricks. This creates a virtuous
+cycle: better value estimates -> better MCTS -> better early-game
+labels -> better overall play.
+
+### Outcome-balanced batching
+
+The soloist is 1-vs-2, so defenders win more often in self-play.
+Without correction, the buffer fills with defender-win samples and
+the value head learns "soloist always loses." The replay buffer
+guarantees 15%+ soloist-win samples per batch and weights soloist
+positions 3x to prevent this collapse.
+
+### Deal enrichment (curriculum learning via value head)
+
+In a random deal, the soloist is statistically disadvantaged — roughly
+50-70% of random deals are unwinnable. This creates a class imbalance
+that drowns the policy signal.
+
+Deal enrichment uses the **network's own value head** to filter deals.
+A deal is re-rolled (up to 20 attempts) until the value head rates the
+soloist's position above a threshold. The threshold anneals over training:
+
+| Phase | Steps | Threshold | Effect |
+|---|---|---|---|
+| warmup | first N steps | disabled | Value head is untrained, skip filtering |
+| 1 (easy) | 0%-25% | v ≥ 0.00 | Only "even or better" deals |
+| 2 (medium) | 25%-60% | v ≥ −0.25 | Slightly losing deals mixed in |
+| 3 (full) | 60%+ | disabled | All deals accepted |
+
+The warmup period (default 20 steps, `--enrich-warmup`) is critical:
+at the start of training the value head outputs near-zero for
+everything, so filtering by it would be meaningless. Once the value
+head has learned the basics from unfiltered games, enrichment kicks
+in and provides a better balance of soloist-winnable games.
+
+30% of games at every phase are **always fully random** to prevent
+distribution shift. This ensures the network never forgets how to
+handle genuinely bad positions.
+
+Disable with `--no-enrichment`. Adjust the random fraction with
+`--enrich-random-frac` (default 0.3).
+
+### Solver temperature
+
+`--solver-temp` controls how sharp the solver's policy labels are.
+Lower temperature (default 0.5) makes the solver prefer its best
+move more strongly, giving the network cleaner gradient signals
+during the endgame. At 1.0, the solver distributes probability
+more evenly across "good enough" moves.

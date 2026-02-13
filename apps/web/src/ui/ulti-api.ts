@@ -112,6 +112,8 @@ export type UltiState = {
   bubbles: { player: number; text: string }[];
   aiMode: "neural" | "mcts" | "random";
   aiStrength: "fast" | "medium" | "strong";
+  dealValue?: number;  // value-head assessment of the deal (Parti practice)
+  talonCards: UltiCard[] | null;  // revealed only when game is done
 };
 
 const BASE = "/api/ulti";
@@ -188,6 +190,21 @@ export async function ultiAiSettings(
   });
   if (!res.ok) throw new Error(await res.text());
   return (await res.json()) as { aiMode: string; aiStrength: string };
+}
+
+/** Start a Parti practice game (training-style deal, no auction). */
+export function ultiPartiNew(
+  seed?: number | null,
+  dealer?: number,
+  aiMode?: string,
+  aiStrength?: string,
+): Promise<UltiState> {
+  const body: Record<string, unknown> = {};
+  if (seed != null) body.seed = seed;
+  if (dealer != null) body.dealer = dealer;
+  if (aiMode) body.aiMode = aiMode;
+  if (aiStrength) body.aiStrength = aiStrength;
+  return post("/parti/new", body);
 }
 
 export async function ultiModelInfo(): Promise<{

@@ -98,6 +98,12 @@ body {
   color: #1f2937;
   font-weight: 700;
 }
+.btn-accent {
+  background: linear-gradient(180deg, #4caf50 0%, #388e3c 100%);
+  border-color: #388e3c;
+  color: #fff;
+  font-weight: 700;
+}
 
 .main {
   display: grid;
@@ -1073,6 +1079,35 @@ body {
   opacity: 0.3;
 }
 
+.ulti-score-me {
+  color: #fbbf24;
+}
+
+/* Role tags (Játékos / Védő) */
+.ulti-role-tag {
+  font-size: 0.8em;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  margin-left: 2px;
+}
+.ulti-role-soloist {
+  background: #ef5350;
+  color: #fff;
+}
+.ulti-role-defender {
+  background: #42a5f5;
+  color: #fff;
+}
+
+.ulti-player-role {
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 2px 0;
+}
+
 .ulti-trick-area {
   display: flex;
   justify-content: center;
@@ -1538,6 +1573,10 @@ body {
   color: var(--muted);
   font-weight: 400;
 }
+.ulti-deal-value {
+  opacity: 0.7;
+  font-family: monospace;
+}
 
 /* ── Bid phase info ── */
 
@@ -1608,6 +1647,24 @@ body {
 }
 
 /* ── Done-phase action buttons ── */
+
+.ulti-talon-reveal {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+.ulti-talon-label {
+  font-weight: 700;
+  color: var(--text);
+}
+.ulti-talon-pts {
+  font-size: 12px;
+  opacity: 0.8;
+}
 
 .ulti-done-actions {
   display: flex;

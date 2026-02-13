@@ -100,7 +100,7 @@ from trickster.games.ulti.rules import TrickResult
 # ---------------------------------------------------------------------------
 
 _MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
-_DEFAULT_MODEL = "ulti_mixed.pt"
+_DEFAULT_MODEL = "ulti_parti.pt"  # legacy; also checks models/ulti/*/model.pt
 
 # Singleton: loaded once, shared across all sessions.
 _ulti_game: UltiGame | None = None
@@ -131,7 +131,16 @@ def _load_ulti_model(model_path: str | None = None) -> UltiNetWrapper | None:
         if candidate.exists():
             model_path = str(candidate)
         else:
-            # Try any ulti_*.pt
+            # Try tiered models (prefer strongest tier)
+            ulti_dir = _MODEL_DIR / "ulti"
+            if ulti_dir.exists():
+                for tier_dir in sorted(ulti_dir.iterdir(), reverse=True):
+                    mp = tier_dir / "model.pt"
+                    if mp.exists():
+                        model_path = str(mp)
+                        break
+        if model_path is None:
+            # Fallback: any ulti_*.pt
             for f in sorted(_MODEL_DIR.glob("ulti_*.pt")):
                 model_path = str(f)
                 break
@@ -148,7 +157,7 @@ def _load_ulti_model(model_path: str | None = None) -> UltiNetWrapper | None:
         checkpoint = torch.load(model_path, weights_only=True, map_location="cpu")
         body_units = checkpoint.get("body_units", 256)
         body_layers = checkpoint.get("body_layers", 4)
-        input_dim = checkpoint.get("input_dim", 259)
+        input_dim = checkpoint.get("input_dim", 291)
         action_dim = checkpoint.get("action_dim", 32)
 
         net = UltiNet(
@@ -157,14 +166,7 @@ def _load_ulti_model(model_path: str | None = None) -> UltiNetWrapper | None:
             body_layers=body_layers,
             action_dim=action_dim,
         )
-        # Gracefully load (skip mismatched keys, init new ones)
-        model_dict = net.state_dict()
-        pretrained = {
-            k: v for k, v in checkpoint["model_state_dict"].items()
-            if k in model_dict and v.shape == model_dict[k].shape
-        }
-        model_dict.update(pretrained)
-        net.load_state_dict(model_dict)
+        net.load_state_dict(checkpoint["model_state_dict"])
 
         _ulti_wrapper = UltiNetWrapper(net, device="cpu")
         _model_path_loaded = model_path
@@ -446,7 +448,7 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         settlement = _compute_final_settlement(st, bid, sess.component_kontras)
         settlement_data = settlement
 
-        if bid.rank == BID_PASSZ.rank:
+        if bid.rank == BID_PASSZ.rank and st.trick_no == 0:
             result_msg = f"Mindenki passzolt — {sol_label} fizet 2-2 pontot."
         else:
             won = settlement["soloistWon"]
@@ -515,7 +517,11 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         "seed": sess.seed,
         "dealer": st.dealer,
         "soloistPoints": soloist_points(st),
-        "defenderPoints": defender_points(st),
+        # During play, show only trick-based defender points (no talon).
+        # At game end, include talon points.
+        "defenderPoints": defender_points(st) if sess.phase == "done" else (
+            sum(s for i, s in enumerate(st.scores) if i != st.soloist)
+        ),
         "auction": auction_data,
         "kontra": kontra_data,
         "contract": contract_info,
@@ -529,6 +535,10 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         "bubbles": bubbles,
         "aiMode": sess.ai_mode,
         "aiStrength": sess.ai_strength,
+        # Talon cards: revealed only when the game is over.
+        "talonCards": [_card_json(c) for c in st.talon_discards] if (
+            sess.phase == "done" and st.talon_discards
+        ) else None,
     }
 
 
@@ -766,7 +776,8 @@ def _compute_final_settlement(
     comps = bid.components
 
     # --- All-pass rule (no play) ---
-    if bid.rank == BID_PASSZ.rank:
+    # Only applies when all three players passed in the auction (no tricks played).
+    if bid.rank == BID_PASSZ.rank and st.trick_no == 0:
         return {
             "contractResult": -2,
             "silentBonuses": [],
@@ -1431,10 +1442,129 @@ def model_info() -> dict[str, Any]:
             "path": None,
             "params": 0,
             "message": "No model found — AI plays randomly. "
-                       "Train one with: python scripts/train_baseline.py --mode mixed --steps 200",
+                       "Train one with: python scripts/train_baseline.py --steps 500",
         }
     return {
         "loaded": True,
         "path": _model_path_loaded,
         "params": sum(p.numel() for p in wrapper.net.parameters()),
     }
+
+
+# ---------------------------------------------------------------------------
+#  Parti Practice — training-style deals (no auction, straight to play)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/parti/new")
+def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
+    """Start a Parti practice game (same deals as training).
+
+    Deals 10-10-10 + 2 talon.  Talon goes to defender points.
+    Hearts trump (Piros Passz).  No auction, no discard,
+    straight to the play phase.
+
+    Soloist = next_player(dealer), rotating each round.
+
+    Optional body fields:
+      - ``seed``: int — deal seed
+      - ``dealer``: int — dealer index (0-2), rotates soloist
+      - ``aiMode``: "neural" | "mcts" | "solver" | "random"
+      - ``aiStrength``: "fast" | "medium" | "strong"
+    """
+    seed = body.get("seed")
+    if seed is None:
+        seed = random.randint(0, 2**31)
+    seed = int(seed)
+
+    ai_mode = body.get("aiMode", "mcts")
+    if ai_mode not in ("neural", "mcts", "solver", "random"):
+        ai_mode = "mcts"
+    ai_strength = body.get("aiStrength", "medium")
+    if ai_strength not in ("fast", "medium", "strong"):
+        ai_strength = "medium"
+
+    dealer_arg = body.get("dealer")
+    if dealer_arg is not None:
+        dealer = int(dealer_arg) % 3
+    else:
+        dealer = 0  # default: soloist = player 1
+
+    game = _get_ulti_game()
+    wrapper = _load_ulti_model()
+
+    # Deal with value-head enrichment: keep competitive deals only.
+    # Reject hands where the soloist is hopeless OR dominant.
+    VAL_LO = -0.20   # soloist not too weak
+    VAL_HI = +0.35   # soloist not too strong (no free 40+20 marriages)
+    MAX_ATTEMPTS = 50
+    best_node = None
+    best_val = -999.0
+    best_dist = 999.0  # distance from 0 (most balanced = best)
+    for attempt in range(MAX_ATTEMPTS):
+        attempt_seed = seed + attempt * 100_000
+        node = game.new_game(
+            seed=attempt_seed,
+            training_mode="simple",
+            starting_leader=dealer,
+        )
+        # Override trump to Hearts before evaluation
+        set_contract(node.gs, node.gs.soloist, trump=Suit.HEARTS)
+
+        if wrapper is not None:
+            sol = node.gs.soloist
+            feats = game.encode_state(node, sol)
+            val = wrapper.predict_value(feats)
+            dist = abs(val)
+            # Track the most balanced deal we've seen
+            if dist < best_dist:
+                best_node, best_val, best_dist = node, val, dist
+            # Accept if within the competitive band
+            if VAL_LO <= val <= VAL_HI:
+                best_node, best_val = node, val
+                break
+        else:
+            best_node, best_val = node, 0.0
+            break
+
+    node = best_node
+    gs = node.gs
+
+    from trickster.games.ulti.auction import BID_BY_RANK
+    parti_bid = BID_BY_RANK[2]   # Piros passz (red Parti)
+
+    sess = UltiSession(
+        id=str(uuid.uuid4()),
+        state=gs,
+        talon=list(gs.talon_discards),
+        phase="play",
+        seed=seed,
+        auction=None,
+        winning_bid=parti_bid,
+        component_kontras={"parti": 0},
+        ai_mode=ai_mode,
+        ai_strength=ai_strength,
+    )
+    _sessions[sess.id] = sess
+
+    # Declare marriages before play
+    declare_all_marriages(gs)
+
+    # Generate marriage bubbles
+    for player in range(3):
+        pts = marriage_points(gs, player)
+        if pts > 0:
+            parts = []
+            for p, _suit, mpts in gs.marriages:
+                if p == player:
+                    parts.append(f"Van {mpts}-{'em' if mpts == 40 else 'am'}!")
+            sess.bubbles.append({"player": player, "text": " ".join(parts)})
+
+    # If AI leads, play one card
+    cp = current_player(gs)
+    if cp != HUMAN:
+        _advance_ai_one(sess)
+
+    result = _public_state(sess)
+    result["dealValue"] = round(best_val, 3)  # value-head assessment
+    return result

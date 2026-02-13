@@ -3,27 +3,29 @@
 
 Loads two checkpoint files and plays N games with every possible
 role assignment (Model A as soloist, Model B as both defenders, and
-vice versa).  Reports detailed per-contract, per-role diagnostics
-plus sample game highlights.
+vice versa).  Reports per-role, per-trump diagnostics.
+
+Both players use the HybridPlayer (MCTS + solver) — same engine
+used during training.
 
 Usage:
-    # Compare a checkpoint against the final model
-    python scripts/eval_head2head.py \\
-        --model-a models/checkpoints/mixed/step_00050.pt \\
-        --model-b models/ulti_mixed.pt \\
+    # Model vs random baseline
+    python scripts/eval_head2head.py \
+        --model-a models/ulti_simple.pt \
+        --model-b random \
         --games 100
 
-    # Compare checkpoint against random baseline
-    python scripts/eval_head2head.py \\
-        --model-a models/ulti_mixed.pt \\
-        --model-b random \\
-        --games 200
-
-    # Compare two checkpoints from the same run
-    python scripts/eval_head2head.py \\
-        --model-a models/checkpoints/mixed/step_00050.pt \\
-        --model-b models/checkpoints/mixed/step_00200.pt \\
+    # Two checkpoints against each other
+    python scripts/eval_head2head.py \
+        --model-a models/checkpoints/simple/step_00200.pt \
+        --model-b models/ulti_simple.pt \
         --games 100
+
+    # Quick test (fewer games, less MCTS)
+    python scripts/eval_head2head.py \
+        --model-a models/ulti_simple.pt \
+        --model-b random \
+        --games 20 --sims 8
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ import argparse
 import random
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -39,18 +41,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
 import torch
 
-from trickster.games.ulti.adapter import UltiGame, UltiNode, _IDX_TO_CARD
-from trickster.games.ulti.cards import ALL_SUITS, Suit, BETLI_STRENGTH
+from trickster.games.ulti.adapter import UltiGame, UltiNode
+from trickster.games.ulti.cards import Suit
 from trickster.games.ulti.game import (
-    last_trick_ulti_check,
-    soloist_lost_betli,
     soloist_points,
     defender_points,
     soloist_tricks,
     soloist_won_simple,
-    soloist_won_durchmars,
 )
-from trickster.mcts import MCTSConfig, alpha_mcts_policy
+from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
+from trickster.mcts import MCTSConfig
 from trickster.model import UltiNet, UltiNetWrapper
 
 
@@ -65,43 +65,19 @@ def load_model(path: str) -> UltiNetWrapper | None:
         return None
     checkpoint = torch.load(path, weights_only=True, map_location="cpu")
     net = UltiNet(
-        input_dim=checkpoint.get("input_dim", 259),
+        input_dim=checkpoint.get("input_dim", 291),
         body_units=checkpoint.get("body_units", 256),
         body_layers=checkpoint.get("body_layers", 4),
         action_dim=checkpoint.get("action_dim", 32),
     )
-    model_dict = net.state_dict()
-    pretrained = {
-        k: v for k, v in checkpoint["model_state_dict"].items()
-        if k in model_dict and v.shape == model_dict[k].shape
-    }
-    model_dict.update(pretrained)
-    net.load_state_dict(model_dict)
+    net.load_state_dict(checkpoint["model_state_dict"])
     return UltiNetWrapper(net, device="cpu")
 
 
 def model_label(path: str) -> str:
     if path.lower() == "random":
         return "Random"
-    p = Path(path)
-    return p.stem
-
-
-# ---------------------------------------------------------------------------
-#  Greedy discard (same as train_baseline)
-# ---------------------------------------------------------------------------
-
-
-def _greedy_discard(hand, betli, trump):
-    candidates = list(hand)
-    if betli:
-        candidates.sort(key=lambda c: -BETLI_STRENGTH[c.rank])
-    else:
-        def simple_key(c):
-            is_trump = 1 if (trump is not None and c.suit == trump) else 0
-            return (is_trump, c.rank.value)
-        candidates.sort(key=simple_key)
-    return candidates[:2]
+    return Path(path).stem
 
 
 # ---------------------------------------------------------------------------
@@ -113,15 +89,14 @@ def _greedy_discard(hand, betli, trump):
 class GameRecord:
     """Result of one evaluated game."""
     seed: int
-    contract: str        # "simple" or "betli"
-    trump: str | None    # suit name or None
+    trump: str | None
+    is_red: bool
     soloist_model: str   # "A" or "B"
     soloist_won: bool
     soloist_pts: int
     defender_pts: int
-    soloist_tricks: int
-    ulti_info: str       # "none", "soloist_won", "soloist_lost", "defender_won", "defender_lost"
-    durchmars: bool
+    soloist_trick_count: int
+    game_point_reward: float  # normalised [-1,+1]
 
 
 # ---------------------------------------------------------------------------
@@ -133,21 +108,46 @@ def play_one_game(
     game: UltiGame,
     wrapper_soloist: UltiNetWrapper | None,
     wrapper_defender: UltiNetWrapper | None,
-    config: MCTSConfig,
+    mcts_config: MCTSConfig,
     seed: int,
-    training_mode: str,
+    endgame_tricks: int = 6,
+    pimc_dets: int = 20,
 ) -> tuple[UltiNode, int]:
-    """Play one game. Returns (terminal_state, soloist_idx)."""
+    """Play one Parti game. Returns (terminal_state, soloist_idx)."""
     rng = random.Random(seed)
     dealer = seed % 3
 
     state = game.new_game(
         seed=seed,
-        training_mode=training_mode,
+        training_mode="simple",
         starting_leader=dealer,
-        _discard_fn=_greedy_discard,
     )
     soloist_idx = state.gs.soloist
+
+    # Build players
+    if wrapper_soloist is not None:
+        sol_player = HybridPlayer(
+            game, wrapper_soloist,
+            mcts_config=mcts_config,
+            endgame_tricks=endgame_tricks,
+            pimc_determinizations=pimc_dets,
+            solver_temperature=0.1,  # near-greedy for eval
+        )
+    else:
+        sol_player = None
+
+    if wrapper_defender is not None:
+        def_player = HybridPlayer(
+            game, wrapper_defender,
+            mcts_config=mcts_config,
+            endgame_tricks=endgame_tricks,
+            pimc_determinizations=pimc_dets,
+            solver_temperature=0.1,
+        )
+    else:
+        def_player = None
+
+    rng_rand = random.Random(seed + 50000)
 
     while not game.is_terminal(state):
         player = game.current_player(state)
@@ -158,14 +158,12 @@ def play_one_game(
             continue
 
         is_soloist = (player == soloist_idx)
-        wrapper = wrapper_soloist if is_soloist else wrapper_defender
+        hybrid = sol_player if is_soloist else def_player
 
-        if wrapper is not None:
-            pi, action = alpha_mcts_policy(
-                state, game, wrapper, player, config, rng,
-            )
+        if hybrid is not None:
+            action = hybrid.choose_action(state, player, rng)
         else:
-            action = rng.choice(actions)
+            action = rng_rand.choice(actions)
 
         state = game.apply(state, action)
 
@@ -182,26 +180,24 @@ def run_evaluation(
     model_b_path: str,
     num_games: int = 100,
     sims: int = 20,
-    dets: int = 2,
+    dets: int = 1,
+    endgame_tricks: int = 6,
+    pimc_dets: int = 20,
     seed: int = 42,
-    modes: list[str] | None = None,
     show_highlights: int = 5,
 ) -> None:
-    if modes is None:
-        modes = ["simple", "betli"]
-
     label_a = model_label(model_a_path)
     label_b = model_label(model_b_path)
 
     print("=" * 70)
-    print("  Ulti Head-to-Head Evaluation")
+    print("  Ulti Head-to-Head Evaluation (Parti)")
     print("=" * 70)
     print(f"  Model A: {label_a}  ({model_a_path})")
     print(f"  Model B: {label_b}  ({model_b_path})")
-    print(f"  Games: {num_games} per matchup × {len(modes)} modes × 2 roles")
-    print(f"         = {num_games * len(modes) * 2} total games")
+    print(f"  Games: {num_games} per role × 2 roles = {num_games * 2} total")
+    print(f"  Engine: Hybrid ({SOLVER_ENGINE}, endgame={endgame_tricks}, "
+          f"PIMC={pimc_dets})")
     print(f"  MCTS: {sims} sims × {dets} dets")
-    print(f"  Modes: {', '.join(modes)}")
     print()
 
     wrapper_a = load_model(model_a_path)
@@ -220,69 +216,55 @@ def run_evaluation(
     )
 
     records: list[GameRecord] = []
-    rng_mode = random.Random(seed)
     t0 = time.perf_counter()
     game_count = 0
-    total_total = num_games * len(modes) * 2
+    total_total = num_games * 2
 
-    for training_mode in modes:
-        for soloist_label, sol_wrap, def_wrap in [
-            ("A", wrapper_a, wrapper_b),
-            ("B", wrapper_b, wrapper_a),
-        ]:
-            for g in range(num_games):
-                game_seed = seed + hash((training_mode, soloist_label, g)) % (2**30)
+    for soloist_label, sol_wrap, def_wrap in [
+        ("A", wrapper_a, wrapper_b),
+        ("B", wrapper_b, wrapper_a),
+    ]:
+        for g in range(num_games):
+            game_seed = seed + hash((soloist_label, g)) % (2**30)
 
-                state, soloist_idx = play_one_game(
-                    game, sol_wrap, def_wrap, config, game_seed, training_mode,
+            state, soloist_idx = play_one_game(
+                game, sol_wrap, def_wrap, config, game_seed,
+                endgame_tricks=endgame_tricks,
+                pimc_dets=pimc_dets,
+            )
+            gs = state.gs
+            won = soloist_won_simple(gs)
+            trump_str = gs.trump.value if gs.trump else None
+            is_red = gs.trump is not None and gs.trump == Suit.HEARTS
+
+            rec = GameRecord(
+                seed=game_seed,
+                trump=trump_str,
+                is_red=is_red,
+                soloist_model=soloist_label,
+                soloist_won=won,
+                soloist_pts=soloist_points(gs),
+                defender_pts=defender_points(gs),
+                soloist_trick_count=soloist_tricks(gs),
+                game_point_reward=game.outcome(state, soloist_idx),
+            )
+            records.append(rec)
+
+            game_count += 1
+            if game_count % 20 == 0:
+                elapsed = time.perf_counter() - t0
+                rate = game_count / elapsed if elapsed > 0 else 0
+                print(
+                    f"\r  [{game_count}/{total_total}] "
+                    f"{elapsed:.0f}s ({rate:.1f} games/s)",
+                    end="", flush=True,
                 )
-                gs = state.gs
-
-                # Determine outcome
-                if gs.betli:
-                    won = not soloist_lost_betli(gs)
-                    contract = "betli"
-                else:
-                    won = soloist_won_simple(gs)
-                    contract = "simple"
-
-                trump_str = gs.trump.value if gs.trump else None
-                side, ulti_won = last_trick_ulti_check(gs)
-                if side == "none":
-                    ulti_info = "none"
-                else:
-                    ulti_info = f"{side}_{'won' if ulti_won else 'lost'}"
-
-                rec = GameRecord(
-                    seed=game_seed,
-                    contract=contract,
-                    trump=trump_str,
-                    soloist_model=soloist_label,
-                    soloist_won=won,
-                    soloist_pts=soloist_points(gs),
-                    defender_pts=defender_points(gs),
-                    soloist_tricks=soloist_tricks(gs),
-                    ulti_info=ulti_info,
-                    durchmars=soloist_won_durchmars(gs),
-                )
-                records.append(rec)
-
-                game_count += 1
-                if game_count % 50 == 0:
-                    elapsed = time.perf_counter() - t0
-                    rate = game_count / elapsed if elapsed > 0 else 0
-                    print(
-                        f"\r  [{game_count}/{total_total}] "
-                        f"{elapsed:.0f}s ({rate:.1f} games/s)",
-                        end="", flush=True,
-                    )
 
     elapsed = time.perf_counter() - t0
     print(f"\r  Done: {game_count} games in {elapsed:.1f}s "
           f"({game_count / elapsed:.1f} games/s)           ")
     print()
 
-    # ----- Aggregate results -----
     _print_results(records, label_a, label_b, show_highlights)
 
 
@@ -299,7 +281,7 @@ def _print_results(
     a_sol_wr = sum(r.soloist_won for r in a_sol) / max(1, len(a_sol))
     b_sol_wr = sum(r.soloist_won for r in b_sol) / max(1, len(b_sol))
 
-    # A wins = A won as soloist + B lost as soloist (= A defended successfully)
+    # A wins = A won as soloist + B lost as soloist (A defended successfully)
     a_wins = sum(r.soloist_won for r in a_sol) + sum(not r.soloist_won for r in b_sol)
     b_wins = sum(r.soloist_won for r in b_sol) + sum(not r.soloist_won for r in a_sol)
     total = len(records)
@@ -308,108 +290,96 @@ def _print_results(
     print("  OVERALL RESULTS")
     print("=" * 70)
     print(f"  {label_a:>20s}  vs  {label_b}")
-    print(f"  {'Wins':>20s}:  {a_wins} ({a_wins/total:.0%})  vs  {b_wins} ({b_wins/total:.0%})")
-    print()
-    print(f"  As Soloist:")
-    print(f"    {label_a:>18s}:  {sum(r.soloist_won for r in a_sol)}/{len(a_sol)} "
-          f"({a_sol_wr:.0%})")
-    print(f"    {label_b:>18s}:  {sum(r.soloist_won for r in b_sol)}/{len(b_sol)} "
-          f"({b_sol_wr:.0%})")
+    print(f"  {'Wins':>20s}:  {a_wins} ({a_wins/total:.0%})  "
+          f"vs  {b_wins} ({b_wins/total:.0%})")
     print()
 
-    # ----- Per-contract breakdown -----
-    contracts = sorted(set(r.contract for r in records))
+    # ----- Per-role breakdown -----
     print("-" * 70)
-    print("  PER-CONTRACT BREAKDOWN")
+    print("  PER-ROLE BREAKDOWN")
     print("-" * 70)
-    print(f"  {'Contract':<12s} {'Model':<10s} {'Role':<10s} "
-          f"{'W':>4s} {'L':>4s} {'Total':>5s} {'WR':>6s}  {'Avg Pts':>8s}")
-    print(f"  {'-'*12:<12s} {'-'*10:<10s} {'-'*10:<10s} "
-          f"{'-'*4:>4s} {'-'*4:>4s} {'-'*5:>5s} {'-'*6:>6s}  {'-'*8:>8s}")
+    print(f"  {'Model':<15s} {'Role':<12s} "
+          f"{'W':>4s} {'L':>4s} {'Total':>5s} {'WR':>6s}  "
+          f"{'Avg Sol Pts':>11s}  {'Avg Def Pts':>11s}")
+    print(f"  {'-'*15:<15s} {'-'*12:<12s} "
+          f"{'-'*4:>4s} {'-'*4:>4s} {'-'*5:>5s} {'-'*6:>6s}  "
+          f"{'-'*11:>11s}  {'-'*11:>11s}")
 
-    for ct in contracts:
-        for model_label, model_key in [(label_a, "A"), (label_b, "B")]:
-            # As soloist
-            sol_games = [r for r in records if r.contract == ct and r.soloist_model == model_key]
-            if sol_games:
-                w = sum(r.soloist_won for r in sol_games)
-                l = len(sol_games) - w
-                wr = w / len(sol_games)
-                avg_pts = sum(r.soloist_pts for r in sol_games) / len(sol_games)
-                print(f"  {ct:<12s} {model_label:<10s} {'soloist':<10s} "
-                      f"{w:>4d} {l:>4d} {len(sol_games):>5d} {wr:>5.0%}  {avg_pts:>8.1f}")
+    for model_label, model_key in [(label_a, "A"), (label_b, "B")]:
+        # As soloist
+        sol_games = [r for r in records if r.soloist_model == model_key]
+        if sol_games:
+            w = sum(r.soloist_won for r in sol_games)
+            l = len(sol_games) - w
+            wr = w / len(sol_games)
+            avg_sp = sum(r.soloist_pts for r in sol_games) / len(sol_games)
+            avg_dp = sum(r.defender_pts for r in sol_games) / len(sol_games)
+            print(f"  {model_label:<15s} {'soloist':<12s} "
+                  f"{w:>4d} {l:>4d} {len(sol_games):>5d} {wr:>5.0%}  "
+                  f"{avg_sp:>11.1f}  {avg_dp:>11.1f}")
 
-            # As defender (other model is soloist)
-            other_key = "B" if model_key == "A" else "A"
-            def_games = [r for r in records if r.contract == ct and r.soloist_model == other_key]
-            if def_games:
-                w = sum(not r.soloist_won for r in def_games)
-                l = len(def_games) - w
-                wr = w / len(def_games)
-                avg_pts = sum(r.defender_pts for r in def_games) / len(def_games)
-                print(f"  {'':<12s} {model_label:<10s} {'defender':<10s} "
-                      f"{w:>4d} {l:>4d} {len(def_games):>5d} {wr:>5.0%}  {avg_pts:>8.1f}")
+        # As defender (other model was soloist)
+        other_key = "B" if model_key == "A" else "A"
+        def_games = [r for r in records if r.soloist_model == other_key]
+        if def_games:
+            w = sum(not r.soloist_won for r in def_games)  # defender won
+            l = len(def_games) - w
+            wr = w / len(def_games)
+            avg_sp = sum(r.soloist_pts for r in def_games) / len(def_games)
+            avg_dp = sum(r.defender_pts for r in def_games) / len(def_games)
+            print(f"  {model_label:<15s} {'defender':<12s} "
+                  f"{w:>4d} {l:>4d} {len(def_games):>5d} {wr:>5.0%}  "
+                  f"{avg_sp:>11.1f}  {avg_dp:>11.1f}")
 
-    # ----- Trump suit breakdown (simple only) -----
-    simple_recs = [r for r in records if r.contract == "simple" and r.trump]
-    if simple_recs:
-        print()
-        print("-" * 70)
-        print("  SIMPLE BY TRUMP SUIT")
-        print("-" * 70)
-        trumps = sorted(set(r.trump for r in simple_recs if r.trump))
-        for trump in trumps:
-            t_recs = [r for r in simple_recs if r.trump == trump]
-            a_t = [r for r in t_recs if r.soloist_model == "A"]
-            b_t = [r for r in t_recs if r.soloist_model == "B"]
-            a_wr = sum(r.soloist_won for r in a_t) / max(1, len(a_t))
-            b_wr = sum(r.soloist_won for r in b_t) / max(1, len(b_t))
-            print(f"  {trump:<10s}  "
-                  f"{label_a} sol: {sum(r.soloist_won for r in a_t)}/{len(a_t)} ({a_wr:.0%})  |  "
-                  f"{label_b} sol: {sum(r.soloist_won for r in b_t)}/{len(b_t)} ({b_wr:.0%})")
+    # ----- Trump suit breakdown -----
+    print()
+    print("-" * 70)
+    print("  BY TRUMP SUIT")
+    print("-" * 70)
+    trumps = sorted(set(r.trump for r in records if r.trump))
+    for trump in trumps:
+        t_recs = [r for r in records if r.trump == trump]
+        is_red = any(r.is_red for r in t_recs)
+        tag = " (RED)" if is_red else ""
+        a_t = [r for r in t_recs if r.soloist_model == "A"]
+        b_t = [r for r in t_recs if r.soloist_model == "B"]
+        a_wr = sum(r.soloist_won for r in a_t) / max(1, len(a_t))
+        b_wr = sum(r.soloist_won for r in b_t) / max(1, len(b_t))
+        print(f"  {trump:<10s}{tag:<7s}  "
+              f"{label_a} sol: {sum(r.soloist_won for r in a_t)}/{len(a_t)} "
+              f"({a_wr:.0%})  |  "
+              f"{label_b} sol: {sum(r.soloist_won for r in b_t)}/{len(b_t)} "
+              f"({b_wr:.0%})")
 
-    # ----- Special events -----
-    ulti_events = [r for r in records if r.ulti_info != "none"]
-    durchmars = [r for r in records if r.durchmars]
-    betli_games = [r for r in records if r.contract == "betli"]
-    zero_trick = [r for r in records if r.contract == "simple" and r.soloist_tricks == 0]
-
-    if ulti_events or durchmars or zero_trick:
-        print()
-        print("-" * 70)
-        print("  NOTABLE EVENTS")
-        print("-" * 70)
-        if ulti_events:
-            for kind in ["soloist_won", "soloist_lost", "defender_won", "defender_lost"]:
-                n = sum(1 for r in ulti_events if r.ulti_info == kind)
-                if n:
-                    desc = kind.replace("_", " ")
-                    print(f"  Ulti ({desc}): {n} times")
-        if durchmars:
-            print(f"  Durchmars (soloist took all 10): {len(durchmars)} times")
-        if zero_trick:
-            print(f"  Soloist 0 tricks (simple): {len(zero_trick)} times")
+    # ----- Game-point analysis -----
+    print()
+    print("-" * 70)
+    print("  GAME-POINT REWARD ANALYSIS (soloist perspective, normalised)")
+    print("-" * 70)
+    for model_label, model_key in [(label_a, "A"), (label_b, "B")]:
+        sol_rewards = [r.game_point_reward for r in records
+                       if r.soloist_model == model_key]
+        if sol_rewards:
+            print(f"  {model_label} as soloist:  "
+                  f"avg={np.mean(sol_rewards):+.3f}  "
+                  f"min={min(sol_rewards):+.3f}  "
+                  f"max={max(sol_rewards):+.3f}")
 
     # ----- Points distribution -----
     print()
     print("-" * 70)
-    print("  POINTS DISTRIBUTION (soloist pts when playing as soloist)")
+    print("  CARD-POINTS DISTRIBUTION (soloist pts when playing as soloist)")
     print("-" * 70)
     for model_label, model_key in [(label_a, "A"), (label_b, "B")]:
-        sol_pts = [r.soloist_pts for r in records if r.soloist_model == model_key
-                   and r.contract == "simple"]
+        sol_pts = [r.soloist_pts for r in records
+                   if r.soloist_model == model_key]
         if sol_pts:
-            print(f"  {model_label} (simple):  "
+            print(f"  {model_label}:  "
                   f"avg={np.mean(sol_pts):.1f}  "
                   f"min={min(sol_pts)}  "
                   f"max={max(sol_pts)}  "
-                  f"median={int(np.median(sol_pts))}")
-        bet_pts = [r.soloist_tricks for r in records if r.soloist_model == model_key
-                   and r.contract == "betli"]
-        if bet_pts:
-            print(f"  {model_label} (betli):   "
-                  f"avg tricks={np.mean(bet_pts):.1f}  "
-                  f"0-trick rate={sum(1 for t in bet_pts if t == 0)/len(bet_pts):.0%}")
+                  f"median={int(np.median(sol_pts))}  "
+                  f"tricks={np.mean([r.soloist_trick_count for r in records if r.soloist_model == model_key]):.1f}/10")
 
     # ----- Highlight games -----
     if show_highlights > 0:
@@ -420,29 +390,29 @@ def _print_results(
 
         # Biggest soloist wins
         won_games = sorted(
-            [r for r in records if r.soloist_won and r.contract == "simple"],
+            [r for r in records if r.soloist_won],
             key=lambda r: r.soloist_pts,
             reverse=True,
         )[:show_highlights]
 
         if won_games:
-            print("  Biggest soloist wins (simple):")
+            print("  Biggest soloist wins:")
             for r in won_games:
+                red_tag = " RED" if r.is_red else ""
                 print(f"    seed={r.seed:>10d}  {r.soloist_model}-soloist  "
-                      f"trump={r.trump or '-':<8s}  "
+                      f"trump={r.trump or '-':<8s}{red_tag:>4s}  "
                       f"pts={r.soloist_pts:>3d}-{r.defender_pts:<3d}  "
-                      f"tricks={r.soloist_tricks}/10"
-                      f"{'  DURI!' if r.durchmars else ''}"
-                      f"{'  ULTI: ' + r.ulti_info if r.ulti_info != 'none' else ''}")
+                      f"tricks={r.soloist_trick_count}/10  "
+                      f"reward={r.game_point_reward:+.2f}")
 
         # Closest games
         close_games = sorted(
-            [r for r in records if r.contract == "simple"],
+            records,
             key=lambda r: abs(r.soloist_pts - r.defender_pts),
         )[:show_highlights]
 
         if close_games:
-            print("  Closest games (simple):")
+            print("  Closest games:")
             for r in close_games:
                 winner = f"{r.soloist_model}-sol {'WON' if r.soloist_won else 'LOST'}"
                 print(f"    seed={r.seed:>10d}  {winner:<12s}  "
@@ -450,38 +420,30 @@ def _print_results(
                       f"pts={r.soloist_pts:>3d}-{r.defender_pts:<3d}  "
                       f"margin={abs(r.soloist_pts - r.defender_pts)}")
 
-        # Betli highlights
-        betli_lost = [r for r in records if r.contract == "betli" and not r.soloist_won]
-        if betli_lost:
-            print(f"  Betli failures ({len(betli_lost)} total, showing up to {min(show_highlights, len(betli_lost))}):")
-            for r in betli_lost[:show_highlights]:
-                print(f"    seed={r.seed:>10d}  {r.soloist_model}-soloist  "
-                      f"took {r.soloist_tricks} tricks (should be 0)")
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Head-to-head Ulti model evaluation",
+        description="Head-to-head Ulti evaluation (Parti, hybrid engine)",
     )
     parser.add_argument("--model-a", type=str, required=True,
                         help="Path to model A checkpoint (or 'random')")
     parser.add_argument("--model-b", type=str, required=True,
                         help="Path to model B checkpoint (or 'random')")
     parser.add_argument("--games", type=int, default=100,
-                        help="Games per matchup per mode (default 100)")
+                        help="Games per role (default 100, total = 2x)")
     parser.add_argument("--sims", type=int, default=20,
                         help="MCTS simulations per move (default 20)")
-    parser.add_argument("--dets", type=int, default=2,
-                        help="MCTS determinizations (default 2)")
+    parser.add_argument("--dets", type=int, default=1,
+                        help="MCTS determinizations (default 1)")
+    parser.add_argument("--endgame-tricks", type=int, default=6,
+                        help="Solver endgame threshold (default 6)")
+    parser.add_argument("--pimc-dets", type=int, default=20,
+                        help="PIMC determinizations for solver (default 20)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default 42)")
-    parser.add_argument("--modes", type=str, default="simple,betli",
-                        help="Comma-separated modes: simple,betli (default both)")
     parser.add_argument("--highlights", type=int, default=5,
                         help="Number of highlight games to show (default 5)")
     args = parser.parse_args()
-
-    modes = [m.strip() for m in args.modes.split(",")]
 
     run_evaluation(
         model_a_path=args.model_a,
@@ -489,8 +451,9 @@ def main() -> None:
         num_games=args.games,
         sims=args.sims,
         dets=args.dets,
+        endgame_tricks=args.endgame_tricks,
+        pimc_dets=args.pimc_dets,
         seed=args.seed,
-        modes=modes,
         show_highlights=args.highlights,
     )
 

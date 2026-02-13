@@ -1,7 +1,11 @@
-"""Feature encoding for Ulti — AlphaZero state representation (v2).
+"""Feature encoding for Ulti — AlphaZero state representation (v3).
 
 Produces a flat numpy vector of shape ``(STATE_DIM,)`` encoding
 everything the current player can observe during the **play phase**.
+
+v3 upgrades:
+  - Talon knowledge: 32-bit bitmask of the 2 talon cards, visible
+    only to the soloist (zeros for defenders).
 
 v2 upgrades ("detective model"):
   - Per-player captured card bitmaps (card counting)
@@ -28,8 +32,9 @@ v2 upgrades ("detective model"):
   Trick momentum (winners)        10       233
   Auction context                 10       243
   Marriage memory                  6       253
+  Talon cards (soloist only)      32       259
   ───────────────────────────────────────────────
-  Total                          259
+  Total                          291
 
 Cards are indexed as ``suit_idx * 8 + rank_idx`` (0 .. 31).
 
@@ -90,7 +95,8 @@ _LEAD_HIST_OFF = _CONTRACT_OFF + 8            # 10  trick leaders
 _WIN_HIST_OFF = _LEAD_HIST_OFF + TRICKS_PER_GAME  # 10  trick winners
 _AUCTION_OFF = _WIN_HIST_OFF + TRICKS_PER_GAME    # 10  auction context
 _MAR_MEM_OFF = _AUCTION_OFF + 10              #  6  marriage memory
-STATE_DIM = _MAR_MEM_OFF + 6                  # 259
+_TALON_OFF = _MAR_MEM_OFF + 6                 # 32  talon cards (soloist only)
+STATE_DIM = _TALON_OFF + NUM_CARDS            # 291
 
 # Relative position encoding values
 _REL_ME = 0.33
@@ -152,6 +158,7 @@ class UltiEncoder:
         soloist_saw_talon: bool = True,
         dealer: int = 0,
         component_kontras: dict[str, int] | None = None,
+        talon_cards: Sequence[Card] | None = None,
     ) -> np.ndarray:
         """Encode observable state into a 1-D float64 array (259 dims)."""
         x = np.zeros(STATE_DIM, dtype=np.float64)
@@ -275,5 +282,12 @@ class UltiEncoder:
                 pts = sum(v for mp, _, v in marriages if mp == p)
                 x[_MAR_MEM_OFF + p] = pts / 100.0
                 x[_MAR_MEM_OFF + 3 + p] = 1.0 if pts > 0 else 0.0
+
+        # ── Section 15: Talon cards — soloist only (32 binary) ────
+        # The soloist knows which 2 cards went to the talon (they
+        # discarded them or saw them dealt).  Defenders see zeros.
+        if talon_cards and player == soloist:
+            for c in talon_cards:
+                x[_TALON_OFF + _ci[c]] = 1.0
 
         return x
