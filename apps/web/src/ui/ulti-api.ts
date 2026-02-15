@@ -106,14 +106,13 @@ export type UltiState = {
   resultMessage: string | null;
   declaredMarriages: [number, number, number];
   isTeritett: boolean;
-  soloistHand: UltiCard[] | null;  // terített: soloist's cards (AI only)
+  soloistHand: UltiCard[] | null;
   settlement: Settlement | null;
   capturedTricks: UltiCard[][];
   bubbles: { player: number; text: string }[];
-  aiMode: "neural" | "mcts" | "random";
-  aiStrength: "fast" | "medium" | "strong";
-  dealValue?: number;  // value-head assessment of the deal (Parti practice)
-  talonCards: UltiCard[] | null;  // revealed only when game is done
+  opponents: [string, string];
+  dealValue?: number;
+  talonCards: UltiCard[] | null;
 };
 
 const BASE = "/api/ulti";
@@ -128,10 +127,15 @@ async function post(path: string, body: unknown = {}): Promise<UltiState> {
   return (await res.json()) as UltiState;
 }
 
-export function ultiNewGame(seed?: number | null, dealer?: number): Promise<UltiState> {
+export function ultiNewGame(
+  seed?: number | null,
+  dealer?: number,
+  opponents?: [string, string],
+): Promise<UltiState> {
   const body: Record<string, unknown> = {};
   if (seed != null) body.seed = seed;
   if (dealer != null) body.dealer = dealer;
+  if (opponents) body.opponents = opponents;
   return post("/new", body);
 }
 
@@ -175,45 +179,23 @@ export function ultiContinue(gameId: string): Promise<UltiState> {
   return post(`/${gameId}/continue`);
 }
 
-export async function ultiAiSettings(
-  gameId: string,
-  aiMode?: string,
-  aiStrength?: string,
-): Promise<{ aiMode: string; aiStrength: string }> {
-  const body: Record<string, unknown> = {};
-  if (aiMode) body.aiMode = aiMode;
-  if (aiStrength) body.aiStrength = aiStrength;
-  const res = await fetch(`${BASE}/${gameId}/ai-settings`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return (await res.json()) as { aiMode: string; aiStrength: string };
-}
-
 /** Start a Parti practice game (training-style deal, no auction). */
 export function ultiPartiNew(
   seed?: number | null,
   dealer?: number,
-  aiMode?: string,
-  aiStrength?: string,
+  opponents?: [string, string],
 ): Promise<UltiState> {
   const body: Record<string, unknown> = {};
   if (seed != null) body.seed = seed;
   if (dealer != null) body.dealer = dealer;
-  if (aiMode) body.aiMode = aiMode;
-  if (aiStrength) body.aiStrength = aiStrength;
+  if (opponents) body.opponents = opponents;
   return post("/parti/new", body);
 }
 
-export async function ultiModelInfo(): Promise<{
-  loaded: boolean;
-  path: string | null;
-  params: number;
-  message?: string;
-}> {
-  const res = await fetch(`${BASE}/model-info`);
+/** List available model sources from the server. */
+export async function ultiListModels(): Promise<string[]> {
+  const res = await fetch(`${BASE}/models`);
   if (!res.ok) throw new Error(await res.text());
-  return await res.json();
+  const data = await res.json();
+  return data.models as string[];
 }

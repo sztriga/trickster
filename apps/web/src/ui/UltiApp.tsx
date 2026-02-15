@@ -1,11 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ultiAiSettings,
   ultiAuction,
   ultiBid,
   ultiContinue,
   ultiKontra,
-  ultiModelInfo,
   ultiNewGame,
   ultiPartiNew,
   ultiPlay,
@@ -21,8 +19,14 @@ const SUIT_SYMBOL: Record<string, string> = {
 const SUIT_NAME: Record<string, string> = {
   HEARTS: "Piros", BELLS: "Tök", LEAVES: "Zöld", ACORNS: "Makk",
 };
-const PLAYER_LABEL = ["Te", "Gép 1", "Gép 2"];
+const DEFAULT_LABELS = ["Te", "Gép 1", "Gép 2"];
 const KONTRA_LEVEL_LABEL: Record<number, string> = { 1: "Kontra", 2: "Rekontra" };
+
+/** Bid ranks for contracts we have trained models for.
+ *  1=Passz, 2=P.Passz, 3=40-100, 4=Ulti, 5=Betli,
+ *  8=P.40-100, 10=P.Ulti, 11=P.Betli
+ */
+const SUPPORTED_BID_RANKS = new Set([1, 2, 3, 4, 5, 8, 10, 11]);
 
 /** One completed round (party) in a match. */
 type RoundRecord = {
@@ -80,6 +84,14 @@ function useUltiBubble(): {
 }
 
 export function UltiApp() {
+  // Screen: "lobby" (opponent select) or "game" (in-game)
+  const [screen, setScreen] = useState<"lobby" | "game">("lobby");
+
+  // Lobby state — only Scout is supported for now
+  const SUPPORTED_MODELS = useMemo(() => ["scout"], []);
+  const [opp1, setOpp1] = useState("scout");
+  const [opp2, setOpp2] = useState("scout");
+
   const [state, setState] = useState<UltiState | null>(null);
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
@@ -88,8 +100,16 @@ export function UltiApp() {
   const [roundHistory, setRoundHistory] = useState<RoundRecord[]>([]);
   const [matchScores, setMatchScores] = useState<[number, number, number]>([0, 0, 0]);
   const [showScorecard, setShowScorecard] = useState(false);
-  // Track which gameId has been scored to prevent double-counting
   const recordedGameId = useRef<string | null>(null);
+
+  // Current opponents for the active match
+  const [activeOpponents, setActiveOpponents] = useState<[string, string]>(["random", "random"]);
+
+  // Dynamic player labels based on selected opponents
+  const PLAYER_LABEL = useMemo(() => {
+    const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    return ["Te", capitalize(activeOpponents[0]), capitalize(activeOpponents[1])];
+  }, [activeOpponents]);
 
   // Bid phase state (discard selection + bid selection)
   const [selectedDiscards, setSelectedDiscards] = useState<Set<string>>(new Set());
@@ -182,9 +202,8 @@ export function UltiApp() {
   async function nextRound() {
     setErr(""); setBusy(true);
     try {
-      // Rotate dealer from previous game (or random if first game).
       const nextDealer = state ? (state.dealer + 1) % 3 : undefined;
-      const st = await ultiNewGame(null, nextDealer);
+      const st = await ultiNewGame(null, nextDealer, activeOpponents);
       setState(st);
       setSelectedDiscards(new Set());
       setSelectedBidIdx(0);
@@ -195,15 +214,18 @@ export function UltiApp() {
     finally { setBusy(false); }
   }
 
-  /** Start a brand new match (reset all scores). */
-  async function newMatch() {
+  /** Start a brand new match from the lobby. */
+  async function startMatch(opponents: [string, string]) {
+    setActiveOpponents(opponents);
     setRoundHistory([]);
     setMatchScores([0, 0, 0]);
     recordedGameId.current = null;
     setShowScorecard(false);
+    setIsPartiMode(false);
+    setScreen("game");
     setErr(""); setBusy(true);
     try {
-      const st = await ultiNewGame();
+      const st = await ultiNewGame(null, undefined, opponents);
       setState(st);
       setSelectedDiscards(new Set());
       setSelectedBidIdx(0);
@@ -212,6 +234,17 @@ export function UltiApp() {
       lastBubbleKey.current = "";
     } catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
+  }
+
+  /** Go back to lobby. */
+  function backToLobby() {
+    setState(null);
+    setRoundHistory([]);
+    setMatchScores([0, 0, 0]);
+    recordedGameId.current = null;
+    setShowScorecard(false);
+    setIsPartiMode(false);
+    setScreen("lobby");
   }
 
   /** Submit discard + bid (bid phase). */
@@ -265,7 +298,7 @@ export function UltiApp() {
     setIsPartiMode(true);
     setErr(""); setBusy(true);
     try {
-      const st = await ultiPartiNew(null, undefined, aiMode, aiStrength);
+      const st = await ultiPartiNew(null, undefined, activeOpponents);
       setState(st);
       setSelectedDiscards(new Set());
       setSelectedBidIdx(0);
@@ -281,7 +314,7 @@ export function UltiApp() {
     setErr(""); setBusy(true);
     try {
       const nextDealer = state ? (state.dealer + 1) % 3 : 0;
-      const st = await ultiPartiNew(null, nextDealer, aiMode, aiStrength);
+      const st = await ultiPartiNew(null, nextDealer, activeOpponents);
       setState(st);
       setSelectedDiscards(new Set());
       setSelectedBidIdx(0);
@@ -292,25 +325,6 @@ export function UltiApp() {
     finally { setBusy(false); }
   }
 
-  // AI mode
-  const [aiMode, setAiMode] = useState<string>("mcts");
-  const [aiStrength, setAiStrength] = useState<string>("medium");
-  const [modelLoaded, setModelLoaded] = useState<boolean | null>(null);
-
-  // Check model on mount
-  useEffect(() => {
-    ultiModelInfo().then((info) => {
-      setModelLoaded(info.loaded);
-      if (!info.loaded) setAiMode("random");
-    }).catch(() => setModelLoaded(false));
-  }, []);
-
-  // Sync AI settings when changed
-  useEffect(() => {
-    if (!state?.gameId) return;
-    ultiAiSettings(state.gameId, aiMode, aiStrength).catch(() => {});
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [aiMode, aiStrength, state?.gameId]);
 
   // Captured cards reveal toggle
   const [showCaptured, setShowCaptured] = useState(false);
@@ -366,6 +380,56 @@ export function UltiApp() {
   const isBidPhase = phase === "bid" && isMyAuctionTurn && auction?.awaitingBid;
   const isAuctionPhase = phase === "auction" && isMyAuctionTurn && !auction?.awaitingBid;
 
+  // ===== LOBBY SCREEN =====
+  if (screen === "lobby") {
+    return (
+      <div className="app">
+        <div className="ulti-lobby">
+          <div className="ulti-lobby-card">
+            <h1 className="ulti-lobby-title">Trickster Ulti</h1>
+            <p className="ulti-lobby-subtitle">Válaszd ki az ellenfeleidet</p>
+
+            <div className="ulti-lobby-seats">
+              <div className="ulti-lobby-seat">
+                <label className="ulti-lobby-label">Gép 1</label>
+                <select
+                  className="ulti-lobby-select"
+                  value={opp1}
+                  onChange={(e) => setOpp1(e.target.value)}
+                >
+                  {SUPPORTED_MODELS.map((m) => (
+                    <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="ulti-lobby-seat">
+                <label className="ulti-lobby-label">Gép 2</label>
+                <select
+                  className="ulti-lobby-select"
+                  value={opp2}
+                  onChange={(e) => setOpp2(e.target.value)}
+                >
+                  {SUPPORTED_MODELS.map((m) => (
+                    <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <button
+              className="btn btn-primary ulti-lobby-start"
+              onClick={() => startMatch([opp1, opp2])}
+              disabled={busy}
+            >
+              {busy ? "Indítás..." : "Játék indítása"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== GAME SCREEN =====
   return (
     <div className="app">
       <header className="topbar">
@@ -376,46 +440,16 @@ export function UltiApp() {
               ? `Piros Parti gyakorlás | Te: ${matchScores[0]} | G1: ${matchScores[1]} | G2: ${matchScores[2]}`
               : roundHistory.length > 0
                 ? `${roundHistory.length}. kör | Te: ${matchScores[0]} | G1: ${matchScores[1]} | G2: ${matchScores[2]}`
-                : "3 játékos, 1 vs 2"}
+                : `${PLAYER_LABEL[1]} vs Te vs ${PLAYER_LABEL[2]}`}
           </div>
         </div>
         <div className="controls">
-          <select
-            className="btn ulti-ai-select"
-            value={aiMode}
-            onChange={(e) => setAiMode(e.target.value)}
-            title="AI mód"
-          >
-            <option value="neural">AI: Neural</option>
-            <option value="mcts">AI: MCTS</option>
-            <option value="random">AI: Random</option>
-          </select>
-          {aiMode === "mcts" && (
-            <select
-              className="btn ulti-ai-select"
-              value={aiStrength}
-              onChange={(e) => setAiStrength(e.target.value)}
-              title="AI erősség"
-            >
-              <option value="fast">Gyors (5)</option>
-              <option value="medium">Közepes (20)</option>
-              <option value="strong">Erős (50)</option>
-            </select>
-          )}
-          {modelLoaded === false && (
-            <span className="ulti-no-model" title="Nincs modell — tanítsd be: python scripts/train_baseline.py --mode mixed --steps 200">
-              ⚠ Nincs modell
-            </span>
-          )}
-          <button className="btn btn-accent" onClick={startParti} disabled={busy}>
-            Parti gyakorlás
-          </button>
           {roundHistory.length > 0 && (
             <button className="btn" onClick={() => setShowScorecard(true)} disabled={busy}>
               Pontszámok
             </button>
           )}
-          <button className="btn btn-primary" onClick={() => { setIsPartiMode(false); newMatch(); }} disabled={busy}>Új mérkőzés</button>
+          <button className="btn" onClick={backToLobby} disabled={busy}>Lobby</button>
         </div>
       </header>
 
@@ -455,7 +489,7 @@ export function UltiApp() {
           <div className="ulti-ai-row">
             <div className="ulti-ai-hand">
               <div className="ulti-ai-label">
-                Gép 2
+                {PLAYER_LABEL[2]}
                 {state?.soloist === 2 && <span className="ulti-role-tag ulti-role-soloist"> Játékos</span>}
                 {state?.soloist !== 2 && <span className="ulti-role-tag ulti-role-defender"> Védő</span>}
                 {state?.isTeritett && state?.soloist === 2 && " — Terített"}
@@ -475,7 +509,7 @@ export function UltiApp() {
             </div>
             <div className="ulti-ai-hand">
               <div className="ulti-ai-label">
-                Gép 1
+                {PLAYER_LABEL[1]}
                 {state?.soloist === 1 && <span className="ulti-role-tag ulti-role-soloist"> Játékos</span>}
                 {state?.soloist !== 1 && <span className="ulti-role-tag ulti-role-defender"> Védő</span>}
                 {state?.isTeritett && state?.soloist === 1 && " — Terített"}
@@ -495,7 +529,7 @@ export function UltiApp() {
             </div>
           </div>
 
-          {/* Scoreboard — hide during bid/auction */}
+          {/* Scoreboard — visible during play, kontra, done */}
           {phase !== "bid" && phase !== "auction" && phase !== "trump_select" && state && (
             <div className="ulti-scores">
               <span>Ütés: {state.trickNo ?? 0}/10</span>
@@ -561,28 +595,35 @@ export function UltiApp() {
                 Dobj el 2 lapot ({selectedDiscards.size}/2) és válassz licitet:
               </div>
 
-              {auction.legalBids.length > 0 && (
-                <div className="ulti-bid-select-row">
-                  <select
-                    className="ulti-bid-select"
-                    value={selectedBidIdx}
-                    onChange={(e) => setSelectedBidIdx(Number(e.target.value))}
-                  >
-                    {auction.legalBids.map((b, i) => (
-                      <option key={b.rank} value={i}>
-                        {b.label} — {b.displayWin}p
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    className="btn ulti-bid-confirm"
-                    onClick={submitBid}
-                    disabled={busy || selectedDiscards.size !== 2}
-                  >
-                    Licitálok
-                  </button>
-                </div>
-              )}
+              {(() => {
+                const supported = auction.legalBids.filter((b) => SUPPORTED_BID_RANKS.has(b.rank));
+                if (supported.length === 0) return null;
+                return (
+                  <div className="ulti-bid-select-row">
+                    <select
+                      className="ulti-bid-select"
+                      value={selectedBidIdx}
+                      onChange={(e) => setSelectedBidIdx(Number(e.target.value))}
+                    >
+                      {supported.map((b) => {
+                        const origIdx = auction.legalBids.indexOf(b);
+                        return (
+                          <option key={b.rank} value={origIdx}>
+                            {b.label} — {b.displayWin}p
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <button
+                      className="btn ulti-bid-confirm"
+                      onClick={submitBid}
+                      disabled={busy || selectedDiscards.size !== 2}
+                    >
+                      Licitálok
+                    </button>
+                  </div>
+                );
+              })()}
             </div>
           )}
 
@@ -671,18 +712,34 @@ export function UltiApp() {
           {/* =============== KONTRA / REKONTRA OVERLAY =============== */}
           {(phase === "kontra" || phase === "rekontra") && state?.kontra && (
             <div className="ulti-kontra-overlay">
-              <div className="ulti-auction-title">
-                {state.kontra.phase === "rekontra" ? "Rekontra" : "Kontra"}
+              {/* Big title */}
+              <div className="ulti-kontra-title">
+                {state.kontra.phase === "rekontra" ? "Rekontra!" : "Kontra!"}
               </div>
-              <div className="ulti-kontra-info">
-                Kontraktus: <strong>{state.contract?.bid.label}</strong>
-                {Object.entries(state.kontra.currentKontras).filter(([, v]) => v > 0).map(([comp, lvl]) => (
-                  <span key={comp} className="ulti-kontra-tag"> [{comp}: {KONTRA_LEVEL_LABEL[lvl] ?? "?"}]</span>
-                ))}
+
+              {/* Explanation */}
+              <div className="ulti-kontra-desc">
+                {state.kontra.phase === "kontra"
+                  ? `${state.contract?.bid.label ?? "Kontraktus"} — az 1. ütés után kontrázhatod a tétet.`
+                  : "Kontrázták a tétet — visszakontrázhatod."}
+                {Object.entries(state.kontra.currentKontras).filter(([, v]) => v > 0).length > 0 && (
+                  <span className="ulti-kontra-active-tags">
+                    {Object.entries(state.kontra.currentKontras).filter(([, v]) => v > 0).map(([comp, lvl]) => (
+                      <span key={comp} className="ulti-kontra-active-tag">{comp} {KONTRA_LEVEL_LABEL[lvl]}</span>
+                    ))}
+                  </span>
+                )}
               </div>
+
               {state.kontra.isMyTurn ? (
                 <div className="ulti-kontra-actions">
-                  <div className="ulti-kontra-components">
+                  {/* Contract label */}
+                  <div className="ulti-kontra-contract">
+                    {state.contract?.bid.label}
+                  </div>
+
+                  {/* Component toggle buttons */}
+                  <div className="ulti-kontra-toggles">
                     {state.kontra.kontrable
                       .filter((comp) =>
                         state.kontra!.phase === "kontra"
@@ -690,39 +747,41 @@ export function UltiApp() {
                           : state.kontra!.currentKontras[comp] === 1
                       )
                       .map((comp) => (
-                        <label key={comp} className="ulti-kontra-checkbox">
-                          <input
-                            type="checkbox"
-                            checked={kontraSelection.has(comp)}
-                            onChange={() => toggleKontraComponent(comp)}
-                          />
+                        <button
+                          key={comp}
+                          className={`ulti-kontra-toggle ${kontraSelection.has(comp) ? "ulti-kontra-toggle-on" : ""}`}
+                          onClick={() => toggleKontraComponent(comp)}
+                          disabled={busy}
+                        >
                           {comp}
-                        </label>
+                        </button>
                       ))}
                   </div>
-                  <div className="ulti-kontra-buttons">
+
+                  {/* Action row */}
+                  <div className="ulti-kontra-btn-row">
                     <button
-                      className="btn ulti-bid-hold"
+                      className="btn ulti-kontra-confirm"
                       onClick={() => handleKontra(state.kontra!.phase === "rekontra" ? "rekontra" : "kontra")}
                       disabled={busy || kontraSelection.size === 0}
                     >
                       {state.kontra.phase === "rekontra" ? "Rekontra!" : "Kontra!"}
                     </button>
-                    <button className="btn ulti-bid-pass" onClick={() => handleKontra("pass")} disabled={busy}>
+                    <button className="btn ulti-kontra-pass" onClick={() => handleKontra("pass")} disabled={busy}>
                       Passz
                     </button>
                   </div>
                 </div>
               ) : (
-                <div className="ulti-auction-waiting">
+                <div className="ulti-kontra-waiting">
                   {PLAYER_LABEL[state.kontra.turn ?? 0]} gondolkodik...
                 </div>
               )}
             </div>
           )}
 
-          {/* Declared marriages (shown during play/done if any exist) */}
-          {state && (phase === "play" || phase === "done") && state.declaredMarriages.some(v => v > 0) && (
+          {/* Declared marriages (shown during play/kontra/done if any exist) */}
+          {state && (phase === "play" || phase === "done" || phase === "kontra" || phase === "rekontra") && state.declaredMarriages.some(v => v > 0) && (
             <div className="ulti-declared-marriages">
               {state.declaredMarriages.map((pts, i) =>
                 pts > 0 ? (
@@ -734,12 +793,12 @@ export function UltiApp() {
             </div>
           )}
 
-          {/* Trick area */}
-          {(phase === "play" || phase === "done") && (
+          {/* Trick area — also visible during kontra/rekontra (trick 1 result shown) */}
+          {(phase === "play" || phase === "done" || phase === "kontra" || phase === "rekontra") && (
             <div className="ulti-trick-area">
               {(() => {
                 const slots: Record<number, { card: UltiCard; winner?: boolean }> = {};
-                if ((state?.needsContinue || phase === "done") && state?.lastTrick) {
+                if ((state?.needsContinue || phase === "done" || phase === "kontra" || phase === "rekontra") && state?.lastTrick) {
                   state.lastTrick.players.forEach((p, i) => {
                     slots[p] = { card: state.lastTrick!.cards[i], winner: p === state.lastTrick!.winner };
                   });
@@ -769,6 +828,15 @@ export function UltiApp() {
                   </>
                 );
               })()}
+
+              {/* Talon — tucked into the bottom-left of the trick area */}
+              {phase === "done" && state?.talonCards && state.talonCards.length > 0 && (
+                <div className="ulti-talon-inline">
+                  {state.talonCards.map((c, i) => (
+                    <img key={i} className="ulti-talon-card" src={ultiCardUrl(c)} alt={ultiCardLabel(c)} />
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -793,21 +861,6 @@ export function UltiApp() {
             )}
           </div>
 
-          {/* Talon reveal at game end */}
-          {phase === "done" && state?.talonCards && state.talonCards.length > 0 && (
-            <div className="ulti-talon-reveal">
-              <span className="ulti-talon-label">Talon:</span>
-              {state.talonCards.map((c, i) => (
-                <img key={i} className="card-thumb" src={ultiCardUrl(c)} alt={ultiCardLabel(c)} />
-              ))}
-              <span className="ulti-talon-pts">
-                (+{state.talonCards.reduce((sum, c) => {
-                  const pts: Record<string, number> = { ACE: 11, TEN: 10, KING: 4, QUEEN: 3, JACK: 2, NINE: 0, EIGHT: 0, SEVEN: 0 };
-                  return sum + (pts[c.rank] ?? 0);
-                }, 0)} pont a védőknek)
-              </span>
-            </div>
-          )}
 
           {/* Next round + scorecard buttons when done */}
           {phase === "done" && (
@@ -827,7 +880,7 @@ export function UltiApp() {
           <div className="ulti-bubble-anchor ulti-bubble-player-anchor">{bubble0.node}</div>
 
           {/* Player role label */}
-          {state && (phase === "play" || phase === "done") && (
+          {state && (phase === "play" || phase === "done" || phase === "kontra" || phase === "rekontra") && (
             <div className="ulti-player-role">
               Te
               {state.soloist === 0
@@ -916,9 +969,9 @@ export function UltiApp() {
                   <th>#</th>
                   <th>Játék</th>
                   <th>Játékos</th>
-                  <th>Te</th>
-                  <th>Gép 1</th>
-                  <th>Gép 2</th>
+                  <th>{PLAYER_LABEL[0]}</th>
+                  <th>{PLAYER_LABEL[1]}</th>
+                  <th>{PLAYER_LABEL[2]}</th>
                 </tr>
               </thead>
               <tbody>

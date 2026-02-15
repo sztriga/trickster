@@ -5,14 +5,13 @@ same pattern as ``trickster.training.alpha_zero`` for Snapszer: the
 engine owns the full training loop (self-play → buffer → SGD) with
 parallel workers, and callers pass configuration.
 
-Features consolidated from train_baseline.py and train_ulti.py:
+Features consolidated from train_baseline.py and train_parti.py:
   - Parallel self-play via ProcessPoolExecutor (``num_workers``)
   - Cosine LR annealing (``lr_start`` / ``lr_end``)
   - Decoupled SGD steps (fixed ``train_steps`` per iteration)
   - Deal enrichment via value head (``enrich_*`` params)
   - Per-role diagnostics (soloist vs defender value loss)
   - Policy accuracy tracking
-  - Opponent pool support (``opponent_state_dict``)
   - Checkpoint load / resume (``initial_net``)
   - Progress callback (``on_progress``)
 
@@ -39,7 +38,8 @@ from trickster.games.ulti.adapter import UltiGame, UltiNode
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 from trickster.mcts import MCTSConfig
 from trickster.model import UltiNet, UltiNetWrapper
-from trickster.train_utils import ReplayBuffer, simple_outcome
+from trickster.train_utils import ReplayBuffer, simple_outcome, solver_value_to_reward
+from trickster.training.model_io import auto_device
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,7 @@ class UltiTrainConfig:
     sol_dets: int = 1
     def_sims: int = 8
     def_dets: int = 1
+    leaf_batch_size: int = 8       # batched NN eval in MCTS (1 = sequential)
 
     # -- Solver / hybrid --
     endgame_tricks: int = 6
@@ -88,6 +89,13 @@ class UltiTrainConfig:
     enrichment: bool = False
     enrich_warmup: int = 20        # skip enrichment for first N steps
     enrich_random_frac: float = 0.3  # fraction of games always random
+
+    # -- Value targets --
+    solver_teacher: bool = False   # use solver value for MCTS positions
+
+    # -- Kontra / Talon --
+    kontra_enabled: bool = True    # apply kontra/rekontra after trick 1
+    neural_discard: bool = True    # use value head for talon discard
 
     # -- General --
     seed: int = 42
@@ -127,8 +135,8 @@ class UltiTrainStats:
     history_ploss: list = field(default_factory=list)
     history_pacc: list = field(default_factory=list)
 
-    # Self-play win rate (current step)
-    sp_sol_wins: int = 0
+    # Self-play game-point tracking (current step)
+    sp_sol_pts_sum: float = 0.0   # sum of soloist reward (normalised)
     sp_sol_total: int = 0
 
     train_time_s: float = 0.0
@@ -141,35 +149,33 @@ class UltiTrainStats:
 _WORKER_GAME: UltiGame | None = None
 _WORKER_NET: UltiNet | None = None
 _WORKER_WRAPPER: UltiNetWrapper | None = None
-_WORKER_OPP_NET: UltiNet | None = None
-_WORKER_OPP_WRAPPER: UltiNetWrapper | None = None
 
 
 def _init_worker(net_kwargs: dict, device: str) -> None:
-    """Called once per worker process to create game + networks."""
+    """Called once per worker process to create game + network."""
     global _WORKER_GAME, _WORKER_NET, _WORKER_WRAPPER
-    global _WORKER_OPP_NET, _WORKER_OPP_WRAPPER
     _WORKER_GAME = UltiGame()
     _WORKER_NET = UltiNet(**net_kwargs)
     _WORKER_WRAPPER = UltiNetWrapper(_WORKER_NET, device=device)
-    _WORKER_OPP_NET = UltiNet(**net_kwargs)
-    _WORKER_OPP_WRAPPER = UltiNetWrapper(_WORKER_OPP_NET, device=device)
 
 
 def _play_game_in_worker(
     args: tuple,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
     """Worker entry-point for parallel self-play."""
-    (state_dict, opp_state_dict, sol_mcts_cfg, def_mcts_cfg,
+    (state_dict, sol_mcts_cfg, def_mcts_cfg,
      seed, endgame_tricks, pimc_dets, solver_temp,
-     training_mode, enrich_thresh) = args
+     training_mode, enrich_thresh, solver_teacher,
+     kontra_enabled, use_neural_discard) = args
     _WORKER_NET.load_state_dict(state_dict)
-    opp_wrapper = None
-    if opp_state_dict is not None:
-        _WORKER_OPP_NET.load_state_dict(opp_state_dict)
-        opp_wrapper = _WORKER_OPP_WRAPPER
+
     init_state = None
-    if enrich_thresh > -999.0:
+    if use_neural_discard:
+        init_state = _new_game_with_neural_discard(
+            _WORKER_GAME, _WORKER_WRAPPER, seed,
+            training_mode=training_mode, dealer=seed % 3,
+        )
+    elif enrich_thresh > -999.0:
         init_state, _ = _value_enriched_new_game(
             _WORKER_GAME, _WORKER_WRAPPER, seed,
             min_value=enrich_thresh, training_mode=training_mode,
@@ -180,8 +186,9 @@ def _play_game_in_worker(
         pimc_dets=pimc_dets,
         solver_temp=solver_temp,
         training_mode=training_mode,
-        opponent_wrapper=opp_wrapper,
         initial_state=init_state,
+        solver_teacher=solver_teacher,
+        kontra_enabled=kontra_enabled,
     )
 
 
@@ -240,6 +247,246 @@ def _enrichment_threshold(step: int, total_steps: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+#  Training mode → contract key (for kontra unit lookup)
+# ---------------------------------------------------------------------------
+
+_MODE_TO_CONTRACT_KEY: dict[str, str] = {
+    "simple": "parti",
+    "ulti":   "ulti",
+    "40-100": "40-100",
+    "betli":  "betli",
+}
+
+
+# ---------------------------------------------------------------------------
+#  Kontra helper (same model for both sides in single-contract training)
+# ---------------------------------------------------------------------------
+
+
+def _decide_kontra_training(
+    game: UltiGame,
+    state: UltiNode,
+    wrapper: UltiNetWrapper,
+    training_mode: str,
+) -> None:
+    """Apply kontra/rekontra using the single shared value head.
+
+    Same logic as ``bidding_loop._decide_kontra`` but adapted for
+    single-contract self-play where all seats share one model.
+    """
+    from trickster.training.bidding_loop import _kontrable_units
+
+    contract_key = _MODE_TO_CONTRACT_KEY.get(training_mode, "parti")
+    units = _kontrable_units(contract_key)
+    if not units:
+        return
+
+    gs = state.gs
+    soloist = gs.soloist
+    defenders = [i for i in range(3) if i != soloist]
+
+    # Each defender evaluates with the same model
+    def_values = []
+    for d in defenders:
+        feats = game.encode_state(state, d)
+        v = wrapper.predict_value(feats)
+        def_values.append(v)
+
+    kontrad = max(def_values) > 0.0
+    if kontrad:
+        for u in units:
+            state.component_kontras[u] = 1
+
+    # Rekontra: soloist still expects to win
+    if kontrad:
+        feats = game.encode_state(state, soloist)
+        sol_v = wrapper.predict_value(feats)
+        if sol_v > 0.0:
+            for u in units:
+                if state.component_kontras.get(u, 0) == 1:
+                    state.component_kontras[u] = 2
+
+
+# ---------------------------------------------------------------------------
+#  Neural talon discard for training
+# ---------------------------------------------------------------------------
+
+
+def _new_game_with_neural_discard(
+    game: UltiGame,
+    wrapper: UltiNetWrapper,
+    seed: int,
+    training_mode: str,
+    dealer: int,
+) -> UltiNode:
+    """Deal a new training game with value-head-driven talon discard.
+
+    For adu contracts (parti, ulti, 40-100): picks up the talon,
+    evaluates up to 20 discard pairs via the value head, and keeps
+    the best.  For betli: same but with betli flag.
+
+    Falls back to the standard ``game.new_game()`` for unknown modes.
+    """
+    from itertools import combinations
+
+    from trickster.games.ulti.adapter import build_auction_constraints
+    from trickster.games.ulti.cards import Card, Rank, Suit
+    from trickster.games.ulti.game import (
+        NUM_PLAYERS,
+        deal,
+        declare_all_marriages,
+        discard_talon,
+        next_player,
+        pickup_talon,
+        set_contract,
+    )
+
+    rng = random.Random(seed)
+    gs, talon = deal(seed=seed, dealer=dealer)
+    gs.training_mode = training_mode
+    soloist = next_player(dealer)
+    gs.soloist = soloist
+
+    # Always pick up the talon so soloist sees 12 cards
+    pickup_talon(gs, soloist, talon)
+
+    if training_mode == "betli":
+        trump = None
+        betli = True
+        set_contract(gs, soloist, trump=None, betli=True)
+    else:
+        betli = False
+        suits_in_hand = list(set(c.suit for c in gs.hands[soloist]))
+        trump = rng.choice(suits_in_hand)
+
+        if training_mode == "40-100":
+            # Ensure soloist holds trump K+Q
+            trump_k = Card(trump, Rank.KING)
+            trump_q = Card(trump, Rank.QUEEN)
+            hand = gs.hands[soloist]
+            for needed in (trump_k, trump_q):
+                if needed not in hand:
+                    # Find it in another hand or talon and swap
+                    all_cards = []
+                    for p in range(NUM_PLAYERS):
+                        if p != soloist:
+                            all_cards.extend((p, c) for c in gs.hands[p])
+                    for owner, card in all_cards:
+                        if card == needed:
+                            swappable = [c for c in hand
+                                         if c != trump_k and c != trump_q]
+                            give = rng.choice(swappable)
+                            hand.remove(give)
+                            hand.append(needed)
+                            gs.hands[owner].remove(needed)
+                            gs.hands[owner].append(give)
+                            break
+
+        set_contract(gs, soloist, trump=trump)
+
+    # ── Neural discard: evaluate up to 20 best discard pairs ──
+    hand = gs.hands[soloist]
+    all_pairs = list(combinations(range(len(hand)), 2))
+
+    # Heuristic pruning for adu (keep all for betli — different strategy)
+    max_pairs = 20
+    if not betli and len(all_pairs) > max_pairs:
+        def _discard_score(pair):
+            score = 0.0
+            for idx in pair:
+                c = hand[idx]
+                if c.suit == trump:
+                    score += 100
+                score -= c.points()
+                if training_mode == "40-100":
+                    if c == Card(trump, Rank.KING) or c == Card(trump, Rank.QUEEN):
+                        score += 1000
+                if training_mode == "ulti":
+                    if trump and c == Card(trump, Rank.SEVEN):
+                        score += 1000
+            return score
+        all_pairs.sort(key=_discard_score)
+        all_pairs = all_pairs[:max_pairs]
+
+    # Build contract components for encoding
+    if betli:
+        comps = frozenset({"betli"})
+    else:
+        comps = frozenset({"parti"})
+        if training_mode == "ulti":
+            comps = frozenset({"parti", "ulti"})
+        elif training_mode == "40-100":
+            comps = frozenset({"parti", "40", "100"})
+
+    is_red = (trump is not None and trump == Suit.HEARTS)
+    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+
+    # Batch-evaluate all discard candidates
+    import copy
+    import numpy as np
+
+    feats_list: list[np.ndarray] = []
+    valid_pairs: list[tuple[int, int]] = []
+
+    for i, j in all_pairs:
+        d0, d1 = hand[i], hand[j]
+
+        # Simulate the discard
+        gs_copy = copy.deepcopy(gs)
+        discard_talon(gs_copy, [d0, d1])
+
+        if training_mode == "ulti":
+            gs_copy.has_ulti = True
+
+        marriage_restrict = "40" if training_mode == "40-100" else None
+        declare_all_marriages(gs_copy, soloist_marriage_restrict=marriage_restrict)
+
+        constraints = build_auction_constraints(gs_copy, comps)
+
+        node = UltiNode(
+            gs=gs_copy,
+            known_voids=empty_voids,
+            bid_rank=1,
+            is_red=is_red,
+            contract_components=comps,
+            dealer=dealer,
+            must_have=constraints,
+        )
+        feats = game.encode_state(node, soloist)
+        feats_list.append(feats)
+        valid_pairs.append((i, j))
+
+    if feats_list:
+        batch = np.stack(feats_list)
+        values = wrapper.batch_value(batch)
+        best_idx = int(np.argmax(values))
+        bi, bj = valid_pairs[best_idx]
+        best_discards = [hand[bi], hand[bj]]
+    else:
+        best_discards = hand[:2]
+
+    # Apply the chosen discard to the ORIGINAL gs
+    discard_talon(gs, best_discards)
+
+    if training_mode == "ulti":
+        gs.has_ulti = True
+
+    marriage_restrict = "40" if training_mode == "40-100" else None
+    declare_all_marriages(gs, soloist_marriage_restrict=marriage_restrict)
+    constraints = build_auction_constraints(gs, comps)
+
+    return UltiNode(
+        gs=gs,
+        known_voids=empty_voids,
+        bid_rank=1,
+        is_red=is_red,
+        contract_components=comps,
+        dealer=dealer,
+        must_have=constraints,
+    )
+
+
+# ---------------------------------------------------------------------------
 #  Self-play: one full game -> training samples
 # ---------------------------------------------------------------------------
 
@@ -254,16 +501,27 @@ def _play_one_game(
     pimc_dets: int = 20,
     solver_temp: float = 1.0,
     training_mode: str = "simple",
-    opponent_wrapper: UltiNetWrapper | None = None,
     initial_state: UltiNode | None = None,
+    solver_teacher: bool = False,
+    kontra_enabled: bool = False,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
     """Play one hybrid self-play game.
 
     Uses HybridPlayer for all seats: neural MCTS for opening tricks,
-    PIMC + exact alpha-beta for the endgame.
+    PIMC + exact alpha-beta for the endgame.  The same network plays
+    both soloist and defenders (pure self-play).
+
+    When ``solver_teacher`` is True, MCTS positions are labelled with
+    the solver's position value at the handoff point (continuous,
+    from the "all-seeing teacher").  When False (default), all
+    positions use the binary game outcome from ``simple_outcome``.
 
     If *initial_state* is provided (e.g. from deal enrichment),
     it is used directly instead of dealing a new game.
+
+    When ``kontra_enabled`` is True, defenders evaluate kontra after
+    trick 1 using the value head (same ``v > 0`` rule as bidding
+    training).
     """
     rng = random.Random(seed)
 
@@ -284,18 +542,24 @@ def _play_one_game(
         pimc_determinizations=pimc_dets,
         solver_temperature=solver_temp,
     )
-    def_wrapper = opponent_wrapper if opponent_wrapper is not None else wrapper
     def_hybrid = HybridPlayer(
-        game, def_wrapper,
+        game, wrapper,
         mcts_config=def_mcts_config,
         endgame_tricks=endgame_tricks,
         pimc_determinizations=pimc_dets,
         solver_temperature=solver_temp,
     )
 
-    trajectory: list[tuple[np.ndarray, np.ndarray, np.ndarray, int]] = []
+    trajectory: list[tuple[np.ndarray, np.ndarray, np.ndarray, int, bool]] = []
+    handoff_solver_val: float | None = None
+    kontra_done = False
 
     while not game.is_terminal(state):
+        # ── Kontra decision after trick 1 ─────────────────────
+        if kontra_enabled and not kontra_done and state.gs.trick_no == 1:
+            kontra_done = True
+            _decide_kontra_training(game, state, wrapper, training_mode)
+
         player = game.current_player(state)
         actions = game.legal_actions(state)
 
@@ -304,9 +568,13 @@ def _play_one_game(
             continue
 
         if player == soloist_idx:
-            pi, action = sol_hybrid.choose_action_with_policy(state, player, rng)
+            pi, action, sv = sol_hybrid.choose_action_with_policy(state, player, rng)
         else:
-            pi, action = def_hybrid.choose_action_with_policy(state, player, rng)
+            pi, action, sv = def_hybrid.choose_action_with_policy(state, player, rng)
+
+        used_solver = sv is not None
+        if used_solver and handoff_solver_val is None:
+            handoff_solver_val = sv
 
         state_feats = game.encode_state(state, player)
         mask = game.legal_action_mask(state)
@@ -315,13 +583,20 @@ def _play_one_game(
             mask.copy(),
             np.asarray(pi, dtype=np.float32).copy(),
             player,
+            used_solver,
         ))
 
         state = game.apply(state, action)
 
+    # ── Assign value targets ──────────────────────────────────────
     samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]] = []
-    for state_feats, mask, pi, player in trajectory:
-        reward = simple_outcome(state, player)
+    for state_feats, mask, pi, player, was_solver in trajectory:
+        if solver_teacher and not was_solver and handoff_solver_val is not None:
+            reward = solver_value_to_reward(
+                handoff_solver_val, player, state.gs,
+            )
+        else:
+            reward = simple_outcome(state, player)
         is_sol = (player == soloist_idx)
         samples.append((state_feats, mask, pi, reward, is_sol))
 
@@ -349,7 +624,6 @@ def train_ulti_hybrid(
     cfg: UltiTrainConfig,
     *,
     initial_net: UltiNet | None = None,
-    opponent_state_dict: dict | None = None,
     on_progress: Callable[[UltiTrainStats], None] | None = None,
 ) -> tuple[UltiNet, UltiTrainStats]:
     """Run hybrid self-play training for Ulti.
@@ -361,8 +635,6 @@ def train_ulti_hybrid(
     initial_net : UltiNet, optional
         Pass an existing net to resume training (checkpoint load).
         If None, a fresh network is created.
-    opponent_state_dict : dict, optional
-        If provided, defenders use a different network (opponent pool).
     on_progress : callable, optional
         Called after every step with an ``UltiTrainStats`` snapshot.
 
@@ -370,7 +642,9 @@ def train_ulti_hybrid(
     -------
     (UltiNet, UltiTrainStats)
     """
-    device = cfg.device
+    # -- Resolve training device (auto-GPU for large nets) --
+    device = auto_device(cfg.body_units, cfg.body_layers, force=cfg.device)
+    use_gpu = device != "cpu"
     game = UltiGame()
 
     # -- Network --
@@ -383,6 +657,7 @@ def train_ulti_hybrid(
             body_layers=cfg.body_layers,
             action_dim=game.action_space_size,
         )
+    net.to(device)
     wrapper = UltiNetWrapper(net, device=device)
     optimizer = torch.optim.Adam(
         net.parameters(), lr=cfg.lr_start, weight_decay=1e-4,
@@ -400,6 +675,7 @@ def train_ulti_hybrid(
         use_value_head=True,
         use_policy_priors=True,
         visit_temp=1.0,
+        leaf_batch_size=cfg.leaf_batch_size,
     )
     def_cfg = MCTSConfig(
         simulations=cfg.def_sims,
@@ -410,6 +686,7 @@ def train_ulti_hybrid(
         use_value_head=True,
         use_policy_priors=True,
         visit_temp=0.5,
+        leaf_batch_size=cfg.leaf_batch_size,
     )
 
     # -- Parallel self-play pool --
@@ -442,7 +719,7 @@ def train_ulti_hybrid(
 
             # ---- 1. Self-play ----
             step_samples = 0
-            sp_wins = 0
+            sp_pts_sum = 0.0
             sp_total = 0
 
             # Enrichment threshold
@@ -451,6 +728,11 @@ def train_ulti_hybrid(
                 _enrichment_threshold(step, cfg.steps)
                 if past_warmup else -999.0
             )
+
+            # Move net to CPU for self-play (GPU used only for SGD)
+            if use_gpu and executor is None:
+                net.to("cpu")
+                wrapper.device = torch.device("cpu")
 
             if executor is not None:
                 # --- Parallel self-play ---
@@ -464,7 +746,6 @@ def train_ulti_hybrid(
                     )
                     tasks.append((
                         state_dict,
-                        opponent_state_dict,
                         sol_cfg,
                         def_cfg,
                         cfg.seed + step * 1000 + g,
@@ -473,14 +754,16 @@ def train_ulti_hybrid(
                         cfg.solver_temp,
                         cfg.training_mode,
                         thresh if use_enrich else -999.0,
+                        cfg.solver_teacher,
+                        cfg.kontra_enabled,
+                        cfg.neural_discard,
                     ))
                 for samples in executor.map(_play_game_in_worker, tasks):
-                    # Tally soloist self-play win rate
+                    # Tally soloist game-point reward
                     sol_r = [r for _, _, _, r, is_sol in samples if is_sol]
                     if sol_r:
                         sp_total += 1
-                        if sol_r[0] > 0:
-                            sp_wins += 1
+                        sp_pts_sum += sol_r[0]
                     for s, m, p, r, is_sol in samples:
                         buffer.push(s, m, p, r, is_soloist=is_sol)
                     step_samples += len(samples)
@@ -495,7 +778,14 @@ def train_ulti_hybrid(
                         and thresh > -999.0
                         and (g / cfg.games_per_step) >= cfg.enrich_random_frac
                     )
-                    if use_enrich:
+
+                    if cfg.neural_discard:
+                        init_state = _new_game_with_neural_discard(
+                            game, wrapper, game_seed,
+                            training_mode=cfg.training_mode,
+                            dealer=game_seed % 3,
+                        )
+                    elif use_enrich:
                         init_state, _ = _value_enriched_new_game(
                             game, wrapper, game_seed,
                             min_value=thresh,
@@ -510,15 +800,15 @@ def train_ulti_hybrid(
                         pimc_dets=cfg.pimc_dets,
                         solver_temp=cfg.solver_temp,
                         training_mode=cfg.training_mode,
-                        opponent_wrapper=None,
                         initial_state=init_state,
+                        solver_teacher=cfg.solver_teacher,
+                        kontra_enabled=cfg.kontra_enabled,
                     )
 
                     sol_r = [r for _, _, _, r, is_sol in samples if is_sol]
                     if sol_r:
                         sp_total += 1
-                        if sol_r[0] > 0:
-                            sp_wins += 1
+                        sp_pts_sum += sol_r[0]
                     for s, m, p, r, is_sol in samples:
                         buffer.push(s, m, p, r, is_soloist=is_sol)
                     step_samples += len(samples)
@@ -527,6 +817,11 @@ def train_ulti_hybrid(
             stats.total_samples += step_samples
 
             # ---- 2. Train (decoupled SGD steps) ----
+            # Move net back to training device for SGD
+            if use_gpu:
+                net.to(device)
+                wrapper.device = torch.device(device)
+
             avg_vloss = 0.0
             avg_ploss = 0.0
             avg_pacc = 0.0
@@ -557,7 +852,7 @@ def train_ulti_hybrid(
 
                     log_probs, values = net.forward_dual(s_t, m_t, is_sol_t)
 
-                    value_loss = F.mse_loss(values, z_t)
+                    value_loss = F.huber_loss(values, z_t, delta=1.0)
                     policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
                     loss = value_loss + policy_loss
 
@@ -600,7 +895,7 @@ def train_ulti_hybrid(
             stats.sol_vloss = avg_sol_vloss
             stats.def_vloss = avg_def_vloss
             stats.lr = lr
-            stats.sp_sol_wins = sp_wins
+            stats.sp_sol_pts_sum = sp_pts_sum
             stats.sp_sol_total = sp_total
             stats.train_time_s = time.perf_counter() - t0
 

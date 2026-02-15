@@ -1,21 +1,17 @@
 """FastAPI router for Ulti game sessions.
 
-Human is always player 0 (bottom of screen).  AI uses trained UltiNet.
+Human is always player 0 (bottom of screen).  AI opponents use trained
+contract models loaded via ``model_io.load_wrappers``.
+
 Game flow: BID → AUCTION → TRUMP_SELECT → KONTRA → PLAY → DONE.
 
-AI play modes (configurable per session):
-  - "neural"  : UltiNet policy head only — instant, no search.
-  - "mcts"    : UltiNet + MCTS search — stronger but slower.
-  - "solver"  : PIMC with exact alpha-beta solver — strongest, may be slow.
-  - "random"  : Random legal card (legacy / fallback).
-
-The model is loaded lazily from ``models/ulti_mixed.pt`` on first use.
+Each AI seat can use a different trained model (e.g. scout, knight).
+The model is selected at game creation via the ``opponents`` parameter.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import random
 import uuid
 from collections import Counter
@@ -23,21 +19,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
-import torch
 from fastapi import APIRouter, HTTPException
 
 from trickster.games.ulti.adapter import (
     UltiGame,
     UltiNode,
-    _CARD_IDX,
-    _IDX_TO_CARD,
     build_auction_constraints,
 )
 from trickster.games.ulti.cards import Card, Rank, Suit
-from trickster.mcts import MCTSConfig, alpha_mcts_policy
-from trickster.model import UltiNet, UltiNetWrapper
-from trickster.solver import SolverPIMC
+from trickster.hybrid import HybridPlayer
+from trickster.mcts import MCTSConfig
+from trickster.model import UltiNetWrapper
+from trickster.training.model_io import (
+    list_available_sources,
+    load_wrappers,
+)
 
 log = logging.getLogger(__name__)
 from trickster.games.ulti.auction import (
@@ -96,16 +92,15 @@ from trickster.games.ulti.game import (
 from trickster.games.ulti.rules import TrickResult
 
 # ---------------------------------------------------------------------------
-#  Neural AI — model loading (lazy singleton)
+#  Model loading — per-seat wrappers via model_io
 # ---------------------------------------------------------------------------
 
 _MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
-_DEFAULT_MODEL = "ulti_parti.pt"  # legacy; also checks models/ulti/*/model.pt
 
-# Singleton: loaded once, shared across all sessions.
 _ulti_game: UltiGame | None = None
-_ulti_wrapper: UltiNetWrapper | None = None
-_model_path_loaded: str = ""
+
+# Cache: source name → {contract_key → UltiNetWrapper}
+_wrapper_cache: dict[str, dict[str, UltiNetWrapper]] = {}
 
 
 def _get_ulti_game() -> UltiGame:
@@ -115,67 +110,34 @@ def _get_ulti_game() -> UltiGame:
     return _ulti_game
 
 
-def _load_ulti_model(model_path: str | None = None) -> UltiNetWrapper | None:
-    """Load a trained UltiNet from disk (cached singleton).
+def _get_wrappers(source: str) -> dict[str, UltiNetWrapper]:
+    """Load (or return cached) contract wrappers for a model source.
 
-    Falls back through: explicit path → env var ``ULTI_MODEL`` →
-    ``models/ulti_mixed.pt`` → any ``models/ulti_*.pt``.
-    Returns ``None`` if no model file is found.
+    Returns {} for "random" or if no models found.
     """
-    global _ulti_wrapper, _model_path_loaded
+    if source == "random":
+        return {}
+    if source not in _wrapper_cache:
+        try:
+            wraps = load_wrappers(source)
+            _wrapper_cache[source] = wraps
+            n = len(wraps)
+            log.info("Loaded %d contract models for '%s'", n, source)
+        except Exception:
+            log.exception("Failed to load models for '%s'", source)
+            _wrapper_cache[source] = {}
+    return _wrapper_cache[source]
 
-    if model_path is None:
-        model_path = os.environ.get("ULTI_MODEL")
-    if model_path is None:
-        candidate = _MODEL_DIR / _DEFAULT_MODEL
-        if candidate.exists():
-            model_path = str(candidate)
-        else:
-            # Try tiered models (prefer strongest tier)
-            ulti_dir = _MODEL_DIR / "ulti"
-            if ulti_dir.exists():
-                for tier_dir in sorted(ulti_dir.iterdir(), reverse=True):
-                    mp = tier_dir / "model.pt"
-                    if mp.exists():
-                        model_path = str(mp)
-                        break
-        if model_path is None:
-            # Fallback: any ulti_*.pt
-            for f in sorted(_MODEL_DIR.glob("ulti_*.pt")):
-                model_path = str(f)
-                break
 
-    if model_path is None:
-        log.warning("No Ulti model found — AI will play randomly.")
-        return None
+def _get_wrapper_for_contract(
+    source: str,
+    contract_key: str,
+) -> UltiNetWrapper | None:
+    """Get a single contract wrapper for a source, or None."""
+    wraps = _get_wrappers(source)
+    return wraps.get(contract_key)
 
-    # Return cached if same path
-    if _ulti_wrapper is not None and _model_path_loaded == model_path:
-        return _ulti_wrapper
 
-    try:
-        checkpoint = torch.load(model_path, weights_only=True, map_location="cpu")
-        body_units = checkpoint.get("body_units", 256)
-        body_layers = checkpoint.get("body_layers", 4)
-        input_dim = checkpoint.get("input_dim", 291)
-        action_dim = checkpoint.get("action_dim", 32)
-
-        net = UltiNet(
-            input_dim=input_dim,
-            body_units=body_units,
-            body_layers=body_layers,
-            action_dim=action_dim,
-        )
-        net.load_state_dict(checkpoint["model_state_dict"])
-
-        _ulti_wrapper = UltiNetWrapper(net, device="cpu")
-        _model_path_loaded = model_path
-        log.info("Loaded Ulti model from %s (%d params)",
-                 model_path, sum(p.numel() for p in net.parameters()))
-        return _ulti_wrapper
-    except Exception:
-        log.exception("Failed to load Ulti model from %s", model_path)
-        return None
 
 
 def _session_to_node(sess: "UltiSession") -> UltiNode:
@@ -218,43 +180,48 @@ def _session_to_node(sess: "UltiSession") -> UltiNode:
     )
 
 
-# Solver PIMC configs for different strength levels
-_SOLVER_CONFIGS: dict[str, dict[str, int]] = {
-    "fast": {"num_determinizations": 5, "max_exact_tricks": 5},
-    "medium": {"num_determinizations": 15, "max_exact_tricks": 6},
-    "strong": {"num_determinizations": 30, "max_exact_tricks": 6},
-}
+# ---------------------------------------------------------------------------
+#  AI play config — MCTS + PIMC solver (HybridPlayer)
+#
+#  Tuned for ~0.5-1s per AI move on a modern CPU (single-threaded).
+#  MCTS handles opening tricks; the exact alpha-beta solver kicks in
+#  for the last ``endgame_tricks`` tricks via PIMC determinizations.
+# ---------------------------------------------------------------------------
 
-# Lazy singleton solver instances
-_solver_instances: dict[str, SolverPIMC] = {}
+_AI_MCTS_CONFIG = MCTSConfig(
+    simulations=80,
+    determinizations=3,
+    c_puct=1.5,
+    dirichlet_alpha=0.0,
+    dirichlet_weight=0.0,
+    use_value_head=True,
+    use_policy_priors=True,
+    visit_temp=0.1,
+)
+
+_AI_ENDGAME_TRICKS = 6
+_AI_PIMC_DETS = 25
+
+# Cache: (source, contract_key) → HybridPlayer
+_hybrid_cache: dict[tuple[str, str], HybridPlayer] = {}
 
 
-def _get_solver(strength: str = "medium") -> SolverPIMC:
-    """Get or create a SolverPIMC instance for the given strength."""
-    if strength not in _solver_instances:
-        cfg = _SOLVER_CONFIGS.get(strength, _SOLVER_CONFIGS["medium"])
-        _solver_instances[strength] = SolverPIMC(**cfg)
-    return _solver_instances[strength]
-
-
-# MCTS configs for different AI strength levels
-_MCTS_CONFIGS: dict[str, MCTSConfig] = {
-    "fast": MCTSConfig(
-        simulations=5, determinizations=1,
-        c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
-        use_value_head=True, use_policy_priors=True, visit_temp=0.1,
-    ),
-    "medium": MCTSConfig(
-        simulations=20, determinizations=2,
-        c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
-        use_value_head=True, use_policy_priors=True, visit_temp=0.1,
-    ),
-    "strong": MCTSConfig(
-        simulations=50, determinizations=3,
-        c_puct=1.5, dirichlet_alpha=0.0, dirichlet_weight=0.0,
-        use_value_head=True, use_policy_priors=True, visit_temp=0.1,
-    ),
-}
+def _get_hybrid_player(source: str, contract_key: str) -> HybridPlayer | None:
+    """Get a cached HybridPlayer for a given model source + contract."""
+    cache_key = (source, contract_key)
+    if cache_key not in _hybrid_cache:
+        wrapper = _get_wrapper_for_contract(source, contract_key)
+        if wrapper is None:
+            return None
+        game = _get_ulti_game()
+        _hybrid_cache[cache_key] = HybridPlayer(
+            game=game,
+            net=wrapper,
+            mcts_config=_AI_MCTS_CONFIG,
+            endgame_tricks=_AI_ENDGAME_TRICKS,
+            pimc_determinizations=_AI_PIMC_DETS,
+        )
+    return _hybrid_cache[cache_key]
 
 
 # ---------------------------------------------------------------------------
@@ -333,14 +300,13 @@ class UltiSession:
     # defender player index → 0 / 1 / 2
     colorless_kontras: dict[int, int] = field(default_factory=dict)
     kontra_defender_idx: int = 0  # which defender is up (0=first, 1=second)
+    kontra_done: bool = False  # True after kontra decisions are complete
     needs_continue: bool = False
     log: list[dict[str, Any]] = field(default_factory=list)
     # Speech-bubble events: [{player: int, text: str}, ...]
     bubbles: list[dict[str, Any]] = field(default_factory=list)
-    # AI play mode: "neural" | "mcts" | "random"
-    ai_mode: str = "neural"
-    # MCTS strength level: "fast" | "medium" | "strong" (only for mcts mode)
-    ai_strength: str = "medium"
+    # Model source for each AI seat: [seat1_source, seat2_source]
+    opponent_sources: list[str] = field(default_factory=lambda: ["random", "random"])
 
 
 _sessions: dict[str, UltiSession] = {}
@@ -380,7 +346,11 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         if a.turn == HUMAN and not a.done:
             if a.awaiting_bid:
                 # Human must bid — show legal bids
-                legal_bid_list = [_bid_json(b) for b in legal_bids(a)]
+                from trickster.games.ulti.auction import SUPPORTED_BID_RANKS
+                legal_bid_list = [
+                    _bid_json(b) for b in legal_bids(a)
+                    if b.rank in SUPPORTED_BID_RANKS
+                ]
             else:
                 # Human in auction phase — can pickup or pass
                 pickup_ok = can_pickup(a)
@@ -533,8 +503,7 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         "settlement": settlement_data,
         "capturedTricks": captured_tricks,
         "bubbles": bubbles,
-        "aiMode": sess.ai_mode,
-        "aiStrength": sess.ai_strength,
+        "opponents": sess.opponent_sources,
         # Talon cards: revealed only when the game is over.
         "talonCards": [_card_json(c) for c in st.talon_discards] if (
             sess.phase == "done" and st.talon_discards
@@ -547,58 +516,43 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _soloist_won(st: GameState, bid: Bid) -> bool:
-    """Evaluate whether the soloist won the contracted game.
+def _unit_won(unit: str, st: GameState) -> bool:
+    """Evaluate whether the soloist won a specific kontrable unit.
 
-    Each bid is decomposed into components (from its ``components``
-    frozenset).  ALL components must be satisfied; if any one fails
-    the entire contract is lost.
-
-    Component rules (Hungarian Tournament)
-    ---------------------------------------
-    - **parti**: Soloist total > defenders total (foundation of all Adu games).
-    - **40**:    Declared 40 (trump K+Q marriage).
-    - **20**:    Declared 20 (non-trump K+Q marriage).
-    - **100**:   Total points (tricks + marriages) >= 100.
-    - **ulti**:  Won the last trick with 7 of trumps.
-    - **durchmars**: Won all 10 tricks.
-    - **betli**:  Won zero tricks (no trump, no Simple).
+    Each kontrable unit maps to one or more win conditions:
+      - **parti**: Soloist total > defenders total.
+      - **40-100**: Soloist has 40 marriage AND total >= 100.
+      - **20-100**: Soloist has 20 marriage AND total >= 100.
+      - **ulti**: Won the last trick with 7 of trumps.
+      - **durchmars**: Won all 10 tricks.
+      - **betli**: Won zero tricks.
     """
-    comps = bid.components
-
-    # --- Betli: completely separate logic ---
-    if COMP_BETLI in comps:
-        return not soloist_lost_betli(st)
-
-    # --- Build component checks for Adu games ---
-    checks: list[bool] = []
-
-    if COMP_PARTI in comps:
-        checks.append(soloist_won_simple(st))
-
-    if COMP_40 in comps:
-        checks.append(soloist_has_40(st))
-
-    if COMP_20 in comps:
-        checks.append(soloist_has_20(st))
-
-    if COMP_100 in comps:
-        checks.append(soloist_points(st) >= 100)
-
-    if COMP_ULTI in comps:
+    if unit == "parti":
+        return soloist_won_simple(st)
+    if unit == "40-100":
+        return soloist_has_40(st) and soloist_points(st) >= 100
+    if unit == "20-100":
+        return soloist_has_20(st) and soloist_points(st) >= 100
+    if unit == "ulti":
         if st.last_trick is None or st.trump is None:
-            checks.append(False)
-        else:
-            seven = Card(st.trump, Rank.SEVEN)
-            checks.append(
-                st.last_trick.winner == st.soloist
-                and seven in st.last_trick.cards
-            )
+            return False
+        seven = Card(st.trump, Rank.SEVEN)
+        return (st.last_trick.winner == st.soloist
+                and seven in st.last_trick.cards)
+    if unit == "durchmars":
+        return soloist_won_durchmars(st)
+    if unit == "betli":
+        return not soloist_lost_betli(st)
+    return False
 
-    if COMP_DURCHMARS in comps:
-        checks.append(soloist_won_durchmars(st))
 
-    return all(checks)
+def _soloist_won(st: GameState, bid: Bid) -> bool:
+    """Evaluate whether the soloist won ALL announced components.
+
+    Delegates to ``_unit_won`` for each kontrable unit.
+    """
+    vm = component_value_map(bid)
+    return all(_unit_won(unit, st) for unit in vm)
 
 
 # ---------------------------------------------------------------------------
@@ -786,24 +740,31 @@ def _compute_final_settlement(
             "soloistWon": False,
         }
 
-    # --- Determine win/loss ---
-    won = _soloist_won(st, bid)
-
     # --- Silent bonuses (computed first to know which components are replaced) ---
     silent_list, replaced = _compute_silent_bonuses(st, bid, kontras)
     silent_total = sum(sb.points for sb in silent_list)
 
-    # --- Main contract: per-component scoring (skip replaced units) ---
+    # --- Per-component scoring (each unit evaluated independently) ---
     vm = component_value_map(bid)
     base = 0
+    all_won = True
     for unit, (wv, lv) in vm.items():
         if unit in replaced:
             continue  # This component is replaced by a silent bonus
-        mult = 2 ** kontras.get(unit, 0)
-        if won:
+        k = kontras.get(unit, 0)
+        mult = 2 ** k
+        comp_won = _unit_won(unit, st)
+        if comp_won:
             base += wv * mult
         else:
-            base -= lv * mult
+            all_won = False
+            if unit == "ulti":
+                # Bukott ulti: special kontra formula.
+                # kontra → 3× base win, rekontra → 5× base win.
+                # General: loss = wv × (2^k + 1)
+                base -= wv * (mult + 1)
+            else:
+                base -= lv * mult
 
     net = base + silent_total
 
@@ -812,7 +773,7 @@ def _compute_final_settlement(
         "silentBonuses": [{"label": sb.label, "points": sb.points} for sb in silent_list],
         "netPerDefender": net,
         "soloistTotal": net * 2,
-        "soloistWon": won,
+        "soloistWon": net > 0,
     }
 
 
@@ -897,14 +858,15 @@ def _resolve_auction(sess: UltiSession) -> None:
     sess.state.talon_discards = list(a.talon)
 
     # Determine trump and proceed.
+    # Kontra now happens *during play* — after trick 1 completes.
     if bid.is_colorless:
         # No trump (Betli / Színtelen games).
         _setup_contract(sess, bid, trump=None)
-        _start_kontra_phase(sess)
+        _start_play_phase(sess)
     elif bid.is_red:
         # Red = Hearts trump.
         _setup_contract(sess, bid, trump=Suit.HEARTS)
-        _start_kontra_phase(sess)
+        _start_play_phase(sess)
     else:
         # Non-red adu: winner must choose trump suit.
         if winner == HUMAN:
@@ -913,7 +875,7 @@ def _resolve_auction(sess: UltiSession) -> None:
             # AI chooses trump (most common non-Hearts suit).
             trump = _ai_choose_trump(sess, winner)
             _setup_contract(sess, bid, trump=trump)
-            _start_kontra_phase(sess)
+            _start_play_phase(sess)
 
 
 def _ai_choose_trump(sess: UltiSession, player: int) -> Suit:
@@ -945,14 +907,19 @@ def _setup_contract(sess: UltiSession, bid: Bid, trump: Suit | None) -> None:
 
 
 def _start_kontra_phase(sess: UltiSession) -> None:
-    """Start the Kontra phase (defenders choose per-component kontras)."""
+    """Start the Kontra phase after trick 1 completes.
+
+    In real Ulti, defenders kontra during trick 1 (after seeing
+    the cards played).  We trigger this after trick 1 resolves so
+    that both defenders have seen all 3 cards.
+    """
     bid = sess.winning_bid
     assert bid is not None
     units = kontrable_units(bid)
 
     if not units:
-        # Nothing to kontra (should not happen, but safety)
-        _start_play_phase(sess)
+        # Nothing to kontra — resume play.
+        sess.kontra_done = True
         return
 
     sess.phase = "kontra"
@@ -970,8 +937,44 @@ def _defender_at(sess: UltiSession, idx: int) -> int | None:
     return None
 
 
+def _ai_kontra_decision(sess: UltiSession, defender: int) -> bool:
+    """AI defender decides whether to kontra using the value head.
+
+    Uses the defender's seat-specific model.  Kontra when value > 0
+    (the defender expects to gain points).
+    """
+    contract_key = _contract_key_from_bid(sess.winning_bid)
+    wrapper = _get_seat_wrapper(sess, defender, contract_key)
+    if wrapper is None:
+        return False
+
+    game = _get_ulti_game()
+    node = _session_to_node(sess)
+    feats = game.encode_state(node, defender)
+    v = wrapper.predict_value(feats)
+    return v > 0.0
+
+
+def _ai_rekontra_decision(sess: UltiSession) -> bool:
+    """AI soloist decides whether to rekontra using the value head.
+
+    Uses the soloist's seat-specific model.  Rekontra when value > 0.
+    """
+    soloist = sess.state.soloist
+    contract_key = _contract_key_from_bid(sess.winning_bid)
+    wrapper = _get_seat_wrapper(sess, soloist, contract_key)
+    if wrapper is None:
+        return False
+
+    game = _get_ulti_game()
+    node = _session_to_node(sess)
+    feats = game.encode_state(node, soloist)
+    v = wrapper.predict_value(feats)
+    return v > 0.0
+
+
 def _advance_ai_kontra(sess: UltiSession) -> None:
-    """Auto-play AI kontra/rekontra decisions."""
+    """Auto-play AI kontra/rekontra decisions using the value head."""
     if sess.phase == "kontra":
         while sess.kontra_defender_idx < 2:
             defender = _defender_at(sess, sess.kontra_defender_idx)
@@ -979,23 +982,69 @@ def _advance_ai_kontra(sess: UltiSession) -> None:
                 break
             if defender == HUMAN:
                 return  # Human's turn to decide
-            # AI defender: for now, always passes (no kontra)
+
+            # AI defender: use value head to decide
+            if _ai_kontra_decision(sess, defender):
+                for u in sess.component_kontras:
+                    sess.component_kontras[u] = max(sess.component_kontras[u], 1)
+                sess.bubbles.append({
+                    "player": defender,
+                    "text": f"Kontra! ({', '.join(sess.component_kontras.keys())})",
+                })
+
             sess.kontra_defender_idx += 1
 
         # Both defenders done — check if any kontras were made
         if any(v > 0 for v in sess.component_kontras.values()):
             sess.phase = "rekontra"
             if sess.state.soloist != HUMAN:
-                # AI soloist: for now, never rekontra
-                _start_play_phase(sess)
+                # AI soloist: use value head to decide rekontra
+                if _ai_rekontra_decision(sess):
+                    for u in sess.component_kontras:
+                        if sess.component_kontras[u] == 1:
+                            sess.component_kontras[u] = 2
+                    sess.bubbles.append({
+                        "player": sess.state.soloist,
+                        "text": "Rekontra!",
+                    })
+                _resume_play_after_kontra(sess)
             # else: human soloist decides
         else:
-            _start_play_phase(sess)
+            _resume_play_after_kontra(sess)
 
     elif sess.phase == "rekontra":
-        # AI soloist: never rekontra
+        # AI soloist: use value head
         if sess.state.soloist != HUMAN:
-            _start_play_phase(sess)
+            if _ai_rekontra_decision(sess):
+                for u in sess.component_kontras:
+                    if sess.component_kontras[u] == 1:
+                        sess.component_kontras[u] = 2
+                sess.bubbles.append({
+                    "player": sess.state.soloist,
+                    "text": "Rekontra!",
+                })
+            _resume_play_after_kontra(sess)
+
+
+def _resume_play_after_kontra(sess: UltiSession) -> None:
+    """Resume the play phase after kontra/rekontra decisions complete.
+
+    Trick 1 has already been played and resolved.  Now we continue
+    from trick 2 onwards.
+    """
+    sess.kontra_done = True
+    sess.phase = "play"
+
+    # Update the UltiNode's component_kontras for the encoder.
+    # (The kontras are already in sess.component_kontras.)
+
+    if is_terminal(sess.state):
+        sess.phase = "done"
+        return
+
+    cp = current_player(sess.state)
+    if cp != HUMAN:
+        _advance_ai_one(sess)
 
 
 def _start_play_phase(sess: UltiSession) -> None:
@@ -1004,11 +1053,22 @@ def _start_play_phase(sess: UltiSession) -> None:
     Before the first trick, all players declare their marriages
     (K+Q pairs) — points are added immediately.
 
+    Kontra decisions happen *during* trick 1 (after it completes),
+    not before play starts.
+
     Marriage restriction is applied based on the contract:
       - 40-100: soloist only declares trump K+Q (40).
       - 20-100: soloist only declares one non-trump K+Q (20).
     """
     sess.phase = "play"
+    sess.kontra_done = False  # Will be set True after trick 1 kontra decisions
+
+    # Pre-initialize component_kontras (all at 0) so the encoder
+    # can read them from the start.
+    bid = sess.winning_bid
+    if bid:
+        units = kontrable_units(bid)
+        sess.component_kontras = {u: 0 for u in units}
 
     # Determine marriage restriction from the winning bid.
     restrict = marriage_restriction(sess.winning_bid) if sess.winning_bid else None
@@ -1032,52 +1092,70 @@ def _start_play_phase(sess: UltiSession) -> None:
         _advance_ai_one(sess)
 
 
-def _ai_pick_card(sess: UltiSession) -> Card:
-    """Select a card for the AI using the configured mode.
+def _get_seat_wrapper(
+    sess: UltiSession,
+    player: int,
+    contract_key: str | None = None,
+) -> UltiNetWrapper | None:
+    """Get the appropriate model wrapper for an AI seat.
 
-    Modes:
-      - "neural":  Pure policy head (instant, no search).
-      - "mcts":    MCTS search with configurable strength.
-      - "solver":  PIMC with exact alpha-beta solver.
-      - "random":  Random legal card (fallback).
+    ``player`` is 1 or 2 (AI seats).  Looks up the contract-specific
+    wrapper from the seat's model source.  Falls back to "parti" if no
+    contract-specific model is found.
+    """
+    if player == HUMAN:
+        return None
+    seat_idx = player - 1  # seats [0,1] in opponent_sources
+    source = sess.opponent_sources[seat_idx]
+    if source == "random":
+        return None
+    wraps = _get_wrappers(source)
+    if not wraps:
+        return None
+    if contract_key and contract_key in wraps:
+        return wraps[contract_key]
+    return wraps.get("parti")
+
+
+def _contract_key_from_bid(bid: Bid | None) -> str:
+    """Map a Bid to its contract model key."""
+    if bid is None:
+        return "parti"
+    comps = bid.components
+    if COMP_BETLI in comps:
+        return "betli"
+    if COMP_100 in comps:
+        return "40-100"
+    if COMP_ULTI in comps:
+        return "ulti"
+    return "parti"
+
+
+def _ai_pick_card(sess: UltiSession) -> Card:
+    """Select a card for the AI using HybridPlayer (MCTS + PIMC solver).
+
+    Uses the seat's contract-specific model via HybridPlayer.  Falls
+    back to random legal card if no model is loaded for this seat.
     """
     st = sess.state
     actions = legal_actions(st)
     if len(actions) == 1:
         return actions[0]
 
-    mode = sess.ai_mode
+    player = current_player(st)
+    rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
 
-    # Solver mode: no neural network needed
-    if mode == "solver":
-        solver = _get_solver(sess.ai_strength)
-        node = _session_to_node(sess)
-        player = current_player(st)
-        rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
-        return solver.choose_action(node, player, rng)
+    # Look up the seat's model source and contract
+    seat_idx = player - 1
+    source = sess.opponent_sources[seat_idx]
+    contract_key = _contract_key_from_bid(sess.winning_bid)
 
-    wrapper = _load_ulti_model()
-
-    if wrapper is None or mode == "random":
-        rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
+    hybrid = _get_hybrid_player(source, contract_key)
+    if hybrid is None:
         return rng.choice(actions)
 
-    game = _get_ulti_game()
     node = _session_to_node(sess)
-    player = current_player(st)
-
-    if mode == "mcts":
-        config = _MCTS_CONFIGS.get(sess.ai_strength, _MCTS_CONFIGS["medium"])
-        rng = random.Random(sess.seed ^ (st.trick_no * 13 + len(st.trick_cards) * 7))
-        _pi, action = alpha_mcts_policy(node, game, wrapper, player, config, rng)
-        return action
-    else:
-        # "neural" — pure policy head, no search
-        feats = game.encode_state(node, player)
-        mask = game.legal_action_mask(node)
-        probs = wrapper.predict_policy(feats, mask)
-        best_idx = int(np.argmax(probs))
-        return _IDX_TO_CARD[best_idx]
+    return hybrid.choose_action(node, player, rng)
 
 
 def _advance_ai_one(sess: UltiSession) -> None:
@@ -1121,9 +1199,8 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
 
     Optional body fields:
       - ``seed``:  int — deal seed
-      - ``dealer``: int — dealer index (0–2)
-      - ``aiMode``: "neural" | "mcts" | "random"
-      - ``aiStrength``: "fast" | "medium" | "strong" (for mcts mode)
+      - ``dealer``: int — dealer index (0-2)
+      - ``opponents``: [string, string] — model sources for seat 1, 2
     """
     seed = body.get("seed")
     if seed is None:
@@ -1135,13 +1212,10 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
     else:
         dealer = random.randint(0, 2)
 
-    # AI configuration
-    ai_mode = body.get("aiMode", "neural")
-    if ai_mode not in ("neural", "mcts", "solver", "random"):
-        ai_mode = "neural"
-    ai_strength = body.get("aiStrength", "medium")
-    if ai_strength not in ("fast", "medium", "strong"):
-        ai_strength = "medium"
+    # Opponent model sources
+    opponents = body.get("opponents", ["random", "random"])
+    if not isinstance(opponents, list) or len(opponents) != 2:
+        opponents = ["random", "random"]
 
     st, talon = deal(seed=seed, dealer=dealer)
 
@@ -1156,23 +1230,21 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         id=str(uuid.uuid4()),
         state=st,
         talon=talon,
-        phase="bid",  # will be set by _advance_ai_auction
+        phase="bid",
         seed=seed,
         auction=auction,
-        ai_mode=ai_mode,
-        ai_strength=ai_strength,
+        opponent_sources=opponents,
     )
     _sessions[sess.id] = sess
 
-    # Eagerly try to load the model on first game
-    if ai_mode != "random":
-        _load_ulti_model()
+    # Eagerly preload the opponent models
+    for src in set(opponents):
+        if src != "random":
+            _get_wrappers(src)
 
     if first_bidder == HUMAN:
-        # Human has 12 cards — must discard 2 + bid.
         sess.phase = "bid"
     else:
-        # AI first bidder: auto-bid, then advance.
         _advance_ai_auction(sess)
 
     return _public_state(sess)
@@ -1294,7 +1366,7 @@ def choose_trump(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
 
     assert sess.winning_bid is not None
     _setup_contract(sess, sess.winning_bid, trump=suit)
-    _start_kontra_phase(sess)
+    _start_play_phase(sess)
 
     return _public_state(sess)
 
@@ -1334,7 +1406,6 @@ def kontra_action(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
                 sess.bubbles.append({"player": HUMAN, "text": f"Kontra! ({', '.join(components)})"})
         elif action != "pass":
             raise HTTPException(400, f"Invalid kontra action: {action}")
-            raise HTTPException(400, f"Invalid kontra action: {action}")
 
         sess.kontra_defender_idx += 1
         _advance_ai_kontra(sess)
@@ -1353,9 +1424,8 @@ def kontra_action(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
                 sess.bubbles.append({"player": HUMAN, "text": f"Rekontra! ({', '.join(components)})"})
         elif action != "pass":
             raise HTTPException(400, f"Invalid rekontra action: {action}")
-            raise HTTPException(400, f"Invalid rekontra action: {action}")
 
-        _start_play_phase(sess)
+        _resume_play_after_kontra(sess)
 
     return _public_state(sess)
 
@@ -1392,7 +1462,12 @@ def play(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/{game_id}/continue")
 def continue_game(game_id: str) -> dict[str, Any]:
-    """Advance past a completed trick."""
+    """Advance past a completed trick.
+
+    After trick 1 completes, this triggers the kontra phase
+    (defenders decide per-component kontras, soloist may rekontra)
+    before continuing to trick 2.
+    """
     sess = _sessions.get(game_id)
     if not sess:
         raise HTTPException(404, "Game not found")
@@ -1403,52 +1478,23 @@ def continue_game(game_id: str) -> dict[str, Any]:
         sess.phase = "done"
         return _public_state(sess)
 
+    # After trick 1: enter kontra phase before continuing play.
+    if sess.state.trick_no == 1 and not sess.kontra_done:
+        _start_kontra_phase(sess)
+        return _public_state(sess)
+
     _advance_ai_one(sess)
     return _public_state(sess)
 
 
-@router.post("/{game_id}/ai-settings")
-def ai_settings(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
-    """Update AI play settings for this session.
+@router.get("/models")
+def list_models() -> dict[str, Any]:
+    """List available model sources for opponent selection.
 
-    Body: { aiMode: "neural"|"mcts"|"random", aiStrength: "fast"|"medium"|"strong" }
+    Returns both base models and e2e (bidding-trained) models.
     """
-    sess = _sessions.get(game_id)
-    if not sess:
-        raise HTTPException(404, "Game not found")
-
-    if "aiMode" in body:
-        mode = body["aiMode"]
-        if mode in ("neural", "mcts", "solver", "random"):
-            sess.ai_mode = mode
-    if "aiStrength" in body:
-        strength = body["aiStrength"]
-        if strength in ("fast", "medium", "strong"):
-            sess.ai_strength = strength
-
-    return {
-        "aiMode": sess.ai_mode,
-        "aiStrength": sess.ai_strength,
-    }
-
-
-@router.get("/model-info")
-def model_info() -> dict[str, Any]:
-    """Return info about the loaded AI model."""
-    wrapper = _load_ulti_model()
-    if wrapper is None:
-        return {
-            "loaded": False,
-            "path": None,
-            "params": 0,
-            "message": "No model found — AI plays randomly. "
-                       "Train one with: python scripts/train_baseline.py --steps 500",
-        }
-    return {
-        "loaded": True,
-        "path": _model_path_loaded,
-        "params": sum(p.numel() for p in wrapper.net.parameters()),
-    }
+    sources = list_available_sources(str(_MODEL_DIR))
+    return {"models": sources}
 
 
 # ---------------------------------------------------------------------------
@@ -1469,38 +1515,35 @@ def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
     Optional body fields:
       - ``seed``: int — deal seed
       - ``dealer``: int — dealer index (0-2), rotates soloist
-      - ``aiMode``: "neural" | "mcts" | "solver" | "random"
-      - ``aiStrength``: "fast" | "medium" | "strong"
+      - ``opponents``: [string, string] — model sources for seat 1, 2
     """
     seed = body.get("seed")
     if seed is None:
         seed = random.randint(0, 2**31)
     seed = int(seed)
 
-    ai_mode = body.get("aiMode", "mcts")
-    if ai_mode not in ("neural", "mcts", "solver", "random"):
-        ai_mode = "mcts"
-    ai_strength = body.get("aiStrength", "medium")
-    if ai_strength not in ("fast", "medium", "strong"):
-        ai_strength = "medium"
-
     dealer_arg = body.get("dealer")
     if dealer_arg is not None:
         dealer = int(dealer_arg) % 3
     else:
-        dealer = 0  # default: soloist = player 1
+        dealer = 0
+
+    opponents = body.get("opponents", ["random", "random"])
+    if not isinstance(opponents, list) or len(opponents) != 2:
+        opponents = ["random", "random"]
 
     game = _get_ulti_game()
-    wrapper = _load_ulti_model()
 
-    # Deal with value-head enrichment: keep competitive deals only.
-    # Reject hands where the soloist is hopeless OR dominant.
-    VAL_LO = -0.20   # soloist not too weak
-    VAL_HI = +0.35   # soloist not too strong (no free 40+20 marriages)
+    # Use the first opponent's parti wrapper for deal enrichment
+    wrapper = _get_wrapper_for_contract(opponents[0], "parti")
+
+    # Deal enrichment: keep competitive deals only
+    VAL_LO = -0.20
+    VAL_HI = +0.35
     MAX_ATTEMPTS = 50
     best_node = None
     best_val = -999.0
-    best_dist = 999.0  # distance from 0 (most balanced = best)
+    best_dist = 999.0
     for attempt in range(MAX_ATTEMPTS):
         attempt_seed = seed + attempt * 100_000
         node = game.new_game(
@@ -1508,7 +1551,6 @@ def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
             training_mode="simple",
             starting_leader=dealer,
         )
-        # Override trump to Hearts before evaluation
         set_contract(node.gs, node.gs.soloist, trump=Suit.HEARTS)
 
         if wrapper is not None:
@@ -1516,10 +1558,8 @@ def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
             feats = game.encode_state(node, sol)
             val = wrapper.predict_value(feats)
             dist = abs(val)
-            # Track the most balanced deal we've seen
             if dist < best_dist:
                 best_node, best_val, best_dist = node, val, dist
-            # Accept if within the competitive band
             if VAL_LO <= val <= VAL_HI:
                 best_node, best_val = node, val
                 break
@@ -1542,8 +1582,8 @@ def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         auction=None,
         winning_bid=parti_bid,
         component_kontras={"parti": 0},
-        ai_mode=ai_mode,
-        ai_strength=ai_strength,
+        kontra_done=False,
+        opponent_sources=opponents,
     )
     _sessions[sess.id] = sess
 

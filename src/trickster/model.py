@@ -3,7 +3,7 @@
 Architecture:
     Input (259-dim) → Shared Backbone (4×256 + LayerNorm + ReLU)
                        ├── Policy Head   → Linear(256, 32)   → LogSoftmax
-                       ├── Value Head    → Linear(256, 1)    → Tanh
+                       ├── Value Head    → Linear(256, 1)     (unbounded)
                        └── Auction Head (multi-component)
                             ├── Trump sub-head → Linear(128, 5) → LogSoftmax
                             │                    (♥, ♦, ♠, ♣, NoTrump)
@@ -199,7 +199,7 @@ class UltiNet(nn.Module):
             logits = logits.masked_fill(~mask, -1e9)
         log_probs = F.log_softmax(logits, dim=-1)
 
-        value = torch.tanh(self.value_fc(body)).squeeze(-1)
+        value = self.value_fc(body).squeeze(-1)
         return log_probs, value
 
     def forward_role(
@@ -219,10 +219,10 @@ class UltiNet(nn.Module):
 
         if is_soloist:
             logits = self.policy_head_sol(body)
-            value = torch.tanh(self.value_fc_sol(body)).squeeze(-1)
+            value = self.value_fc_sol(body).squeeze(-1)
         else:
             logits = self.policy_head_def(body)
-            value = torch.tanh(self.value_fc_def(body)).squeeze(-1)
+            value = self.value_fc_def(body).squeeze(-1)
 
         if mask is not None:
             logits = logits.masked_fill(~mask, -1e9)
@@ -274,9 +274,8 @@ class UltiNet(nn.Module):
         if mask is not None:
             logits = logits.masked_fill(~mask, -1e9)
         log_probs = F.log_softmax(logits, dim=-1)
-        values = torch.tanh(raw_val)
 
-        return log_probs, values
+        return log_probs, raw_val
 
     def forward_auction(
         self, x: torch.Tensor,
@@ -325,7 +324,7 @@ class UltiNet(nn.Module):
     def forward_value_only(self, x: torch.Tensor) -> torch.Tensor:
         """Value head only — used for neural discard evaluation."""
         body = self.backbone(x)
-        return torch.tanh(self.value_fc(body)).squeeze(-1)
+        return self.value_fc(body).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -395,12 +394,62 @@ class UltiNetWrapper:
             probs = log_probs.exp().squeeze(0)
         return float(value.item()), probs.cpu().numpy()
 
+    def predict_both_batch(
+        self,
+        feats_list: list[np.ndarray],
+        mask_list: list[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Batched predict_both — amortises PyTorch overhead across leaves.
+
+        Auto-detects soloist/defender role per sample from encoded features
+        and routes through the appropriate role-specific head via
+        ``forward_dual``.
+
+        Parameters
+        ----------
+        feats_list : list of (input_dim,) arrays
+        mask_list  : list of (action_dim,) bool arrays
+
+        Returns
+        -------
+        values : (B,) float array — value from each sample's current player
+        probs  : (B, action_dim) float array — policy probabilities
+        """
+        B = len(feats_list)
+        if B == 0:
+            return np.empty(0, dtype=np.float32), np.zeros(
+                (0, self.net.action_dim), dtype=np.float32,
+            )
+
+        is_sol_list = [self._detect_role(f) for f in feats_list]
+
+        self.net.eval()
+        with torch.no_grad():
+            x = torch.from_numpy(np.stack(feats_list)).float().to(self.device)
+            m = torch.from_numpy(np.stack(mask_list)).bool().to(self.device)
+            is_sol = torch.tensor(
+                is_sol_list, dtype=torch.bool, device=self.device,
+            )
+            log_probs, values = self.net.forward_dual(x, m, is_sol)
+            probs = log_probs.exp()
+        return values.cpu().numpy(), probs.cpu().numpy()
+
     def batch_value(self, states: np.ndarray) -> np.ndarray:
-        """Evaluate value head on a batch of states (shared head)."""
+        """Evaluate soloist value head on a batch of states.
+
+        Uses the role-specific soloist head (``value_fc_sol``) which is
+        trained by ``forward_dual`` during self-play.  This replaces the
+        old shared ``value_fc`` path which was never updated by the
+        bidding training loop.
+
+        Callers (bidding evaluator, neural discard) always evaluate from
+        the soloist's perspective, so the soloist head is correct here.
+        """
         self.net.eval()
         with torch.no_grad():
             x = torch.from_numpy(states).float().to(self.device)
-            values = self.net.forward_value_only(x)
+            body = self.net.backbone(x)
+            values = self.net.value_fc_sol(body).squeeze(-1)
         return values.cpu().numpy()
 
     def predict_auction(self, state_feats: np.ndarray) -> np.ndarray:

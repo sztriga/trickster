@@ -1115,6 +1115,7 @@ body {
   gap: 48px;
   min-height: 160px;
   padding: 16px 0;
+  position: relative;
 }
 
 .ulti-trick-slot {
@@ -1540,29 +1541,145 @@ body {
 /* ── Kontra overlay ── */
 
 .ulti-kontra-overlay {
-  background: var(--panel-2);
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 20px 24px;
+  border-radius: 16px;
+  padding: 28px 32px 24px;
   margin: 12px auto;
-  max-width: 420px;
+  max-width: 400px;
   text-align: center;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.10);
 }
 
-.ulti-kontra-info {
-  font-size: 14px;
-  margin-bottom: 14px;
-}
-
-.ulti-kontra-level {
+.ulti-kontra-title {
+  font-size: 26px;
+  font-weight: 800;
   color: #ef5350;
+  letter-spacing: -0.5px;
+  margin-bottom: 6px;
+}
+
+.ulti-kontra-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+
+.ulti-kontra-active-tags {
+  display: block;
+  margin-top: 6px;
+}
+
+.ulti-kontra-active-tag {
+  display: inline-block;
+  background: rgba(239, 83, 80, 0.12);
+  color: #ef5350;
+  font-size: 11px;
   font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin: 0 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
 }
 
 .ulti-kontra-actions {
   display: flex;
-  gap: 12px;
+  flex-direction: column;
+  gap: 14px;
+  align-items: center;
+}
+
+.ulti-kontra-contract {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.ulti-kontra-toggles {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
   justify-content: center;
+}
+
+.ulti-kontra-toggle {
+  padding: 10px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  border: 2px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-transform: capitalize;
+}
+
+.ulti-kontra-toggle:hover {
+  border-color: #ef5350;
+  color: var(--text);
+}
+
+.ulti-kontra-toggle-on {
+  border-color: #ef5350;
+  background: rgba(239, 83, 80, 0.10);
+  color: #ef5350;
+}
+
+.ulti-kontra-btn-row {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.ulti-kontra-confirm {
+  flex: 1;
+  padding: 12px 20px;
+  font-size: 15px;
+  font-weight: 700;
+  background: #ef5350;
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.ulti-kontra-confirm:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.ulti-kontra-confirm:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ulti-kontra-pass {
+  flex: 1;
+  padding: 12px 20px;
+  font-size: 15px;
+  font-weight: 600;
+  background: var(--bg);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.ulti-kontra-pass:hover:not(:disabled) {
+  background: var(--surface);
+  color: var(--text);
+}
+
+.ulti-kontra-waiting {
+  font-size: 14px;
+  color: var(--text-muted);
+  padding: 12px 0;
 }
 
 /* ── Contract badge value ── */
@@ -1648,22 +1765,22 @@ body {
 
 /* ── Done-phase action buttons ── */
 
-.ulti-talon-reveal {
+/* Talon — small cards in the bottom-left of the trick area */
+.ulti-talon-inline {
+  position: absolute;
+  left: 8px;
+  bottom: 4px;
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 6px 0;
-  font-size: 13px;
-  color: var(--muted);
+  align-items: flex-end;
+  gap: 3px;
 }
-.ulti-talon-label {
-  font-weight: 700;
-  color: var(--text);
-}
-.ulti-talon-pts {
-  font-size: 12px;
-  opacity: 0.8;
+
+.ulti-talon-card {
+  width: 64px;
+  height: auto;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  opacity: 0.75;
 }
 
 .ulti-done-actions {
@@ -1724,20 +1841,119 @@ body {
 .ulti-row-win { background: rgba(76, 175, 80, 0.06); }
 .ulti-row-loss { background: rgba(239, 83, 80, 0.06); }
 
-/* AI mode selector */
-.ulti-ai-select {
-  font-size: 12px;
-  padding: 4px 8px;
-  background: var(--surface);
-  color: var(--text);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  cursor: pointer;
+/* =============== LOBBY SCREEN =============== */
+
+.ulti-lobby {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 24px;
 }
 
-.ulti-no-model {
-  font-size: 11px;
-  color: #ff9800;
-  padding: 4px 6px;
+.ulti-lobby-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 48px 40px;
+  max-width: 440px;
+  width: 100%;
+  text-align: center;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+}
+
+.ulti-lobby-title {
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--text);
+  margin: 0 0 4px;
+  letter-spacing: -0.5px;
+}
+
+.ulti-lobby-subtitle {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin: 0 0 32px;
+}
+
+.ulti-lobby-seats {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.ulti-lobby-seat {
+  flex: 1;
+  text-align: left;
+}
+
+.ulti-lobby-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.ulti-lobby-select {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' fill='none' stroke='%23999' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 32px;
+}
+
+.ulti-lobby-select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+
+.ulti-lobby-settings {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.ulti-lobby-setting {
+  flex: 1;
+  text-align: left;
+}
+
+.ulti-lobby-start {
+  width: 100%;
+  height: auto;
+  padding: 14px 24px;
+  font-size: 16px;
+  font-weight: 700;
+  border-radius: 10px;
+}
+
+.ulti-lobby-loading,
+.ulti-lobby-empty {
+  font-size: 14px;
+  color: var(--text-muted);
+  padding: 24px 0;
+}
+
+.ulti-lobby-empty code {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+  background: var(--bg);
+  padding: 8px;
+  border-radius: 6px;
+  color: var(--text);
 }
 

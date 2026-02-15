@@ -599,14 +599,20 @@ def ai_should_pickup(hand: list[Card], auction: AuctionState) -> bool:
     return strong >= 5 and can_pickup(auction)
 
 
+# Bid ranks for contracts that have trained models.
+# Others will be enabled once we train them.
+SUPPORTED_BID_RANKS: frozenset[int] = frozenset({1, 2, 3, 4, 5, 8, 10, 11})
+
+
 def ai_bid_after_pickup(hand: list[Card], auction: AuctionState) -> tuple[Bid, list[Card]]:
     """AI bids after picking up the talon.
 
-    Returns (bid, discards).
+    Returns (bid, discards).  Only considers supported contracts
+    (those with trained models).
     """
     candidates = sorted(hand, key=lambda c: (c.points(), c.strength()))
     discards = candidates[:2]
-    bids = legal_bids(auction)
+    bids = [b for b in legal_bids(auction) if b.rank in SUPPORTED_BID_RANKS]
     if not bids:
         raise ValueError("No legal bids — should not have picked up")
     return bids[0], discards

@@ -91,7 +91,7 @@ _label_to_dir: dict[str, Path] = {}
 def _refresh_label_map() -> None:
     """Rebuild the label -> dir mapping from disk."""
     _label_to_dir.clear()
-    for d in list_model_dirs(root="models"):
+    for d in list_model_dirs(root="models/snapszer"):
         label = model_label_from_dir(d)
         _label_to_dir[label] = d
 

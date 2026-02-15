@@ -451,13 +451,48 @@ class UltiGame:
         soloist = next_player(dealer)  # first bidder
         gs.soloist = soloist
 
-        if training_mode in ("simple", "ulti"):
-            # ---- Simple Parti / Ulti: no talon interaction ----
+        if training_mode in ("simple", "ulti", "40-100"):
+            # ---- Parti / Ulti / 40-100: no talon interaction ----
             # Talon cards go straight to talon_discards (defender pts).
             gs.talon_discards = list(talon)
 
             suits_in_hand = list(set(c.suit for c in gs.hands[soloist]))
             trump = rng.choice(suits_in_hand)
+
+            if training_mode == "40-100":
+                # Soloist must hold trump K+Q for the 40-100 contract.
+                # If they don't, swap cards from hand with the needed
+                # trump K/Q so the constraint is always satisfied.
+                trump_k = Card(trump, Rank.KING)
+                trump_q = Card(trump, Rank.QUEEN)
+                hand = gs.hands[soloist]
+                for needed in (trump_k, trump_q):
+                    if needed not in hand:
+                        # Find the needed card somewhere else and swap it in
+                        for other_p in range(NUM_PLAYERS):
+                            if other_p == soloist:
+                                continue
+                            if needed in gs.hands[other_p]:
+                                # Swap a random non-essential card from soloist
+                                swappable = [c for c in hand
+                                             if c != trump_k and c != trump_q]
+                                give = rng.choice(swappable)
+                                hand.remove(give)
+                                hand.append(needed)
+                                gs.hands[other_p].remove(needed)
+                                gs.hands[other_p].append(give)
+                                break
+                        else:
+                            # Card is in the talon
+                            if needed in gs.talon_discards:
+                                swappable = [c for c in hand
+                                             if c != trump_k and c != trump_q]
+                                give = rng.choice(swappable)
+                                hand.remove(give)
+                                hand.append(needed)
+                                gs.talon_discards.remove(needed)
+                                gs.talon_discards.append(give)
+
             set_contract(gs, soloist, trump=trump)
             betli = False
         elif training_mode == "betli":
@@ -485,7 +520,9 @@ class UltiGame:
             discard_talon(gs, discards)
 
         # Declare all marriages before the play phase begins.
-        declare_all_marriages(gs)
+        # 40-100: soloist may only declare the trump marriage.
+        marriage_restrict = "40" if training_mode == "40-100" else None
+        declare_all_marriages(gs, soloist_marriage_restrict=marriage_restrict)
 
         # Build contract components for training (simplified)
         if betli:
@@ -495,6 +532,8 @@ class UltiGame:
             if training_mode == "ulti":
                 comps = frozenset({"parti", "ulti"})
                 gs.has_ulti = True
+            elif training_mode == "40-100":
+                comps = frozenset({"parti", "40", "100"})
 
         # Build auction constraints from marriages/contract
         constraints = build_auction_constraints(gs, comps)

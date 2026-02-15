@@ -267,8 +267,13 @@ class UltiEncoder:
             x[_AUCTION_OFF + 2 + si] = 1.0 if si == seat else 0.0
         if component_kontras:
             _KONTRA_KEYS = ["parti", "ulti", "durchmars", "betli"]
+            # 40-100 and 20-100 map to the "parti" slot (they replace parti)
+            _KONTRA_ALIASES = {"40-100": "parti", "20-100": "parti"}
             for ki, key in enumerate(_KONTRA_KEYS):
                 level = component_kontras.get(key, 0)
+                for alias, target in _KONTRA_ALIASES.items():
+                    if target == key:
+                        level = max(level, component_kontras.get(alias, 0))
                 x[_AUCTION_OFF + 5 + ki] = level / 2.0  # 0, 0.5, or 1.0
         has_ulti = contract_components is not None and "ulti" in contract_components
         x[_AUCTION_OFF + 9] = 1.0 if has_ulti else 0.0

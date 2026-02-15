@@ -13,8 +13,8 @@ Usage (play):
     player = HybridPlayer(game, net_wrapper, endgame_tricks=6)
     action = player.choose_action(state, player_idx, rng)
 
-Usage (training — returns policy target):
-    pi, action = player.choose_action_with_policy(state, player_idx, rng)
+Usage (training — returns policy target + solver value):
+    pi, action, sv = player.choose_action_with_policy(state, player_idx, rng)
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ class HybridPlayer:
         )
 
     # ------------------------------------------------------------------
-    #  Public API: training (returns policy + action)
+    #  Public API: training (returns policy + action + optional value)
     # ------------------------------------------------------------------
 
     def choose_action_with_policy(
@@ -143,11 +143,15 @@ class HybridPlayer:
         state: UltiNode,
         player: int,
         rng: random.Random,
-    ) -> tuple[np.ndarray, Card]:
+    ) -> tuple[np.ndarray, Card, float | None]:
         """Pick action and return a policy target for training.
 
-        Returns ``(pi, action)`` where ``pi`` is an ``(action_space,)``
-        probability distribution and ``action`` is sampled from it.
+        Returns ``(pi, action, solver_value)`` where:
+        - ``pi`` is an ``(action_space,)`` probability distribution
+        - ``action`` is sampled from it
+        - ``solver_value`` is the PIMC position value from the
+          **soloist's perspective** when the solver is used (endgame),
+          or ``None`` when MCTS is used (opening).
         """
         legal = self.game.legal_actions(state)
         action_space = self.game.action_space_size
@@ -156,13 +160,15 @@ class HybridPlayer:
             pi = np.zeros(action_space, dtype=np.float64)
             if legal:
                 pi[self.game.action_to_index(legal[0])] = 1.0
-            return pi, legal[0] if legal else None
+            return pi, (legal[0] if legal else None), None
 
         if self._in_endgame(state):
             return self._solve_policy(state, player, rng)
-        return alpha_mcts_policy(
+
+        pi, action = alpha_mcts_policy(
             state, self.game, self.net, player, self.mcts_config, rng,
         )
+        return pi, action, None
 
     # ------------------------------------------------------------------
     #  PIMC + exact solver internals
@@ -208,14 +214,25 @@ class HybridPlayer:
         state: UltiNode,
         player: int,
         rng: random.Random,
-    ) -> tuple[np.ndarray, Card]:
-        """Solver-derived policy + sampled action for training."""
+    ) -> tuple[np.ndarray, Card, float]:
+        """Solver-derived policy + sampled action + position value.
+
+        The position value is the minimax value from the **soloist's
+        perspective**, averaged over PIMC determinizations.
+        """
         legal = self.game.legal_actions(state)
         action_space = self.game.action_space_size
         avg = self._pimc_values(state, player, rng)
 
         is_max = (player == state.gs.soloist)
         pi = self._values_to_policy(avg, action_space, is_max)
+
+        # Position value = best the current player can achieve
+        # (values are always from soloist's perspective)
+        if avg:
+            pos_value = max(avg.values()) if is_max else min(avg.values())
+        else:
+            pos_value = 0.0
 
         # Sample action from the policy
         indices = [self.game.action_to_index(c) for c in legal]
@@ -225,9 +242,9 @@ class HybridPlayer:
         # Find corresponding Card
         for c in legal:
             if self.game.action_to_index(c) == chosen_idx:
-                return pi, c
+                return pi, c, pos_value
 
-        return pi, legal[0]  # fallback
+        return pi, legal[0], pos_value  # fallback
 
     def _values_to_policy(
         self,

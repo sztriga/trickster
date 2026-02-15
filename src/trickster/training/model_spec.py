@@ -47,11 +47,11 @@ def model_id(spec: ModelSpec) -> str:
     return f"{canon['kind']}-{h[:10]}"
 
 
-def model_dir(spec: ModelSpec, *, root: str | Path = "models") -> Path:
+def model_dir(spec: ModelSpec, *, root: str | Path = "models/snapszer") -> Path:
     return Path(root) / model_id(spec)
 
 
-def write_spec(spec: ModelSpec, *, root: str | Path = "models") -> Path:
+def write_spec(spec: ModelSpec, *, root: str | Path = "models/snapszer") -> Path:
     d = model_dir(spec, root=root)
     d.mkdir(parents=True, exist_ok=True)
     p = d / "spec.json"
@@ -64,7 +64,7 @@ def read_spec(path: str | Path) -> ModelSpec:
     return ModelSpec(kind=obj["kind"], params=obj.get("params", {}), game=obj.get("game", "snapszer"), method=obj.get("method", "direct"))
 
 
-def list_model_dirs(*, root: str | Path = "models") -> List[Path]:
+def list_model_dirs(*, root: str | Path = "models/snapszer") -> List[Path]:
     r = Path(root)
     if not r.exists():
         return []

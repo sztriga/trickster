@@ -30,6 +30,7 @@ class MCTSConfig:
                                   # False = AlphaGo  (random rollout eval)
     use_policy_priors: bool = True  # False = uniform priors (for training)
     visit_temp: float = 1.0  # temperature for visit distribution (< 1 = sharper)
+    leaf_batch_size: int = 1  # >1 enables batched NN eval with virtual loss
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +272,229 @@ def _run_mcts(
 
 
 # ---------------------------------------------------------------------------
+#  Batched MCTS — virtual loss + batched NN evaluation
+# ---------------------------------------------------------------------------
+
+_VIRTUAL_LOSS = 1.0
+
+
+def _run_mcts_batched(
+    state: Any,
+    game: GameInterface,
+    net: AlphaNet,
+    perspective: int,
+    config: MCTSConfig,
+    rollout_rng: random.Random | None = None,
+) -> tuple[dict[Any, float], float]:
+    """MCTS with batched leaf evaluation using virtual loss.
+
+    Instead of evaluating one leaf per simulation, collects up to
+    ``config.leaf_batch_size`` leaves, applies virtual loss to
+    discourage path collisions, then batch-evaluates via
+    ``net.predict_both_batch``.  This amortises per-call PyTorch
+    overhead and can speed up the NN portion by ~10-15x.
+
+    Falls back to sequential evaluation if the net does not expose
+    ``predict_both_batch``.
+    """
+    actions = game.legal_actions(state)
+    if len(actions) <= 1:
+        return {a: 1.0 for a in actions}, 0.0
+
+    # -- Root setup (identical to sequential version) --
+    player = game.current_player(state)
+    K = len(actions)
+    if config.use_policy_priors:
+        state_feats = game.encode_state(state, player)
+        mask = game.legal_action_mask(state)
+        full_priors = net.predict_policy(state_feats, mask)
+        priors = np.array([full_priors[game.action_to_index(a)] for a in actions])
+        p_sum = priors.sum()
+        if p_sum > 0:
+            priors /= p_sum
+        else:
+            priors = np.full(K, 1.0 / K)
+    else:
+        priors = np.full(K, 1.0 / K)
+
+    if config.dirichlet_alpha > 0:
+        noise = np.random.dirichlet([config.dirichlet_alpha] * K)
+        w = config.dirichlet_weight
+        priors = (1.0 - w) * priors + w * noise
+
+    root = _Node(player=player)
+    root.visits = 1
+    for i, a in enumerate(actions):
+        child = _Node(player=player, action=a, parent=root, prior=float(priors[i]))
+        root.children.append(child)
+
+    node_states: dict[int, Any] = {id(root): state}
+
+    _same_team = game.same_team
+    perspective_allies = frozenset(
+        p for p in range(game.num_players)
+        if _same_team(state, p, perspective)
+    )
+
+    c_puct = config.c_puct
+    batch_sz = config.leaf_batch_size
+    use_policy = config.use_policy_priors
+    use_value = config.use_value_head
+    VL = _VIRTUAL_LOSS
+
+    _game_apply = game.apply
+    _game_is_terminal = game.is_terminal
+    _game_legal = game.legal_actions
+    _game_current = game.current_player
+    _game_outcome = game.outcome
+    _game_encode = game.encode_state
+    _game_mask = game.legal_action_mask
+    _game_a2i = game.action_to_index
+
+    _batch_fn = getattr(net, "predict_both_batch", None)
+    total_sims = config.simulations
+    sims_done = 0
+
+    while sims_done < total_sims:
+        B = min(batch_sz, total_sims - sims_done)
+
+        # -- Phase 1: Select B leaves, apply virtual loss --
+        pending: list[tuple[_Node, Any]] = []  # (leaf, leaf_state)
+
+        for _ in range(B):
+            leaf = _select(root, c_puct)
+
+            # Lazy state computation
+            leaf_id = id(leaf)
+            leaf_state = node_states.get(leaf_id)
+            if leaf_state is None:
+                p_state = node_states.get(id(leaf.parent))
+                if p_state is None:
+                    continue
+                leaf_state = _game_apply(p_state, leaf.action)
+                node_states[leaf_id] = leaf_state
+
+            # Virtual loss: inflate visits + pessimistic value
+            node: _Node | None = leaf
+            while node is not None:
+                node.visits += 1
+                node.value_sum -= VL
+                node = node.parent
+
+            pending.append((leaf, leaf_state))
+
+        if not pending:
+            sims_done += B
+            continue
+
+        # -- Phase 2: Classify leaves --
+        values: list[float] = [0.0] * len(pending)
+        # nn_jobs: (pending_idx, leaf_player, leaf_actions | None, feats, mask)
+        nn_jobs: list[tuple[int, int, list | None, Any, Any]] = []
+
+        for idx, (leaf, ls) in enumerate(pending):
+            if _game_is_terminal(ls):
+                values[idx] = _game_outcome(ls, perspective)
+            elif use_policy or use_value:
+                lp = _game_current(ls)
+                la = None if leaf.children else _game_legal(ls)
+                feats = _game_encode(ls, lp)
+                m = _game_mask(ls)
+                nn_jobs.append((idx, lp, la, feats, m))
+            else:
+                values[idx] = _random_rollout(
+                    ls, game, perspective,
+                    rollout_rng or random.Random(),
+                )
+
+        # -- Phase 3: Batch NN evaluation --
+        if nn_jobs:
+            feats_batch = [j[3] for j in nn_jobs]
+            masks_batch = [j[4] for j in nn_jobs]
+
+            if _batch_fn is not None and len(nn_jobs) > 1:
+                nn_vals, nn_probs = _batch_fn(feats_batch, masks_batch)
+            else:
+                # Sequential fallback
+                nn_vals = np.empty(len(nn_jobs))
+                nn_probs_list = []
+                for j_idx in range(len(nn_jobs)):
+                    v_s, p_s = net.predict_both(
+                        nn_jobs[j_idx][3], nn_jobs[j_idx][4],
+                    )
+                    nn_vals[j_idx] = v_s
+                    nn_probs_list.append(p_s)
+                nn_probs = np.stack(nn_probs_list)
+
+            for j_idx, (idx, lp, la, _f, _m) in enumerate(nn_jobs):
+                leaf = pending[idx][0]
+
+                # Expand if not already expanded (collision guard)
+                if la is not None and not leaf.children:
+                    leaf_K = len(la)
+                    if use_policy:
+                        full_p = nn_probs[j_idx]
+                        cp = np.array([full_p[_game_a2i(a)] for a in la])
+                        cp_sum = cp.sum()
+                        if cp_sum > 0:
+                            cp /= cp_sum
+                        else:
+                            cp = np.full(leaf_K, 1.0 / leaf_K)
+                    else:
+                        cp = np.full(leaf_K, 1.0 / leaf_K)
+
+                    for i, a in enumerate(la):
+                        child = _Node(
+                            player=lp, action=a, parent=leaf,
+                            prior=float(cp[i]),
+                        )
+                        leaf.children.append(child)
+
+                # Value: NN returns from leaf player's perspective
+                v_nn = float(nn_vals[j_idx])
+                values[idx] = v_nn if lp in perspective_allies else -v_nn
+
+        # -- Phase 4: Undo virtual loss, apply real backprop --
+        for idx, (leaf, _ls) in enumerate(pending):
+            v = values[idx]
+            node = leaf
+            while node is not None:
+                node.value_sum += VL  # undo pessimism
+                if node.player in perspective_allies:
+                    node.value_sum += v
+                else:
+                    node.value_sum -= v
+                node = node.parent
+
+        sims_done += len(pending)
+
+    visits = {ch.action: ch.visits for ch in root.children}
+    root_value = root.value_sum / root.visits if root.visits > 0 else 0.0
+    return visits, root_value
+
+
+# ---------------------------------------------------------------------------
+#  Dispatch: pick sequential or batched _run_mcts
+# ---------------------------------------------------------------------------
+
+
+def _run_mcts_dispatch(
+    state: Any,
+    game: GameInterface,
+    net: AlphaNet,
+    perspective: int,
+    config: MCTSConfig,
+    rollout_rng: random.Random | None = None,
+) -> tuple[dict[Any, float], float]:
+    """Route to batched or sequential MCTS based on config."""
+    if config.leaf_batch_size > 1:
+        return _run_mcts_batched(
+            state, game, net, perspective, config, rollout_rng,
+        )
+    return _run_mcts(state, game, net, perspective, config, rollout_rng)
+
+
+# ---------------------------------------------------------------------------
 #  Public API — determinized AlphaZero MCTS
 # ---------------------------------------------------------------------------
 
@@ -292,7 +516,7 @@ def alpha_mcts_choose(
     for _ in range(config.determinizations):
         det = game.determinize(state, player, rng)
         rollout_rng = random.Random(rng.randrange(1 << 30))
-        visits, _rv = _run_mcts(det, game, net, player, config, rollout_rng)
+        visits, _rv = _run_mcts_dispatch(det, game, net, player, config, rollout_rng)
         for act, cnt in visits.items():
             total[act] = total.get(act, 0.0) + cnt
 
@@ -325,7 +549,7 @@ def alpha_mcts_policy(
     for _ in range(config.determinizations):
         det = game.determinize(state, player, rng)
         rollout_rng = random.Random(rng.randrange(1 << 30))
-        visits, _rv = _run_mcts(det, game, net, player, config, rollout_rng)
+        visits, _rv = _run_mcts_dispatch(det, game, net, player, config, rollout_rng)
         for act, cnt in visits.items():
             total[act] = total.get(act, 0.0) + cnt
 
