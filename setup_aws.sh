@@ -17,11 +17,18 @@ if [ "$OS" = "Linux" ]; then
         sudo apt-get install -y -qq python3-pip python3-venv python3-dev gcc > /dev/null 2>&1
         echo "  Done (apt)."
     elif command -v dnf &> /dev/null; then
-        sudo dnf install -y -q python3-pip python3-devel gcc > /dev/null 2>&1
-        echo "  Done (dnf)."
+        sudo dnf install -y -q python3.11 python3.11-pip python3.11-devel gcc > /dev/null 2>&1
+        # Make python3.11 the default python3 if system python is too old
+        if python3 --version 2>&1 | grep -qE '3\.(8|9)'; then
+            sudo alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 2>/dev/null || true
+        fi
+        echo "  Done (dnf, Python 3.11)."
     elif command -v yum &> /dev/null; then
-        sudo yum install -y -q python3-pip python3-devel gcc > /dev/null 2>&1
-        echo "  Done (yum)."
+        sudo yum install -y -q python3.11 python3.11-pip python3.11-devel gcc > /dev/null 2>&1
+        if python3 --version 2>&1 | grep -qE '3\.(8|9)'; then
+            sudo alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 2>/dev/null || true
+        fi
+        echo "  Done (yum, Python 3.11)."
     else
         echo "  WARNING: No supported package manager found. Install python3-dev and gcc manually."
     fi
@@ -38,8 +45,10 @@ fi
 
 # ── Virtual environment ──────────────────────────────
 echo "[2/5] Creating virtual environment..."
+# Prefer python3.11 if available (Amazon Linux ships with 3.9)
+PY=$(command -v python3.11 || command -v python3)
 if [ ! -d ".venv" ]; then
-    python3 -m venv .venv
+    $PY -m venv .venv
 fi
 source .venv/bin/activate
 pip install --upgrade pip -q
