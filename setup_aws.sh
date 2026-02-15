@@ -12,9 +12,19 @@ OS="$(uname -s)"
 # ── System dependencies ──────────────────────────────
 echo "[1/5] Installing system dependencies..."
 if [ "$OS" = "Linux" ]; then
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq python3-pip python3-venv python3-dev gcc > /dev/null 2>&1
-    echo "  Done (apt)."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq python3-pip python3-venv python3-dev gcc > /dev/null 2>&1
+        echo "  Done (apt)."
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y -q python3-pip python3-devel gcc > /dev/null 2>&1
+        echo "  Done (dnf)."
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y -q python3-pip python3-devel gcc > /dev/null 2>&1
+        echo "  Done (yum)."
+    else
+        echo "  WARNING: No supported package manager found. Install python3-dev and gcc manually."
+    fi
 elif [ "$OS" = "Darwin" ]; then
     # macOS: assume Xcode CLI tools are installed (provides gcc/clang)
     if ! command -v python3 &> /dev/null; then
