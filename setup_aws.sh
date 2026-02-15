@@ -2,18 +2,32 @@
 set -euo pipefail
 
 echo "============================================"
-echo "  Trickster — AWS Setup"
+echo "  Trickster — Setup"
 echo "============================================"
 echo ""
 
+# ── Detect OS ────────────────────────────────────────
+OS="$(uname -s)"
+
 # ── System dependencies ──────────────────────────────
-echo "[1/4] Installing system dependencies..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq python3-pip python3-venv python3-dev gcc > /dev/null 2>&1
-echo "  Done."
+echo "[1/5] Installing system dependencies..."
+if [ "$OS" = "Linux" ]; then
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq python3-pip python3-venv python3-dev gcc > /dev/null 2>&1
+    echo "  Done (apt)."
+elif [ "$OS" = "Darwin" ]; then
+    # macOS: assume Xcode CLI tools are installed (provides gcc/clang)
+    if ! command -v python3 &> /dev/null; then
+        echo "  ERROR: python3 not found. Install via brew: brew install python"
+        exit 1
+    fi
+    echo "  Done (macOS — using system toolchain)."
+else
+    echo "  WARNING: Unknown OS '$OS'. Skipping system deps."
+fi
 
 # ── Virtual environment ──────────────────────────────
-echo "[2/4] Creating virtual environment..."
+echo "[2/5] Creating virtual environment..."
 if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi
@@ -22,40 +36,54 @@ pip install --upgrade pip -q
 echo "  Done. Using $(python3 --version)"
 
 # ── Python dependencies ──────────────────────────────
-echo "[3/4] Installing Python packages..."
+echo "[3/5] Installing Python packages..."
 pip install -q torch --index-url https://download.pytorch.org/whl/cpu
 pip install -q numpy cython fastapi uvicorn
 pip install -e . -q
 echo "  Done."
 
 # ── Cython solver ────────────────────────────────────
-echo "[4/4] Building Cython alpha-beta solver..."
-python3 setup_cython.py build_ext --inplace 2>&1 | tail -1
-python3 -c "from trickster._solver_core import solve_root; print('  Cython solver: OK')"
+echo "[4/5] Building Cython alpha-beta solver..."
+python3 setup_cython.py build_ext --inplace 2>&1 | tail -3
+echo ""
 
 # ── Verify ───────────────────────────────────────────
+echo "[5/5] Running verification..."
+FAIL=0
+
+python3 -c "import torch; print(f'  PyTorch {torch.__version__}: OK')" || FAIL=1
+python3 -c "import numpy; print(f'  NumPy {numpy.__version__}: OK')" || FAIL=1
+python3 -c "from trickster._solver_core import solve_root; print('  Cython solver: OK')" || FAIL=1
+python3 -c "
+from trickster.training.tiers import TIERS
+from trickster.training.model_io import resolve_paths
+from trickster.training.contract_loop import train_one_tier
+from trickster.training.bidding_loop import train_with_bidding
+from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
+print(f'  Training modules: OK ({len(TIERS)} tiers, solver={SOLVER_ENGINE})')
+" || FAIL=1
+
+if [ "$FAIL" -ne 0 ]; then
+    echo ""
+    echo "  ERROR: Some checks failed. See above."
+    exit 1
+fi
+
+CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "4")
+
 echo ""
 echo "============================================"
-echo "  Setup complete!"
+echo "  Setup complete! ($CORES cores detected)"
 echo "============================================"
 echo ""
 echo "  Activate the environment:"
 echo "    source .venv/bin/activate"
 echo ""
-echo "  Example commands:"
+echo "  Train:"
+echo "    python3 scripts/train_e2e.py scout --workers $CORES"
+echo "    python3 scripts/train_e2e.py knight --workers $CORES"
+echo "    python3 scripts/train_e2e.py bishop --workers $CORES"
 echo ""
-echo "  # Train scout (fast, ~3 min)"
-echo "  python3 scripts/train_e2e.py scout --workers \$(nproc)"
-echo ""
-echo "  # Train knight (~25 min)"
-echo "  python3 scripts/train_e2e.py knight --workers \$(nproc)"
-echo ""
-echo "  # Train bishop (~1h)"
-echo "  python3 scripts/train_e2e.py bishop --workers \$(nproc)"
-echo ""
-echo "  # Evaluate bishop vs knight"
-echo "  python3 scripts/eval_bidding.py --seats bishop knight knight --games 10000 --workers \$(nproc)"
-echo ""
-echo "  # Evaluate with deeper search"
-echo "  python3 scripts/eval_bidding.py --seats bishop knight knight --games 2000 --speed normal --workers \$(nproc)"
+echo "  Evaluate:"
+echo "    python3 scripts/eval_bidding.py --seats bishop knight knight --games 10000 --workers $CORES"
 echo ""
