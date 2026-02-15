@@ -840,7 +840,7 @@ def train_ulti_hybrid(
                 def_count = 0
 
                 for _ in range(n_train):
-                    states, masks, policies, rewards, is_sol = buffer.sample(
+                    states, masks, policies, rewards, is_sol, _on_pol = buffer.sample(
                         cfg.batch_size, np_rng,
                     )
 

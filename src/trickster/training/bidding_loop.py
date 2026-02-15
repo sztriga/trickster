@@ -18,6 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
+import logging
 import math
 import random
 import time
@@ -150,12 +151,16 @@ class BiddingTrainConfig:
 
     # -- Bidding --
     max_discards: int = 15        # discard pairs per contract eval
-    min_bid_pts: float = -2.0     # minimum stakes pts to accept a bid (vs pass)
+    min_bid_pts: float = -2.0     # minimum expected pts/defender to bid (matches pass penalty)
     pass_penalty: float = 2.0     # pts per defender when everyone passes
     exploration_frac: float = 0.2  # fraction of games with random contract
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
+
+    # -- Opponent pool --
+    opponent_pool: list[str] = field(default_factory=list)  # e.g. ["scout", "knight"]
+    pool_frac: float = 0.5         # fraction of games played vs pool opponents
 
     # -- Contracts to train (model keys) --
     # Parti is included because Piros Parti is the first playable game.
@@ -220,13 +225,15 @@ class BiddingTrainStats:
 _BW_GAME: UltiGame | None = None
 _BW_NETS: dict[str, UltiNet] = {}
 _BW_WRAPPERS: dict[str, UltiNetWrapper] = {}
+_BW_POOL_WRAPPERS: list[dict[str, UltiNetWrapper]] = []
 
 
 def _init_bidding_worker(
     net_kwargs: dict, contract_keys: list[str], device: str,
+    pool_sources: list[str] | None = None,
 ) -> None:
     """Called once per worker process to create game + per-contract networks."""
-    global _BW_GAME, _BW_NETS, _BW_WRAPPERS
+    global _BW_GAME, _BW_NETS, _BW_WRAPPERS, _BW_POOL_WRAPPERS
     _BW_GAME = UltiGame()
     _BW_NETS = {}
     _BW_WRAPPERS = {}
@@ -234,6 +241,14 @@ def _init_bidding_worker(
         net = UltiNet(**net_kwargs)
         _BW_NETS[key] = net
         _BW_WRAPPERS[key] = UltiNetWrapper(net, device=device)
+
+    _BW_POOL_WRAPPERS = []
+    if pool_sources:
+        from trickster.training.model_io import load_wrappers
+        for source in pool_sources:
+            pw = load_wrappers(source, device=device)
+            if pw:
+                _BW_POOL_WRAPPERS.append(pw)
 
 
 def _play_bidding_game_in_worker(
@@ -249,9 +264,15 @@ def _play_bidding_game_in_worker(
     # Reconstruct a lightweight cfg from dict
     cfg = BiddingTrainConfig(**cfg_dict)
 
+    # Pool opponent selection
+    opp_w = None
+    if _BW_POOL_WRAPPERS and random.Random(seed).random() < cfg.pool_frac:
+        opp_w = random.Random(seed).choice(_BW_POOL_WRAPPERS)
+
     return _play_one_bidding_game(
         _BW_GAME, _BW_WRAPPERS, sol_mcts_cfg, def_mcts_cfg, seed, cfg,
         exploration=exploration,
+        opp_wrappers=opp_w,
     )
 
 
@@ -366,8 +387,16 @@ def _play_one_bidding_game(
     seed: int,
     cfg: BiddingTrainConfig,
     exploration: bool = False,
+    opp_wrappers: dict[str, UltiNetWrapper] | None = None,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]]:
     """Play one game with value-head bidding.
+
+    Parameters
+    ----------
+    opp_wrappers : optional
+        When provided, defenders use these wrappers for play and kontra
+        decisions instead of *wrappers*.  Only soloist samples are
+        collected (defender policy is off-policy for the training model).
 
     Returns (display_key, samples) where display_key encodes both
     the contract and whether it's piros (e.g. "p.parti", "ulti").
@@ -376,6 +405,7 @@ def _play_one_bidding_game(
     rng = random.Random(seed)
     dealer = seed % 3
     soloist = next_player(dealer)
+    pool_game = opp_wrappers is not None
 
     # 1. Deal 12 cards
     gs, talon = deal(seed=seed, dealer=dealer)
@@ -406,23 +436,30 @@ def _play_one_bidding_game(
     # 4. Setup game state from the bid
     state = _setup_bid_game(game, gs, soloist, dealer, bid)
 
-    # 5. Get the right wrapper for play
-    wrapper = wrappers.get(bid.contract_key)
-    if wrapper is None:
-        wrapper = next(iter(wrappers.values()))
+    # 5. Get wrappers for play
+    sol_wrapper = wrappers.get(bid.contract_key)
+    if sol_wrapper is None:
+        sol_wrapper = next(iter(wrappers.values()))
+
+    if pool_game:
+        def_wrapper = opp_wrappers.get(bid.contract_key)
+        if def_wrapper is None:
+            def_wrapper = sol_wrapper  # fallback to training model
+    else:
+        def_wrapper = sol_wrapper
 
     soloist_idx = state.gs.soloist
 
     # 6. Play the game
     sol_hybrid = HybridPlayer(
-        game, wrapper,
+        game, sol_wrapper,
         mcts_config=sol_cfg,
         endgame_tricks=cfg.endgame_tricks,
         pimc_determinizations=cfg.pimc_dets,
         solver_temperature=cfg.solver_temp,
     )
     def_hybrid = HybridPlayer(
-        game, wrapper,
+        game, def_wrapper,
         mcts_config=def_cfg,
         endgame_tricks=cfg.endgame_tricks,
         pimc_determinizations=cfg.pimc_dets,
@@ -440,7 +477,8 @@ def _play_one_bidding_game(
             and state.gs.trick_no == 1
         ):
             kontra_done = True
-            _decide_kontra(game, state, wrapper, bid.contract_key)
+            # Defenders decide kontra using their own model
+            _decide_kontra(game, state, def_wrapper, bid.contract_key)
 
         player = game.current_player(state)
         actions = game.legal_actions(state)
@@ -458,6 +496,11 @@ def _play_one_bidding_game(
                 state, player, rng,
             )
 
+        # Always collect trajectory.  In pool games, defender positions
+        # are marked off-policy: their value target is still valid (the
+        # game outcome is objective) but the policy target comes from a
+        # different model.  The SGD loop will skip policy loss for these.
+        is_on_policy = not pool_game or player == soloist_idx
         state_feats = game.encode_state(state, player)
         mask = game.legal_action_mask(state)
         trajectory.append((
@@ -466,15 +509,16 @@ def _play_one_bidding_game(
             np.asarray(pi, dtype=np.float32).copy(),
             player,
             player == soloist_idx,
+            is_on_policy,
         ))
 
         state = game.apply(state, action)
 
     # 7. Label with outcome
-    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]] = []
-    for state_feats, mask, pi, player, is_sol in trajectory:
+    samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool, bool]] = []
+    for state_feats, mask, pi, player, is_sol, on_pol in trajectory:
         reward = simple_outcome(state, player)
-        samples.append((state_feats, mask, pi, reward, is_sol))
+        samples.append((state_feats, mask, pi, reward, is_sol, on_pol))
 
     return dkey, samples
 
@@ -535,6 +579,23 @@ def train_with_bidding(
     use_gpu = device != "cpu"
     wrappers = {key: slot.wrapper for key, slot in slots.items()}
 
+    # -- Opponent pool (frozen, pre-trained models) --
+    pool_wrappers_list: list[dict[str, UltiNetWrapper]] = []
+    if cfg.opponent_pool:
+        from trickster.training.model_io import load_wrappers
+        for source in cfg.opponent_pool:
+            pw = load_wrappers(source, device="cpu")
+            if pw:
+                pool_wrappers_list.append(pw)
+                logging.info("Pool opponent loaded: %s (%d contracts)", source, len(pw))
+            else:
+                logging.warning("Pool opponent '%s' — no models found, skipping", source)
+        if pool_wrappers_list:
+            logging.info(
+                "Opponent pool ready: %d sources, %.0f%% of games",
+                len(pool_wrappers_list), cfg.pool_frac * 100,
+            )
+
     # -- MCTS configs --
     sol_cfg = MCTSConfig(
         simulations=cfg.sol_sims,
@@ -560,6 +621,7 @@ def train_with_bidding(
     )
 
     np_rng = np.random.default_rng(cfg.seed)
+    pool_rng = random.Random(cfg.seed + 777)   # for pool opponent selection
     t0 = time.perf_counter()
 
     stats = BiddingTrainStats(total_steps=cfg.steps)
@@ -605,6 +667,7 @@ def train_with_bidding(
         "num_workers": 1,
         "seed": cfg.seed,
         "device": "cpu",
+        "pool_frac": cfg.pool_frac,
     }
     if cfg.num_workers > 1:
         from concurrent.futures import ProcessPoolExecutor
@@ -612,7 +675,8 @@ def train_with_bidding(
         executor = ProcessPoolExecutor(
             max_workers=cfg.num_workers,
             initializer=_init_bidding_worker,
-            initargs=(net_kwargs, cfg.contract_keys, "cpu"),
+            initargs=(net_kwargs, cfg.contract_keys, "cpu",
+                      cfg.opponent_pool if cfg.opponent_pool else None),
         )
 
     try:
@@ -644,8 +708,8 @@ def train_with_bidding(
                 # Route samples to the model's buffer
                 mkey = _model_key(dkey)
                 slot = slots[mkey]
-                for s, m, p, r, is_sol in samples:
-                    slot.buffer.push(s, m, p, r, is_soloist=is_sol)
+                for s, m, p, r, is_sol, on_pol in samples:
+                    slot.buffer.push(s, m, p, r, is_soloist=is_sol, on_policy=on_pol)
                 slot.samples += len(samples)
                 slot.games += 1
 
@@ -653,7 +717,7 @@ def train_with_bidding(
                 step_dk_games[dkey] = step_dk_games.get(dkey, 0) + 1
                 cum_dk_games[dkey] = cum_dk_games.get(dkey, 0) + 1
 
-                sol_r = [r for _, _, _, r, is_sol in samples if is_sol]
+                sol_r = [r for _, _, _, r, is_sol, _ in samples if is_sol]
                 if sol_r:
                     step_dk_pts[dkey] = step_dk_pts.get(dkey, 0.0) + sol_r[0]
                     cum_dk_pts[dkey] = cum_dk_pts.get(dkey, 0.0) + sol_r[0]
@@ -698,9 +762,15 @@ def train_with_bidding(
                     game_seed = cfg.seed + step * 1000 + g
                     exploration = (g / cfg.games_per_step) < cfg.exploration_frac
 
+                    # Decide whether this game uses a pool opponent
+                    opp_w = None
+                    if pool_wrappers_list and pool_rng.random() < cfg.pool_frac:
+                        opp_w = pool_rng.choice(pool_wrappers_list)
+
                     dkey, samples = _play_one_bidding_game(
                         game, wrappers, sol_cfg, def_cfg, game_seed, cfg,
                         exploration=exploration,
+                        opp_wrappers=opp_w,
                     )
                     _collect_result(dkey, samples)
 
@@ -725,7 +795,7 @@ def train_with_bidding(
                 acc_ploss = 0.0
 
                 for _ in range(n_train):
-                    states, masks, policies, rewards, is_sol = slot.buffer.sample(
+                    states, masks, policies, rewards, is_sol, on_pol = slot.buffer.sample(
                         effective_batch, np_rng,
                     )
 
@@ -734,11 +804,16 @@ def train_with_bidding(
                     pi_t = torch.from_numpy(policies).float().to(device)
                     z_t = torch.from_numpy(rewards).float().to(device)
                     is_sol_t = torch.from_numpy(is_sol).bool().to(device)
+                    on_pol_t = torch.from_numpy(on_pol).float().to(device)
 
                     log_probs, values = slot.net.forward_dual(s_t, m_t, is_sol_t)
 
                     value_loss = F.huber_loss(values, z_t, delta=1.0)
-                    policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
+                    # Off-policy samples (pool game defenders) contribute to
+                    # value loss but not policy loss — the policy target came
+                    # from a different model so it's not a valid gradient signal.
+                    per_sample_ploss = -(pi_t * log_probs).sum(dim=-1)
+                    policy_loss = (per_sample_ploss * on_pol_t).sum() / on_pol_t.sum().clamp(min=1)
                     loss = value_loss + policy_loss
 
                     slot.optimizer.zero_grad()

@@ -28,7 +28,7 @@ from trickster.games.ulti.adapter import (
 )
 from trickster.games.ulti.cards import Card, Rank, Suit
 from trickster.hybrid import HybridPlayer
-from trickster.mcts import MCTSConfig
+from trickster.mcts import MCTSConfig, _run_mcts_dispatch as _mcts_dispatch
 from trickster.model import UltiNetWrapper
 from trickster.training.model_io import (
     list_available_sources,
@@ -36,10 +36,13 @@ from trickster.training.model_io import (
 )
 
 log = logging.getLogger(__name__)
+from trickster.bidding.evaluator import evaluate_all_contracts, pick_best_bid
+from trickster.bidding.registry import BID_TO_CONTRACT, MAX_SUPPORTED_RANK
 from trickster.games.ulti.auction import (
     ALL_BIDS,
     AuctionState,
     Bid,
+    BID_BY_RANK,
     BID_PASSZ,
     COMP_100,
     COMP_20,
@@ -101,6 +104,18 @@ _ulti_game: UltiGame | None = None
 
 # Cache: source name → {contract_key → UltiNetWrapper}
 _wrapper_cache: dict[str, dict[str, UltiNetWrapper]] = {}
+
+# Reverse mapping: (contract_key, is_piros) → bid rank
+_CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
+    v: k for k, v in BID_TO_CONTRACT.items()
+}
+
+# Minimum expected pts/defender for the NN to bid.
+# Matches the pass penalty (-2/defender) so the AI bids whenever it
+# expects to do better than passing.  The value head should learn
+# over training that marginal hands get kontrad and punished.
+_BID_THRESHOLD = -2.0
+_BID_MAX_DISCARDS = 15
 
 
 def _get_ulti_game() -> UltiGame:
@@ -281,7 +296,14 @@ def _auction_history_json(
 #  Session
 # ---------------------------------------------------------------------------
 
-PLAYER_LABELS = ["Te", "Gép 1", "Gép 2"]
+def _player_labels(sess: "UltiSession") -> list[str]:
+    """Build per-seat display labels from opponent sources."""
+    opps = sess.opponent_sources
+    name1 = opps[0].capitalize()
+    name2 = opps[1].capitalize()
+    if opps[0] == opps[1]:
+        name2 = f"Dark {name2}"
+    return ["Te", name1, name2]
 
 
 @dataclass
@@ -291,6 +313,7 @@ class UltiSession:
     talon: list[Card]  # original deal talon (reference only)
     phase: str  # "bid"|"auction"|"trump_select"|"kontra"|"rekontra"|"play"|"done"
     seed: int
+    dealer: int = 0  # dealer index for this deal
     auction: Optional[AuctionState] = None
     winning_bid: Optional[Bid] = None
     # Per-component kontra levels (adu games — shared across defenders)
@@ -307,6 +330,8 @@ class UltiSession:
     bubbles: list[dict[str, Any]] = field(default_factory=list)
     # Model source for each AI seat: [seat1_source, seat2_source]
     opponent_sources: list[str] = field(default_factory=lambda: ["random", "random"])
+    # Trump chosen by NN bidding (used in _resolve_auction for non-red adu games)
+    nn_chosen_trump: Optional[Suit] = None
 
 
 _sessions: dict[str, UltiSession] = {}
@@ -413,7 +438,8 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
     settlement_data: dict[str, Any] | None = None
     if sess.phase == "done" and sess.winning_bid is not None:
         bid = sess.winning_bid
-        sol_label = PLAYER_LABELS[st.soloist]
+        labels = _player_labels(sess)
+        sol_label = labels[st.soloist]
 
         settlement = _compute_final_settlement(st, bid, sess.component_kontras)
         settlement_data = settlement
@@ -782,33 +808,154 @@ def _compute_final_settlement(
 # ---------------------------------------------------------------------------
 
 
+def _ai_nn_evaluate(sess: UltiSession, player: int) -> "ContractEval | None":
+    """Use the NN value heads to find the best contract for *player*.
+
+    The player must have 12 cards.  Returns the best ContractEval
+    (with discard + trump) or None if nothing beats the bid threshold.
+    """
+    from trickster.bidding.evaluator import ContractEval  # noqa: F811
+
+    source = sess.opponent_sources[player - 1]
+    wrappers = _get_wrappers(source)
+    if not wrappers:
+        return None
+
+    evals = evaluate_all_contracts(
+        sess.state, player, sess.dealer,
+        wrappers=wrappers,
+        max_discards=_BID_MAX_DISCARDS,
+    )
+    if not evals:
+        return None
+
+    return pick_best_bid(evals, min_stakes_pts=_BID_THRESHOLD)
+
+
+def _nn_eval_to_auction_bid(
+    ev: "ContractEval",
+    auction: AuctionState,
+) -> tuple[Bid, list[Card]] | None:
+    """Convert a ContractEval to an auction Bid + discards.
+
+    Returns None if the corresponding auction Bid is not legal
+    (e.g. too low to overbid the current holder).
+    """
+    bid_rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
+    if bid_rank is None:
+        return None
+
+    bid_obj = BID_BY_RANK.get(bid_rank)
+    if bid_obj is None:
+        return None
+
+    legal = legal_bids(auction)
+    if bid_obj not in legal:
+        return None
+
+    return bid_obj, list(ev.best_discard.discard)
+
+
+def _auction_no_overbid_possible(a: AuctionState) -> bool:
+    """True when the current bid is at or above the max supported rank.
+
+    No player (human or AI) can meaningfully overbid, so remaining
+    turns should auto-pass to finish the auction quickly.
+    """
+    return (
+        a.current_bid is not None
+        and a.current_bid.rank >= MAX_SUPPORTED_RANK
+        and not a.awaiting_bid
+    )
+
+
 def _advance_ai_auction(sess: UltiSession) -> None:
-    """Auto-play AI turns in the auction until it's the human's turn or done."""
+    """Auto-play AI turns in the auction until it's the human's turn or done.
+
+    Uses the NN value heads to decide bidding (which contract, discards,
+    trump) and whether to pick up the talon.  Falls back to heuristics
+    when no model is loaded for a seat.
+
+    When the highest supported bid has been reached, all remaining
+    players (including the human) auto-pass.
+    """
     a = sess.auction
     if a is None:
         return
 
-    while not a.done and a.turn != HUMAN:
+    while not a.done:
+        # Auto-pass everyone when no overbid is possible
+        if _auction_no_overbid_possible(a):
+            if a.turn == a.holder:
+                # Holder "stands" — auction ends
+                submit_pass(a, a.turn)
+            else:
+                submit_pass(a, a.turn)
+            continue
+
+        if a.turn == HUMAN:
+            break
+
         player = a.turn
         hand = sess.state.hands[player]
 
         if a.awaiting_bid:
-            # AI must discard + bid (first bid or after picking up)
-            if a.current_bid is None:
-                bid, discards = ai_initial_bid(hand)
+            # AI has 12 cards — must discard 2 and bid.
+            nn_eval = _ai_nn_evaluate(sess, player)
+
+            if nn_eval is not None:
+                result = _nn_eval_to_auction_bid(nn_eval, a)
             else:
-                bid, discards = ai_bid_after_pickup(hand, a)
-            # Remove discards from hand
+                result = None
+
+            if result is not None:
+                bid, discards = result
+                # Store trump for _resolve_auction
+                sess.nn_chosen_trump = nn_eval.trump
+                # Add bubble for non-Passz bids
+                if bid.rank > BID_PASSZ.rank:
+                    sess.bubbles.append({
+                        "player": player,
+                        "text": bid.label(),
+                    })
+            else:
+                # NN says pass (or no model) — fall back to heuristic Passz
+                if a.current_bid is None:
+                    bid, discards = ai_initial_bid(hand)
+                else:
+                    bid, discards = ai_bid_after_pickup(hand, a)
+
             for c in discards:
                 hand.remove(c)
             submit_bid(a, player, bid, discards)
+
         else:
-            # AI decides: pick up or pass
-            if ai_should_pickup(hand, a):
-                # Pick up talon
+            # AI has 10 cards — decide whether to pick up the talon.
+            should_pickup = False
+            source = sess.opponent_sources[player - 1]
+            wrappers = _get_wrappers(source)
+
+            if wrappers and can_pickup(a):
+                # Simulate pickup: evaluate 12-card hand with NN
+                sim_hand = hand + list(a.talon)
+                # Temporarily give player 12 cards for evaluation
+                orig_hand = sess.state.hands[player]
+                sess.state.hands[player] = sim_hand
+                try:
+                    nn_eval = _ai_nn_evaluate(sess, player)
+                    if nn_eval is not None:
+                        # Check if we can actually overbid
+                        result = _nn_eval_to_auction_bid(nn_eval, a)
+                        should_pickup = result is not None
+                finally:
+                    sess.state.hands[player] = orig_hand
+            elif not wrappers:
+                # No model — use heuristic
+                should_pickup = ai_should_pickup(hand, a)
+
+            if should_pickup:
                 hand.extend(a.talon)
                 submit_pickup(a, player)
-                # Next iteration will handle the bid (awaiting_bid=True)
             else:
                 submit_pass(a, player)
 
@@ -872,8 +1019,11 @@ def _resolve_auction(sess: UltiSession) -> None:
         if winner == HUMAN:
             sess.phase = "trump_select"
         else:
-            # AI chooses trump (most common non-Hearts suit).
-            trump = _ai_choose_trump(sess, winner)
+            # Use NN-chosen trump if available, otherwise heuristic.
+            if sess.nn_chosen_trump is not None:
+                trump = sess.nn_chosen_trump
+            else:
+                trump = _ai_choose_trump(sess, winner)
             _setup_contract(sess, bid, trump=trump)
             _start_play_phase(sess)
 
@@ -1232,6 +1382,7 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         talon=talon,
         phase="bid",
         seed=seed,
+        dealer=dealer,
         auction=auction,
         opponent_sources=opponents,
     )
@@ -1487,6 +1638,243 @@ def continue_game(game_id: str) -> dict[str, Any]:
     return _public_state(sess)
 
 
+# ---------------------------------------------------------------------------
+#  Analysis — AI evaluation of the current position
+# ---------------------------------------------------------------------------
+
+
+def _analyze_play(
+    sess: UltiSession,
+    source: str,
+    sims: int,
+    dets: int,
+) -> dict[str, Any]:
+    """Analyze the play phase: per-card scores via MCTS."""
+    contract_key = _contract_key_from_bid(sess.winning_bid)
+    wrappers = _get_wrappers(source)
+    wrapper = wrappers.get(contract_key) if wrappers else None
+    if wrapper is None:
+        return {"actions": [], "value": 0.0, "sims": 0}
+
+    game = _get_ulti_game()
+    node = _session_to_node(sess)
+    player = HUMAN
+
+    legal = game.legal_actions(node)
+    if len(legal) <= 1:
+        return {
+            "actions": [{"card": _card_json(legal[0]), "score": 1.0, "visits": 1, "best": True}] if legal else [],
+            "value": 0.0,
+            "sims": 0,
+        }
+
+    cfg = MCTSConfig(
+        simulations=sims,
+        determinizations=1,
+        c_puct=1.5,
+        dirichlet_alpha=0.0,
+        dirichlet_weight=0.0,
+        use_value_head=True,
+        use_policy_priors=True,
+        visit_temp=0.1,
+        leaf_batch_size=8,
+    )
+
+    rng = random.Random()
+    total_visits: dict[Card, float] = {c: 0.0 for c in legal}
+
+    for _ in range(dets):
+        det = game.determinize(node, player, rng)
+        rollout_rng = random.Random(rng.randrange(1 << 30))
+        visits, _rv = _mcts_dispatch(det, game, wrapper, player, cfg, rollout_rng)
+        for act, cnt in visits.items():
+            if act in total_visits:
+                total_visits[act] += cnt
+
+    # Normalise to [0, 1] relative scores
+    max_v = max(total_visits.values()) if total_visits else 1.0
+    min_v = min(total_visits.values()) if total_visits else 0.0
+    best_card = max(total_visits, key=total_visits.__getitem__) if total_visits else None
+
+    actions = []
+    for card in legal:
+        v = total_visits.get(card, 0.0)
+        score = (v - min_v) / max(max_v - min_v, 1e-9) if max_v > min_v else 0.5
+        actions.append({
+            "card": _card_json(card),
+            "score": round(score, 3),
+            "visits": int(v),
+            "best": card == best_card,
+        })
+
+    # Value from player's perspective
+    feats = game.encode_state(node, player)
+    value = float(wrapper.predict_value(feats))
+
+    return {"actions": actions, "value": round(value, 3), "sims": sims * dets}
+
+
+def _analyze_bid(
+    sess: UltiSession,
+    source: str,
+) -> dict[str, Any]:
+    """Analyze the bid/auction phase: per-contract expected points.
+
+    Works for two situations:
+    - Human has 12 cards (awaiting_bid): evaluate contracts directly.
+    - Human has 10 cards (pickup decision): simulate picking up the talon,
+      evaluate the resulting 12-card hand, and show what's available.
+    """
+    a = sess.auction
+    if not a or a.turn != HUMAN:
+        return {"contracts": [], "recommendation": "Várakozás…"}
+
+    wrappers = _get_wrappers(source)
+    if not wrappers:
+        return {"contracts": [], "recommendation": "Passz"}
+
+    hand_size = len(sess.state.hands[HUMAN])
+    restore_hand = None
+
+    if a.awaiting_bid and hand_size == 12:
+        # Human has 12 cards — evaluate directly
+        pass
+    elif not a.awaiting_bid and hand_size == 10 and a.talon:
+        # Human has 10 cards — simulate pickup for analysis
+        restore_hand = list(sess.state.hands[HUMAN])
+        sess.state.hands[HUMAN] = restore_hand + list(a.talon)
+    else:
+        return {"contracts": [], "recommendation": "Várakozás…"}
+
+    try:
+        evals = evaluate_all_contracts(
+            sess.state, HUMAN, sess.dealer,
+            wrappers=wrappers,
+            max_discards=_BID_MAX_DISCARDS,
+        )
+    finally:
+        if restore_hand is not None:
+            sess.state.hands[HUMAN] = restore_hand
+
+    # Filter to only legal overbids (rank must beat current bid)
+    min_rank = a.current_bid.rank if a.current_bid else 0
+    from trickster.games.ulti.auction import SUPPORTED_BID_RANKS
+
+    def _is_legal_eval(ev) -> bool:
+        rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
+        if rank is None:
+            return False
+        if rank not in SUPPORTED_BID_RANKS:
+            return False
+        return rank > min_rank
+
+    legal_evals = [ev for ev in evals if _is_legal_eval(ev)]
+
+    contracts = []
+    for ev in legal_evals[:8]:  # top 8 legal options
+        bid_rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
+        bid_obj = BID_BY_RANK.get(bid_rank) if bid_rank else None
+        d = ev.best_discard
+        contracts.append({
+            "contractKey": ev.contract_key,
+            "isPiros": ev.is_piros,
+            "trump": ev.trump.value if ev.trump else None,
+            "gamePts": round(ev.game_pts, 2),
+            "bidRank": bid_rank,
+            "bidLabel": bid_obj.label() if bid_obj else ev.contract_key,
+            "discard": [_card_json(d.discard[0]), _card_json(d.discard[1])],
+        })
+
+    # Best legal bid above threshold
+    best = next(
+        (ev for ev in legal_evals if ev.game_pts >= _BID_THRESHOLD),
+        None,
+    )
+    rec_discard = None
+    if best:
+        best_rank = _CONTRACT_TO_BID_RANK.get((best.contract_key, best.is_piros))
+        best_bid = BID_BY_RANK.get(best_rank) if best_rank else None
+        label = best_bid.label() if best_bid else best.contract_key
+        recommendation = f"{label} ({'+' if best.game_pts >= 0 else ''}{best.game_pts:.1f})"
+        rec_discard = [_card_json(best.best_discard.discard[0]),
+                       _card_json(best.best_discard.discard[1])]
+        # For pickup analysis, prefix with pickup hint
+        if restore_hand is not None:
+            recommendation = f"Felvesz → {recommendation}"
+    else:
+        recommendation = "Passz" if restore_hand is None else "Ne vedd fel"
+
+    return {
+        "contracts": contracts,
+        "recommendation": recommendation,
+        "recDiscard": rec_discard,
+    }
+
+
+def _analyze_kontra(
+    sess: UltiSession,
+    source: str,
+) -> dict[str, Any]:
+    """Analyze the kontra/rekontra phase: value-head evaluation."""
+    contract_key = _contract_key_from_bid(sess.winning_bid)
+    wrappers = _get_wrappers(source)
+    wrapper = wrappers.get(contract_key) if wrappers else None
+    if wrapper is None:
+        return {"value": 0.0, "recommendation": "pass"}
+
+    game = _get_ulti_game()
+    node = _session_to_node(sess)
+    feats = game.encode_state(node, HUMAN)
+    # Value head returns soloist-perspective value.
+    sol_value = float(wrapper.predict_value(feats))
+
+    is_soloist = (sess.state.soloist == HUMAN)
+    # Positive = good for soloist; for defender, negate
+    my_value = sol_value if is_soloist else -sol_value
+
+    if sess.phase == "kontra":
+        # Human is defender — kontra if position looks bad for soloist
+        rec = "kontra" if my_value > 0.0 else "pass"
+    else:
+        # Human is soloist — rekontra if position still good
+        rec = "rekontra" if my_value > 0.0 else "pass"
+
+    return {"value": round(my_value, 3), "recommendation": rec}
+
+
+@router.post("/{game_id}/analyze")
+def analyze(game_id: str, body: dict[str, Any] = {}) -> dict[str, Any]:
+    """Analyze current position with specified model.
+
+    Body: {"source": "bishop", "sims": 40, "dets": 2}
+
+    Returns analysis appropriate to the current phase:
+    - play:   per-card visit scores from MCTS
+    - bid:    per-contract expected points
+    - kontra: value-head recommendation
+    """
+    sess = _sessions.get(game_id)
+    if not sess:
+        raise HTTPException(404, "Game not found")
+
+    source = body.get("source", "scout")
+    sims = min(int(body.get("sims", 40)), 200)
+    dets = min(int(body.get("dets", 2)), 8)
+
+    if sess.phase == "play" and not sess.needs_continue:
+        result = _analyze_play(sess, source, sims, dets)
+    elif sess.phase in ("bid", "auction"):
+        result = _analyze_bid(sess, source)
+    elif sess.phase in ("kontra", "rekontra"):
+        result = _analyze_kontra(sess, source)
+    else:
+        result = {}
+
+    result["phase"] = sess.phase
+    result["source"] = source
+    return result
+
+
 @router.get("/models")
 def list_models() -> dict[str, Any]:
     """List available model sources for opponent selection.
@@ -1579,6 +1967,7 @@ def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         talon=list(gs.talon_discards),
         phase="play",
         seed=seed,
+        dealer=dealer,
         auction=None,
         winning_bid=parti_bid,
         component_kontras={"parti": 0},

@@ -68,10 +68,21 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--skip-base", action="store_true",
                         help="Skip Phase 1 (base models must already exist)")
+    parser.add_argument("--base-from", type=str, default=None,
+                        help="Load base models from a different tier (e.g. bronze)")
     parser.add_argument("--bidding-steps", type=int, default=None,
                         help="Override bidding training steps")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--opponent-pool", nargs="*", default=None,
+        help="Model sources for opponent pool (e.g. scout knight). "
+             "Defenders in pool games use a randomly chosen pool model.",
+    )
+    parser.add_argument(
+        "--pool-frac", type=float, default=0.5,
+        help="Fraction of games played vs pool opponents (default 0.5)",
+    )
     args = parser.parse_args()
 
     tier = TIERS[args.tier]
@@ -130,13 +141,17 @@ def main() -> None:
         print(f"  Phase 1 complete in {fmt_time(elapsed)}")
         print()
     else:
-        source = f"{tier_name}_base"
+        base_tier = args.base_from or tier_name
+        source = f"{base_tier}_base"
         paths = resolve_paths(source)
         missing = [k for k, p in paths.items() if not (p / "model.pt").exists()]
         if missing:
-            print(f"  ERROR: --skip-base but missing base models: {', '.join(missing)}")
+            print(f"  ERROR: --skip-base but missing base models ({source}): {', '.join(missing)}")
             sys.exit(1)
-        print(f"  Phase 1 skipped (using existing {source} models)")
+        if args.base_from:
+            print(f"  Phase 1 skipped (borrowing base models from {source})")
+        else:
+            print(f"  Phase 1 skipped (using existing {source} models)")
         print()
 
     # ── Phase 2: Bidding Training ──
@@ -147,7 +162,8 @@ def main() -> None:
 
     t_phase2 = time.perf_counter()
 
-    source = f"{tier_name}_base"
+    base_tier = args.base_from or tier_name
+    source = f"{base_tier}_base"
     model_paths = resolve_paths(source)
     initial_nets = {}
     print(f"  Loading base models ({source}):")
@@ -161,6 +177,7 @@ def main() -> None:
             print(f"    {key:<8} — not found, starting fresh")
     print()
 
+    pool_sources = args.opponent_pool or []
     cfg = BiddingTrainConfig(
         steps=bidding_steps,
         games_per_step=tier.e2e_gpi,
@@ -186,6 +203,8 @@ def main() -> None:
         num_workers=args.workers,
         seed=args.seed,
         device=args.device,
+        opponent_pool=pool_sources,
+        pool_frac=args.pool_frac,
     )
 
     e2e_reuse = (bidding_steps * cfg.train_steps * cfg.batch_size) / cfg.buffer_size
@@ -194,6 +213,11 @@ def main() -> None:
     print(f"  SGD: {cfg.train_steps}/step  buffer={cfg.buffer_size:,}  "
           f"batch={cfg.batch_size}  reuse={e2e_reuse:.0f}x")
     print(f"  Contracts: {', '.join(DK_LABELS[dk] for dk in DISPLAY_ORDER)}")
+    if pool_sources:
+        print(f"  Opponent pool: {', '.join(pool_sources)} "
+              f"({cfg.pool_frac:.0%} of games)")
+    else:
+        print("  Opponent pool: none (pure self-play)")
     print()
 
     progress_fn = (bidding_progress_verbose if args.verbose else bidding_progress_bar)(cfg)

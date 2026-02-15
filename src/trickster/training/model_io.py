@@ -68,6 +68,7 @@ _CONTRACT_META: dict[str, tuple[str, str]] = {
 _TIER_INDEX: dict[str, int] = {
     "scout":   1,
     "knight":  2,
+    "knight2": 14,
     "bishop":  3,
     "rook":    4,
     "captain": 5,

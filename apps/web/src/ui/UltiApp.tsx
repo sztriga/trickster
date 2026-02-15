@@ -1,13 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ultiAnalyze,
   ultiAuction,
   ultiBid,
   ultiContinue,
   ultiKontra,
+  ultiListModels,
   ultiNewGame,
   ultiPartiNew,
   ultiPlay,
   ultiTrump,
+  type AnalysisResult,
   type UltiCard,
   type UltiState,
 } from "./ulti-api";
@@ -19,7 +22,6 @@ const SUIT_SYMBOL: Record<string, string> = {
 const SUIT_NAME: Record<string, string> = {
   HEARTS: "Piros", BELLS: "Tök", LEAVES: "Zöld", ACORNS: "Makk",
 };
-const DEFAULT_LABELS = ["Te", "Gép 1", "Gép 2"];
 const KONTRA_LEVEL_LABEL: Record<number, string> = { 1: "Kontra", 2: "Rekontra" };
 
 /** Bid ranks for contracts we have trained models for.
@@ -87,10 +89,25 @@ export function UltiApp() {
   // Screen: "lobby" (opponent select) or "game" (in-game)
   const [screen, setScreen] = useState<"lobby" | "game">("lobby");
 
-  // Lobby state — only Scout is supported for now
-  const SUPPORTED_MODELS = useMemo(() => ["scout"], []);
-  const [opp1, setOpp1] = useState("scout");
-  const [opp2, setOpp2] = useState("scout");
+  // Lobby state — fetch available models from the server
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [opp1, setOpp1] = useState("");
+  const [opp2, setOpp2] = useState("");
+
+  useEffect(() => {
+    ultiListModels()
+      .then((models) => {
+        // Filter to e2e models only (no _base suffix)
+        const e2e = models.filter((m) => !m.endsWith("_base"));
+        setAvailableModels(e2e);
+        if (e2e.length > 0) {
+          setOpp1((prev) => prev || e2e[0]);
+          setOpp2((prev) => prev || e2e[0]);
+          setAnalysisSource((prev) => prev || e2e[e2e.length - 1]);
+        }
+      })
+      .catch(() => setAvailableModels([]));
+  }, []);
 
   const [state, setState] = useState<UltiState | null>(null);
   const [err, setErr] = useState("");
@@ -108,12 +125,24 @@ export function UltiApp() {
   // Dynamic player labels based on selected opponents
   const PLAYER_LABEL = useMemo(() => {
     const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-    return ["Te", capitalize(activeOpponents[0]), capitalize(activeOpponents[1])];
+    const name1 = capitalize(activeOpponents[0]);
+    const name2 = capitalize(activeOpponents[1]);
+    if (activeOpponents[0] === activeOpponents[1]) {
+      return ["Te", `${name1}`, `Dark ${name2}`];
+    }
+    return ["Te", name1, name2];
   }, [activeOpponents]);
 
   // Bid phase state (discard selection + bid selection)
   const [selectedDiscards, setSelectedDiscards] = useState<Set<string>>(new Set());
   const [selectedBidIdx, setSelectedBidIdx] = useState<number>(0);
+
+  // Analysis / settings state
+  const [showSettings, setShowSettings] = useState(false);
+  const [analysisEnabled, setAnalysisEnabled] = useState(false);
+  const [analysisSource, setAnalysisSource] = useState("");
+  const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+  const analysisKey = useRef("");  // tracks position for cache invalidation
 
   const legalSet = useMemo(() => {
     const s = new Set<string>();
@@ -197,6 +226,68 @@ export function UltiApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state?.gameId, state?.currentPlayer, state?.needsContinue, state?.phase, state?.dealOver, state?.trickNo, state?.trickCards?.length, busy]);
 
+
+  // Analysis polling: fetch AI evaluation when analysis mode is on
+  useEffect(() => {
+    if (!analysisEnabled || !state || !state.gameId || !analysisSource) return;
+    // Only analyze when it's human's turn in relevant phases
+    const phase = state.phase;
+    const isHumanTurn =
+      (phase === "play" && state.currentPlayer === 0 && !state.needsContinue) ||
+      phase === "bid" ||
+      phase === "auction" ||
+      phase === "kontra" ||
+      phase === "rekontra";
+    if (!isHumanTurn) {
+      setAnalysis(null);
+      return;
+    }
+
+    // Position key to detect changes
+    const posKey = `${state.gameId}:${phase}:${state.trickNo}:${state.trickCards?.length ?? 0}`;
+    if (posKey !== analysisKey.current) {
+      analysisKey.current = posKey;
+      setAnalysis(null);  // clear stale analysis
+    }
+
+    let cancelled = false;
+    const fetchAnalysis = async () => {
+      try {
+        const result = await ultiAnalyze(state.gameId, analysisSource, 40, 2);
+        if (!cancelled) setAnalysis(result);
+      } catch { /* ignore */ }
+    };
+
+    fetchAnalysis();
+    // Re-run with more sims after a delay for progressive deepening
+    const t = window.setTimeout(async () => {
+      try {
+        const result = await ultiAnalyze(state.gameId, analysisSource, 100, 3);
+        if (!cancelled) setAnalysis(result);
+      } catch { /* ignore */ }
+    }, 2000);
+
+    return () => { cancelled = true; window.clearTimeout(t); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [analysisEnabled, analysisSource, state?.gameId, state?.phase, state?.currentPlayer, state?.trickNo, state?.trickCards?.length, state?.needsContinue]);
+
+  // Build a map of card key -> analysis score for easy lookup
+  const cardScores = useMemo(() => {
+    const m = new Map<string, { score: number; visits: number; best: boolean }>();
+    if (!analysis?.actions) return m;
+    for (const a of analysis.actions) {
+      m.set(cardKey(a.card), { score: a.score, visits: a.visits, best: a.best });
+    }
+    return m;
+  }, [analysis]);
+
+  // Recommended discard cards from analysis (bid phase)
+  const recDiscardKeys = useMemo(() => {
+    const s = new Set<string>();
+    if (!analysis?.recDiscard) return s;
+    for (const c of analysis.recDiscard) s.add(cardKey(c));
+    return s;
+  }, [analysis]);
 
   /** Start the next round within the current match. */
   async function nextRound() {
@@ -397,7 +488,7 @@ export function UltiApp() {
                   value={opp1}
                   onChange={(e) => setOpp1(e.target.value)}
                 >
-                  {SUPPORTED_MODELS.map((m) => (
+                  {availableModels.map((m) => (
                     <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
                   ))}
                 </select>
@@ -409,7 +500,7 @@ export function UltiApp() {
                   value={opp2}
                   onChange={(e) => setOpp2(e.target.value)}
                 >
-                  {SUPPORTED_MODELS.map((m) => (
+                  {availableModels.map((m) => (
                     <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
                   ))}
                 </select>
@@ -419,9 +510,9 @@ export function UltiApp() {
             <button
               className="btn btn-primary ulti-lobby-start"
               onClick={() => startMatch([opp1, opp2])}
-              disabled={busy}
+              disabled={busy || availableModels.length === 0}
             >
-              {busy ? "Indítás..." : "Játék indítása"}
+              {busy ? "Indítás..." : availableModels.length === 0 ? "Nincs elérhető modell" : "Játék indítása"}
             </button>
           </div>
         </div>
@@ -437,19 +528,20 @@ export function UltiApp() {
           <div className="title">Trickster Ulti</div>
           <div className="subtitle">
             {isPartiMode
-              ? `Piros Parti gyakorlás | Te: ${matchScores[0]} | G1: ${matchScores[1]} | G2: ${matchScores[2]}`
+              ? `Piros Parti gyakorlás | Te: ${matchScores[0]} | ${PLAYER_LABEL[1]}: ${matchScores[1]} | ${PLAYER_LABEL[2]}: ${matchScores[2]}`
               : roundHistory.length > 0
-                ? `${roundHistory.length}. kör | Te: ${matchScores[0]} | G1: ${matchScores[1]} | G2: ${matchScores[2]}`
+                ? `${roundHistory.length}. kör | Te: ${matchScores[0]} | ${PLAYER_LABEL[1]}: ${matchScores[1]} | ${PLAYER_LABEL[2]}: ${matchScores[2]}`
                 : `${PLAYER_LABEL[1]} vs Te vs ${PLAYER_LABEL[2]}`}
           </div>
         </div>
         <div className="controls">
+          <button className="btn btn-primary" onClick={backToLobby} disabled={busy}>Új játék</button>
           {roundHistory.length > 0 && (
             <button className="btn" onClick={() => setShowScorecard(true)} disabled={busy}>
               Pontszámok
             </button>
           )}
-          <button className="btn" onClick={backToLobby} disabled={busy}>Lobby</button>
+          <button className="btn btn-gear" onClick={() => setShowSettings(true)}>⚙</button>
         </div>
       </header>
 
@@ -573,15 +665,14 @@ export function UltiApp() {
                 )}
               </div>
 
-              {/* History (last 3) */}
-              {auction.history.length > 0 && (
+              {/* History — only bids and passes, skip pickup */}
+              {auction.history.filter((e: any) => e.action !== "pickup").length > 0 && (
                 <div className="ulti-auction-history">
-                  {auction.history.slice(-3).map((entry, i) => (
+                  {auction.history.filter((e: any) => e.action !== "pickup").slice(-3).map((entry: any, i: number) => (
                     <div key={i} className="ulti-auction-history-entry">
                       <span className="ulti-auction-player">{PLAYER_LABEL[entry.player]}</span>
                       {entry.action === "pass" && <span className="ulti-auction-action pass">Passz</span>}
                       {entry.action === "stand" && <span className="ulti-auction-action hold">Elfogadva</span>}
-                      {entry.action === "pickup" && <span className="ulti-auction-action pickup">Felvette</span>}
                       {entry.action === "bid" && entry.bid && (
                         <span className="ulti-auction-action bid">{entry.bid.label} ({entry.bid.displayWin}p)</span>
                       )}
@@ -642,15 +733,14 @@ export function UltiApp() {
                 )}
               </div>
 
-              {/* History (last 3) */}
-              {auction.history.length > 0 && (
+              {/* History — only bids and passes, skip pickup */}
+              {auction.history.filter((e: any) => e.action !== "pickup").length > 0 && (
                 <div className="ulti-auction-history">
-                  {auction.history.slice(-3).map((entry, i) => (
+                  {auction.history.filter((e: any) => e.action !== "pickup").slice(-3).map((entry: any, i: number) => (
                     <div key={i} className="ulti-auction-history-entry">
                       <span className="ulti-auction-player">{PLAYER_LABEL[entry.player]}</span>
                       {entry.action === "pass" && <span className="ulti-auction-action pass">Passz</span>}
                       {entry.action === "stand" && <span className="ulti-auction-action hold">Elfogadva</span>}
-                      {entry.action === "pickup" && <span className="ulti-auction-action pickup">Felvette</span>}
                       {entry.action === "bid" && entry.bid && (
                         <span className="ulti-auction-action bid">{entry.bid.label} ({entry.bid.displayWin}p)</span>
                       )}
@@ -746,16 +836,31 @@ export function UltiApp() {
                           ? state.kontra!.currentKontras[comp] === 0
                           : state.kontra!.currentKontras[comp] === 1
                       )
-                      .map((comp) => (
-                        <button
-                          key={comp}
-                          className={`ulti-kontra-toggle ${kontraSelection.has(comp) ? "ulti-kontra-toggle-on" : ""}`}
-                          onClick={() => toggleKontraComponent(comp)}
-                          disabled={busy}
-                        >
-                          {comp}
-                        </button>
-                      ))}
+                      .map((comp) => {
+                        const kontraVal = analysisEnabled && analysis?.phase && ["kontra", "rekontra"].includes(analysis.phase) ? analysis.value : undefined;
+                        return (
+                          <div key={comp} className="ulti-kontra-toggle-row">
+                            <button
+                              className={`ulti-kontra-toggle ${kontraSelection.has(comp) ? "ulti-kontra-toggle-on" : ""}`}
+                              onClick={() => toggleKontraComponent(comp)}
+                              disabled={busy}
+                            >
+                              {comp}
+                            </button>
+                            {kontraVal != null && (
+                              <div className={`ulti-kontra-bar ${kontraVal > 0 ? "ulti-kontra-bar-good" : "ulti-kontra-bar-bad"}`}>
+                                <div
+                                  className="ulti-kontra-bar-fill"
+                                  style={{ width: `${Math.min(Math.abs(kontraVal) * 100, 100)}%` }}
+                                />
+                                <span className="ulti-kontra-bar-label">
+                                  {kontraVal > 0 ? "+" : ""}{kontraVal.toFixed(2)}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
                   </div>
 
                   {/* Action row */}
@@ -898,10 +1003,12 @@ export function UltiApp() {
               const canClick =
                 phase === "bid" ||
                 (phase === "play" && isMyTurn && isLegal);
+              const scoreInfo = analysisEnabled ? cardScores.get(key) : undefined;
+              const isRecDiscard = analysisEnabled && phase === "bid" && recDiscardKeys.has(key);
               return (
                 <div key={key} className="hand-slot">
                   <button
-                    className={`hand-card${!isLegal && phase === "play" ? " hand-card-illegal" : ""}${isSelected ? " hand-card-selected" : ""}`}
+                    className={`hand-card${!isLegal && phase === "play" ? " hand-card-illegal" : ""}${isSelected ? " hand-card-selected" : ""}${scoreInfo?.best ? " hand-card-best" : ""}${isRecDiscard ? " hand-card-discard" : ""}`}
                     onClick={() => {
                       if (phase === "bid") toggleDiscard(c);
                       else if (phase === "play" && isMyTurn && isLegal) playCard(c);
@@ -910,6 +1017,16 @@ export function UltiApp() {
                     style={isSelected ? { transform: "translateY(-20px)", zIndex: 10 } : undefined}
                   >
                     <img className="card-hand" src={ultiCardUrl(c)} alt={ultiCardLabel(c)} />
+                    {scoreInfo != null && (
+                      <span
+                        className={`card-score ${scoreInfo.score >= 0.6 ? "card-score-good" : scoreInfo.score <= 0.3 ? "card-score-bad" : "card-score-neutral"}`}
+                      >
+                        {Math.round(scoreInfo.score * 100)}
+                      </span>
+                    )}
+                    {isRecDiscard && (
+                      <span className="card-discard-tag">Talon</span>
+                    )}
                   </button>
                 </div>
               );
@@ -1005,6 +1122,88 @@ export function UltiApp() {
               <button className="btn" onClick={() => setShowScorecard(false)}>Bezár</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Settings modal */}
+      {showSettings && (
+        <div className="modal-overlay" onClick={() => setShowSettings(false)}>
+          <div className="modal ulti-settings" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">Beállítások</div>
+
+            <div className="ulti-setting-row">
+              <label className="ulti-setting-label">AI elemzés</label>
+              <button
+                className={`ulti-toggle ${analysisEnabled ? "ulti-toggle-on" : ""}`}
+                onClick={() => {
+                  setAnalysisEnabled((v) => !v);
+                  if (analysisEnabled) setAnalysis(null);
+                }}
+              >
+                {analysisEnabled ? "Be" : "Ki"}
+              </button>
+            </div>
+
+            {analysisEnabled && (
+              <div className="ulti-setting-row">
+                <label className="ulti-setting-label">Elemző modell</label>
+                <select
+                  className="ulti-lobby-select"
+                  value={analysisSource}
+                  onChange={(e) => { setAnalysisSource(e.target.value); setAnalysis(null); }}
+                >
+                  <option value="">— válassz —</option>
+                  {availableModels.map((m) => (
+                    <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            <div className="modal-actions">
+              <button className="btn" onClick={() => setShowSettings(false)}>Bezár</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Analysis panel — bid/auction phase */}
+      {analysisEnabled && (analysis?.phase === "bid" || analysis?.phase === "auction") && analysis?.contracts && analysis.contracts.length > 0 && (
+        <div className="ulti-analysis-panel">
+          <div className="ulti-analysis-title">AI elemzés ({analysis.source})</div>
+          <div className="ulti-analysis-contracts">
+            {analysis.contracts.map((c, i) => (
+              <div key={i} className={`ulti-analysis-row ${c.gamePts >= 0 ? "ulti-analysis-good" : "ulti-analysis-bad"}`}>
+                <span className="ulti-analysis-label">{c.bidLabel}</span>
+                <span className={`ulti-analysis-pts ${c.gamePts >= 0 ? "card-score-good" : "card-score-bad"}`}>
+                  {c.gamePts >= 0 ? "+" : ""}{c.gamePts.toFixed(1)}
+                </span>
+              </div>
+            ))}
+          </div>
+          {analysis.recommendation && (
+            <div className="ulti-analysis-rec">
+              Javaslat: <strong>{analysis.recommendation}</strong>
+              {analysis.recDiscard && (
+                <div className="ulti-analysis-discard">
+                  Talon: {ultiCardLabel(analysis.recDiscard[0])}, {ultiCardLabel(analysis.recDiscard[1])}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Kontra analysis is shown inline — see kontra toggle section */}
+
+      {/* Analysis info bar — play phase */}
+      {analysisEnabled && analysis?.phase === "play" && analysis.value != null && (
+        <div className="ulti-analysis-bar">
+          <span className="ulti-analysis-source">{analysis.source}</span>
+          <span className={`ulti-analysis-value ${analysis.value > 0 ? "card-score-good" : analysis.value < 0 ? "card-score-bad" : ""}`}>
+            Pozíció: {analysis.value > 0 ? "+" : ""}{analysis.value.toFixed(2)}
+          </span>
+          {analysis.sims != null && <span className="ulti-analysis-sims">{analysis.sims} sim</span>}
         </div>
       )}
     </div>

@@ -199,3 +199,41 @@ export async function ultiListModels(): Promise<string[]> {
   const data = await res.json();
   return data.models as string[];
 }
+
+/** Analysis result for the current position. */
+export type AnalysisResult = {
+  phase: string;
+  source: string;
+  // Play phase
+  actions?: { card: UltiCard; score: number; visits: number; best: boolean }[];
+  value?: number;
+  sims?: number;
+  // Bid phase
+  contracts?: {
+    contractKey: string;
+    isPiros: boolean;
+    trump: string | null;
+    gamePts: number;
+    bidRank: number | null;
+    bidLabel: string;
+    discard?: [UltiCard, UltiCard];
+  }[];
+  recommendation?: string;
+  recDiscard?: [UltiCard, UltiCard];
+};
+
+/** Analyze the current position using AI. */
+export async function ultiAnalyze(
+  gameId: string,
+  source: string,
+  sims = 40,
+  dets = 2,
+): Promise<AnalysisResult> {
+  const res = await fetch(`${BASE}/${gameId}/analyze`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source, sims, dets }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}

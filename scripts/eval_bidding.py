@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Evaluate models in full end-to-end Ulti with bidding.
+"""Evaluate models in full end-to-end Ulti with competitive bidding.
 
 Seats 3 model sets at the table and plays N deals.  Each deal:
   1. Dealer rotates (0 → 1 → 2 → ...)
-  2. Soloist (next after dealer) evaluates all contracts with their models
-  3. Best contract is bid, or pass if nothing beats the penalty
-  4. Game is played with MCTS+solver; kontra/rekontra after trick 1
-  5. Game-point settlement computed (piros + kontra included)
+  2. Competitive auction: first bidder picks up the talon and bids;
+     other players can pick up and overbid.  Each player uses their
+     own NN value heads to evaluate contracts, filtering by legal bids.
+  3. Auction winner plays as soloist with their chosen contract.
+  4. Game is played with MCTS+solver; kontra/rekontra after trick 1.
+  5. Game-point settlement computed (piros + kontra included).
 
 Each seat can use a different model tier AND search speed.
 
@@ -35,7 +37,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 
 from trickster.bidding.evaluator import evaluate_all_contracts, pick_best_bid
+from trickster.bidding.registry import BID_TO_CONTRACT, MAX_SUPPORTED_RANK
 from trickster.games.ulti.adapter import UltiGame, UltiNode
+from trickster.games.ulti.auction import (
+    AuctionState,
+    BID_BY_RANK,
+    SUPPORTED_BID_RANKS,
+    can_pickup,
+    create_auction,
+    legal_bids,
+    submit_bid,
+    submit_pass,
+    submit_pickup,
+)
 from trickster.games.ulti.game import deal, next_player, pickup_talon
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 from trickster.mcts import MCTSConfig
@@ -51,6 +65,14 @@ from trickster.training.model_io import (
     DK_LABELS,
     load_wrappers,
 )
+
+# Reverse mapping: (contract_key, is_piros) → bid rank
+_CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
+    v: k for k, v in BID_TO_CONTRACT.items()
+}
+
+_BID_THRESHOLD = -2.0
+_BID_MAX_DISCARDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +187,160 @@ def _decide_kontra_eval(
 # ---------------------------------------------------------------------------
 
 
+def _nn_eval_to_auction_bid(
+    ev, auction: AuctionState,
+) -> tuple | None:
+    """Convert a ContractEval to (Bid, discards) if legal, else None."""
+    bid_rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
+    if bid_rank is None or bid_rank not in SUPPORTED_BID_RANKS:
+        return None
+    bid_obj = BID_BY_RANK.get(bid_rank)
+    if bid_obj is None:
+        return None
+    if bid_obj not in legal_bids(auction):
+        return None
+    return bid_obj, list(ev.best_discard.discard)
+
+
+def _best_legal_nn_bid(
+    gs, player: int, dealer: int,
+    wrappers: dict[str, UltiNetWrapper],
+    auction: AuctionState,
+    min_bid_pts: float,
+    max_discards: int,
+):
+    """Evaluate contracts and return (ContractEval, Bid, discards) or None.
+
+    Only returns bids that are legal in the current auction state and
+    exceed the profitability threshold.
+    """
+    evals = evaluate_all_contracts(
+        gs, player, dealer,
+        wrappers=wrappers,
+        max_discards=max_discards,
+    )
+    if not evals:
+        return None
+    for ev in evals:
+        if ev.game_pts < min_bid_pts:
+            break  # sorted desc — rest are worse
+        r = _nn_eval_to_auction_bid(ev, auction)
+        if r is not None:
+            bid_obj, discards = r
+            return ev, bid_obj, discards
+    return None
+
+
+def _run_auction(
+    gs,
+    seat_wrappers: list[dict[str, UltiNetWrapper]],
+    dealer: int,
+    talon: list,
+    min_bid_pts: float,
+    max_discards: int,
+) -> tuple[int, "ContractEval | None"]:
+    """Run a competitive 3-player auction.
+
+    Returns (soloist, winning_ContractEval) or (first_bidder, None) if
+    the winning bid is Passz (no real game).
+    The gs.hands are mutated to reflect talon pickups and discards.
+    """
+    from trickster.games.ulti.auction import BID_PASSZ, ai_initial_bid
+
+    first_bidder = next_player(dealer)
+
+    # First bidder picks up the talon → 12 cards
+    gs.hands[first_bidder].extend(talon)
+    a = create_auction(first_bidder, talon)
+
+    # Track the ContractEval that produced the winning bid
+    winning_eval = None
+
+    while not a.done:
+        player = a.turn
+
+        # Auto-pass if current bid is at or above max supported rank
+        if (a.current_bid is not None
+                and a.current_bid.rank >= MAX_SUPPORTED_RANK
+                and not a.awaiting_bid):
+            submit_pass(a, player)
+            continue
+
+        if a.awaiting_bid:
+            # Player has 12 cards — evaluate contracts and bid
+            wrappers = seat_wrappers[player]
+            result = None
+
+            if wrappers:
+                result = _best_legal_nn_bid(
+                    gs, player, dealer, wrappers, a,
+                    min_bid_pts, max_discards,
+                )
+
+            if result is not None:
+                ev, bid_obj, discards = result
+                for c in discards:
+                    gs.hands[player].remove(c)
+                submit_bid(a, player, bid_obj, discards)
+                winning_eval = ev
+            else:
+                # No profitable legal bid.
+                if a.current_bid is None:
+                    # First bidder must bid at least Passz.
+                    bid_obj, discards = ai_initial_bid(gs.hands[player])
+                    for c in discards:
+                        gs.hands[player].remove(c)
+                    submit_bid(a, player, bid_obj, discards)
+                    winning_eval = None
+                else:
+                    # Picked up but can't find a good overbid.
+                    # Safety fallback: bid the minimum legal.
+                    legal = legal_bids(a)
+                    if legal:
+                        bid_obj = legal[0]
+                        discards = gs.hands[player][:2]
+                        for c in discards:
+                            gs.hands[player].remove(c)
+                        submit_bid(a, player, bid_obj, discards)
+                        winning_eval = None
+                    else:
+                        # Shouldn't happen, but guard against it.
+                        submit_pass(a, player)
+
+        else:
+            # Player has 10 cards — decide whether to pick up
+            should_pickup = False
+            wrappers = seat_wrappers[player]
+
+            if wrappers and can_pickup(a):
+                # Simulate 12-card hand
+                sim_hand = list(gs.hands[player]) + list(a.talon)
+                orig = gs.hands[player]
+                gs.hands[player] = sim_hand
+                try:
+                    result = _best_legal_nn_bid(
+                        gs, player, dealer, wrappers, a,
+                        min_bid_pts, max_discards,
+                    )
+                    should_pickup = result is not None
+                finally:
+                    gs.hands[player] = orig
+
+            if should_pickup:
+                gs.hands[player].extend(a.talon)
+                submit_pickup(a, player)
+            else:
+                submit_pass(a, player)
+
+    soloist = a.winner
+
+    # If the winning bid is Passz, treat as all-pass (no real game).
+    if a.current_bid is not None and a.current_bid.rank <= BID_PASSZ.rank:
+        return soloist, None
+
+    return soloist, winning_eval
+
+
 def _play_one_deal(
     game: UltiGame,
     seat_wrappers: list[dict[str, UltiNetWrapper]],
@@ -177,24 +353,17 @@ def _play_one_deal(
 ) -> DealResult:
     rng = random.Random(seed)
     dealer = deal_index % 3
-    soloist = next_player(dealer)
 
     gs, talon = deal(seed=seed, dealer=dealer)
-    pickup_talon(gs, soloist, talon)
 
-    # Bidding
-    sol_wrappers = seat_wrappers[soloist]
-    bid = None
-    if sol_wrappers:
-        evals = evaluate_all_contracts(
-            gs, soloist, dealer,
-            wrappers=sol_wrappers,
-            max_discards=max_discards,
-        )
-        if evals:
-            bid = pick_best_bid(evals, min_stakes_pts=min_bid_pts)
+    # --- Competitive auction ---
+    soloist, bid = _run_auction(
+        gs, seat_wrappers, dealer, talon,
+        min_bid_pts, max_discards,
+    )
 
     if bid is None:
+        # No real game (all Passz)
         seat_raw = [0.0, 0.0, 0.0]
         seat_raw[soloist] = (-pass_penalty * 2) / _GAME_PTS_MAX
         for i in range(3):
@@ -209,6 +378,13 @@ def _play_one_deal(
 
     dkey = _display_key(bid.contract_key, bid.is_piros)
     mkey = bid.contract_key
+
+    # _setup_bid_game expects soloist to have 12 cards.
+    # After the auction they have 10 (already discarded).
+    # Re-add the discards — _setup_bid_game will remove them again.
+    if len(gs.hands[soloist]) == 10:
+        gs.hands[soloist].extend(list(bid.best_discard.discard))
+
     state = _setup_bid_game(game, gs, soloist, dealer, bid)
 
     # Build per-seat players (each with their own search config)
@@ -310,6 +486,28 @@ def _print_results(
 
     print()
     print("  ┌─ RESULTS " + "─" * (w - 11))
+    print("  │")
+
+    # ── Overall totals ──────────────────────────────────────────
+    hdr = f"  │  {'':<12}"
+    for sl in seat_labels:
+        hdr += f" {sl:>{seat_col}}"
+    print(hdr)
+    sep = f"  │  {'─'*12}"
+    for _ in seat_labels:
+        sep += f" {'─'*seat_col}"
+    print(sep)
+
+    totals = [sum(_pts(r.seat_raw[s]) for r in results) for s in range(3)]
+    avgs = [t / N for t in totals]
+    row_tot = f"  │  {'Total pts':<12}"
+    for s in range(3):
+        row_tot += f" {totals[s]:>+{seat_col}.1f}"
+    print(row_tot)
+    row_avg = f"  │  {'Avg/deal':<12}"
+    for s in range(3):
+        row_avg += f" {avgs[s]:>+{seat_col}.3f}"
+    print(row_avg)
     print("  │")
 
     # ── Soloist performance (primary metric) ───────────────────

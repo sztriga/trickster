@@ -260,6 +260,9 @@ def _greedy_playout(gs: GameState) -> float:
     """
     undos: list[tuple] = []
     while gs.trick_no < TRICKS_PER_GAME:
+        # Betli early termination
+        if gs.betli and len(gs.captured[gs.soloist]) > 0:
+            break
         player = current_player(gs)
         moves = _ordered_moves(gs, player == gs.soloist)
         tok = _apply(gs, moves[0])
@@ -312,6 +315,10 @@ def _alphabeta(
     _nodes += 1
 
     if gs.trick_no >= TRICKS_PER_GAME:
+        return _terminal_value(gs)
+
+    # Betli early termination: soloist already captured a trick → lost.
+    if gs.betli and len(gs.captured[gs.soloist]) > 0:
         return _terminal_value(gs)
 
     # Depth limit: use greedy playout for positions in the approximate zone.

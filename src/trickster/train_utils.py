@@ -273,6 +273,7 @@ class ReplayBuffer:
         self._policies: np.ndarray | None = None
         self._rewards = np.zeros(capacity, dtype=np.float64)
         self._is_soloist = np.zeros(capacity, dtype=bool)
+        self._on_policy = np.ones(capacity, dtype=bool)  # True = on-policy (default)
         self._rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
@@ -285,6 +286,7 @@ class ReplayBuffer:
         policy: np.ndarray,
         reward: float,
         is_soloist: bool = False,
+        on_policy: bool = True,
     ) -> None:
         if not self._allocated:
             self._states = np.zeros(
@@ -317,6 +319,7 @@ class ReplayBuffer:
         self._policies[pos] = policy
         self._rewards[pos] = reward
         self._is_soloist[pos] = is_soloist
+        self._on_policy[pos] = on_policy
 
     def stats(self) -> dict[str, float]:
         """Return buffer composition diagnostics."""
@@ -344,7 +347,7 @@ class ReplayBuffer:
 
     def sample(
         self, batch_size: int, rng: np.random.Generator,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Outcome-balanced mini-batch sampling.
 
         Guarantees a minimum fraction of soloist-win samples in each
@@ -358,6 +361,7 @@ class ReplayBuffer:
         policies : (B, action_dim)
         rewards : (B,)
         is_soloist : (B,) bool
+        on_policy : (B,) bool
         """
         n = self._size
         B = min(batch_size, n)
@@ -402,5 +406,6 @@ class ReplayBuffer:
             self._policies[indices].copy(),
             self._rewards[indices].copy(),
             self._is_soloist[indices].copy(),
+            self._on_policy[indices].copy(),
         )
 

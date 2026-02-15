@@ -386,8 +386,16 @@ def play_card(state: GameState, card: Card) -> Optional[TrickResult]:
 
 
 def is_terminal(state: GameState) -> bool:
-    """Is the deal over (all 10 tricks played)?"""
-    return state.trick_no >= TRICKS_PER_GAME
+    """Is the deal over?
+
+    The game ends when all 10 tricks are played, or in Betli when the
+    soloist captures any trick (instant loss — no need to continue).
+    """
+    if state.trick_no >= TRICKS_PER_GAME:
+        return True
+    if state.betli and soloist_lost_betli(state):
+        return True
+    return False
 
 
 def soloist_points(state: GameState) -> int:

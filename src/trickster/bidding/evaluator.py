@@ -233,8 +233,11 @@ def evaluate_contract(
     best_idx = int(np.argmax(values))
     best_val = float(values[best_idx])
     # Un-normalise: value = (sol_pts * 2) / _GAME_PTS_MAX → sol_pts = val * MAX / 2
-    # The value head already predicts expected stakes INCLUDING piros
-    # multiplier and kontra dynamics — no external multiplication needed.
+    # The value head is trained on outcomes that include piros and kontra.
+    # Early in training it may overestimate marginal hands, but the
+    # feedback loop (bid → get kontrad → lose → lower estimate) should
+    # correct this over time.  Keep the bid threshold at the pass penalty
+    # so the model gets to experience and learn from marginal-hand losses.
     best_pts = best_val * _GAME_PTS_MAX / 2
 
     return ContractEval(
