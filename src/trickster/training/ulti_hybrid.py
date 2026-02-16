@@ -713,6 +713,54 @@ def train_ulti_hybrid(
     stats = UltiTrainStats(total_steps=cfg.steps)
     t0 = time.perf_counter()
 
+    _is_onnx = isinstance(wrapper, OnnxUltiWrapper)
+
+    # Helpers for building self-play task tuples
+    def _build_tasks(step: int):
+        past_warmup = cfg.enrichment and step > cfg.enrich_warmup
+        thresh = (
+            _enrichment_threshold(step, cfg.steps)
+            if past_warmup else -999.0
+        )
+        tasks = []
+        for g in range(cfg.games_per_step):
+            use_enrich = (
+                past_warmup
+                and thresh > -999.0
+                and (g / cfg.games_per_step) >= cfg.enrich_random_frac
+            )
+            tasks.append((
+                {k: v.cpu() for k, v in net.state_dict().items()},
+                sol_cfg, def_cfg,
+                cfg.seed + step * 1000 + g,
+                cfg.endgame_tricks, cfg.pimc_dets, cfg.solver_temp,
+                cfg.training_mode,
+                thresh if use_enrich else -999.0,
+                cfg.solver_teacher, cfg.kontra_enabled,
+                cfg.neural_discard,
+            ))
+        return tasks, past_warmup, thresh
+
+    def _collect_results(futures, buffer_, stats_):
+        """Collect self-play results from completed futures."""
+        sp_pts_sum_ = 0.0
+        sp_total_ = 0
+        n_samples = 0
+        for f in futures:
+            samples = f.result()
+            sol_r = [r for _, _, _, r, is_sol in samples if is_sol]
+            if sol_r:
+                sp_total_ += 1
+                sp_pts_sum_ += sol_r[0]
+            for s, m, p, r, is_sol in samples:
+                buffer_.push(s, m, p, r, is_soloist=is_sol)
+            n_samples += len(samples)
+            stats_.total_games += 1
+        return sp_pts_sum_, sp_total_, n_samples
+
+    # For double-buffering: futures from the previous iteration
+    _pending_futures: list | None = None
+
     try:
         for step in range(1, cfg.steps + 1):
             # ---- 0. Cosine LR schedule ----
@@ -725,56 +773,40 @@ def train_ulti_hybrid(
             sp_pts_sum = 0.0
             sp_total = 0
 
-            # Enrichment threshold
             past_warmup = cfg.enrichment and step > cfg.enrich_warmup
             thresh = (
                 _enrichment_threshold(step, cfg.steps)
                 if past_warmup else -999.0
             )
 
-            # Move net to CPU for self-play (GPU used only for SGD).
-            # Not needed when using ONNX — sessions are independent.
-            _is_onnx = isinstance(wrapper, OnnxUltiWrapper)
-            if use_gpu and executor is None and not _is_onnx:
-                net.to("cpu")
-                wrapper.device = torch.device("cpu")
-
             if executor is not None:
-                # --- Parallel self-play ---
-                state_dict = {k: v.cpu() for k, v in net.state_dict().items()}
-                tasks = []
-                for g in range(cfg.games_per_step):
-                    use_enrich = (
-                        past_warmup
-                        and thresh > -999.0
-                        and (g / cfg.games_per_step) >= cfg.enrich_random_frac
+                # --- Double-buffered parallel self-play ---
+                #
+                # On step 1, no previous futures exist — submit and
+                # block (the buffer needs data before SGD can start).
+                # On step 2+, the previous iteration already submitted
+                # futures while SGD ran; collect those results now
+                # (they're likely already done), then submit *next*
+                # iteration's work before running SGD.
+
+                if _pending_futures is not None:
+                    sp_pts_sum, sp_total, step_samples = _collect_results(
+                        _pending_futures, buffer, stats,
                     )
-                    tasks.append((
-                        state_dict,
-                        sol_cfg,
-                        def_cfg,
-                        cfg.seed + step * 1000 + g,
-                        cfg.endgame_tricks,
-                        cfg.pimc_dets,
-                        cfg.solver_temp,
-                        cfg.training_mode,
-                        thresh if use_enrich else -999.0,
-                        cfg.solver_teacher,
-                        cfg.kontra_enabled,
-                        cfg.neural_discard,
-                    ))
-                for samples in executor.map(_play_game_in_worker, tasks):
-                    # Tally soloist game-point reward
-                    sol_r = [r for _, _, _, r, is_sol in samples if is_sol]
-                    if sol_r:
-                        sp_total += 1
-                        sp_pts_sum += sol_r[0]
-                    for s, m, p, r, is_sol in samples:
-                        buffer.push(s, m, p, r, is_soloist=is_sol)
-                    step_samples += len(samples)
-                    stats.total_games += 1
+                    _pending_futures = None
+                else:
+                    # First iteration — submit and block
+                    tasks, _, _ = _build_tasks(step)
+                    futures = [executor.submit(_play_game_in_worker, t) for t in tasks]
+                    sp_pts_sum, sp_total, step_samples = _collect_results(
+                        futures, buffer, stats,
+                    )
             else:
-                # --- Sequential self-play ---
+                # --- Sequential self-play (no workers) ---
+                if not _is_onnx and use_gpu:
+                    net.to("cpu")
+                    wrapper.device = torch.device("cpu")
+
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
 
@@ -819,19 +851,26 @@ def train_ulti_hybrid(
                     step_samples += len(samples)
                     stats.total_games += 1
 
+                if not _is_onnx and use_gpu:
+                    net.to(device)
+                    wrapper.device = torch.device(device)
+
             stats.total_samples += step_samples
 
             # ---- 2. Train (decoupled SGD steps) ----
-            # Move net back to training device for SGD
-            if use_gpu and not _is_onnx:
-                net.to(device)
-                wrapper.device = torch.device(device)
-
             avg_vloss = 0.0
             avg_ploss = 0.0
             avg_pacc = 0.0
             avg_sol_vloss = 0.0
             avg_def_vloss = 0.0
+
+            # Submit next iteration's self-play *before* SGD so workers
+            # run in parallel with training (double-buffering).
+            if executor is not None and step < cfg.steps:
+                next_tasks, _, _ = _build_tasks(step + 1)
+                _pending_futures = [
+                    executor.submit(_play_game_in_worker, t) for t in next_tasks
+                ]
 
             if len(buffer) >= cfg.batch_size:
                 net.train()
@@ -917,6 +956,10 @@ def train_ulti_hybrid(
                 on_progress(stats)
 
     finally:
+        # Drain any pending futures before shutting down
+        if _pending_futures is not None:
+            for f in _pending_futures:
+                f.cancel()
         if executor is not None:
             executor.shutdown(wait=False)
 
