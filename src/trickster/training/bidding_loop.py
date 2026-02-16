@@ -48,7 +48,7 @@ from trickster.games.ulti.game import (
 )
 from trickster.hybrid import HybridPlayer
 from trickster.mcts import MCTSConfig
-from trickster.model import UltiNet, UltiNetWrapper
+from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapper
 from trickster.train_utils import ReplayBuffer, simple_outcome, _GAME_PTS_MAX
 
 from .model_io import auto_device, estimate_params
@@ -224,8 +224,8 @@ class BiddingTrainStats:
 
 _BW_GAME: UltiGame | None = None
 _BW_NETS: dict[str, UltiNet] = {}
-_BW_WRAPPERS: dict[str, UltiNetWrapper] = {}
-_BW_POOL_WRAPPERS: list[dict[str, UltiNetWrapper]] = []
+_BW_WRAPPERS: dict[str, UltiNetWrapper | OnnxUltiWrapper] = {}
+_BW_POOL_WRAPPERS: list[dict[str, UltiNetWrapper | OnnxUltiWrapper]] = []
 
 
 def _init_bidding_worker(
@@ -240,7 +240,7 @@ def _init_bidding_worker(
     for key in contract_keys:
         net = UltiNet(**net_kwargs)
         _BW_NETS[key] = net
-        _BW_WRAPPERS[key] = UltiNetWrapper(net, device=device)
+        _BW_WRAPPERS[key] = make_wrapper(net, device=device)
 
     _BW_POOL_WRAPPERS = []
     if pool_sources:
@@ -260,6 +260,9 @@ def _play_bidding_game_in_worker(
     # Load latest weights into worker nets
     for key, sd in all_state_dicts.items():
         _BW_NETS[key].load_state_dict(sd)
+        w = _BW_WRAPPERS.get(key)
+        if isinstance(w, OnnxUltiWrapper):
+            w.sync_weights(_BW_NETS[key])
 
     # Reconstruct a lightweight cfg from dict
     cfg = BiddingTrainConfig(**cfg_dict)
@@ -563,7 +566,7 @@ def train_with_bidding(
                 action_dim=game.action_space_size,
             )
         net.to(device)
-        wrapper = UltiNetWrapper(net, device=device)
+        wrapper = make_wrapper(net, device=device)
         optimizer = torch.optim.Adam(
             net.parameters(), lr=cfg.lr_start, weight_decay=1e-4,
         )
@@ -728,8 +731,10 @@ def train_with_bidding(
 
                 stats.total_games += 1
 
-            # Move nets to CPU for self-play (GPU used only for SGD)
-            if use_gpu and executor is None:
+            # Move nets to CPU for self-play (GPU used only for SGD).
+            # Not needed when using ONNX — sessions are independent.
+            _any_onnx = any(isinstance(s.wrapper, OnnxUltiWrapper) for s in slots.values())
+            if use_gpu and executor is None and not _any_onnx:
                 for slot in slots.values():
                     slot.net.to("cpu")
                     slot.wrapper.device = torch.device("cpu")
@@ -775,7 +780,7 @@ def train_with_bidding(
                     _collect_result(dkey, samples)
 
             # Move nets back to training device for SGD
-            if use_gpu:
+            if use_gpu and not _any_onnx:
                 for slot in slots.values():
                     slot.net.to(device)
                     slot.wrapper.device = torch.device(device)
@@ -835,6 +840,8 @@ def train_with_bidding(
                 step_model_ploss[key] = avg_p
 
                 slot.net.eval()
+                if isinstance(slot.wrapper, OnnxUltiWrapper):
+                    slot.wrapper.sync_weights(slot.net)
 
             # -- Update stats --
             stats.step = step

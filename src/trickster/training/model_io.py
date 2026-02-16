@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from trickster.games.ulti.adapter import UltiGame
-from trickster.model import UltiNet, UltiNetWrapper
+from trickster.model import UltiNet, UltiNetWrapper, make_wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ def load_wrappers(
         net = load_net(path, device)
         if net is not None:
             net.eval()
-            wrappers[key] = UltiNetWrapper(net, device=device)
+            wrappers[key] = make_wrapper(net, device=device)
     return wrappers
 
 

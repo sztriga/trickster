@@ -37,7 +37,7 @@ import torch.nn.functional as F
 from trickster.games.ulti.adapter import UltiGame, UltiNode
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 from trickster.mcts import MCTSConfig
-from trickster.model import UltiNet, UltiNetWrapper
+from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapper
 from trickster.train_utils import ReplayBuffer, simple_outcome, solver_value_to_reward
 from trickster.training.model_io import auto_device
 
@@ -148,7 +148,7 @@ class UltiTrainStats:
 
 _WORKER_GAME: UltiGame | None = None
 _WORKER_NET: UltiNet | None = None
-_WORKER_WRAPPER: UltiNetWrapper | None = None
+_WORKER_WRAPPER: UltiNetWrapper | OnnxUltiWrapper | None = None
 
 
 def _init_worker(net_kwargs: dict, device: str) -> None:
@@ -156,7 +156,7 @@ def _init_worker(net_kwargs: dict, device: str) -> None:
     global _WORKER_GAME, _WORKER_NET, _WORKER_WRAPPER
     _WORKER_GAME = UltiGame()
     _WORKER_NET = UltiNet(**net_kwargs)
-    _WORKER_WRAPPER = UltiNetWrapper(_WORKER_NET, device=device)
+    _WORKER_WRAPPER = make_wrapper(_WORKER_NET, device=device)
 
 
 def _play_game_in_worker(
@@ -168,6 +168,8 @@ def _play_game_in_worker(
      training_mode, enrich_thresh, solver_teacher,
      kontra_enabled, use_neural_discard) = args
     _WORKER_NET.load_state_dict(state_dict)
+    if isinstance(_WORKER_WRAPPER, OnnxUltiWrapper):
+        _WORKER_WRAPPER.sync_weights(_WORKER_NET)
 
     init_state = None
     if use_neural_discard:
@@ -658,7 +660,8 @@ def train_ulti_hybrid(
             action_dim=game.action_space_size,
         )
     net.to(device)
-    wrapper = UltiNetWrapper(net, device=device)
+    # ONNX Runtime for self-play inference (CPU only, ~10x faster per call)
+    wrapper = make_wrapper(net, device=device)
     optimizer = torch.optim.Adam(
         net.parameters(), lr=cfg.lr_start, weight_decay=1e-4,
     )
@@ -729,8 +732,10 @@ def train_ulti_hybrid(
                 if past_warmup else -999.0
             )
 
-            # Move net to CPU for self-play (GPU used only for SGD)
-            if use_gpu and executor is None:
+            # Move net to CPU for self-play (GPU used only for SGD).
+            # Not needed when using ONNX — sessions are independent.
+            _is_onnx = isinstance(wrapper, OnnxUltiWrapper)
+            if use_gpu and executor is None and not _is_onnx:
                 net.to("cpu")
                 wrapper.device = torch.device("cpu")
 
@@ -818,7 +823,7 @@ def train_ulti_hybrid(
 
             # ---- 2. Train (decoupled SGD steps) ----
             # Move net back to training device for SGD
-            if use_gpu:
+            if use_gpu and not _is_onnx:
                 net.to(device)
                 wrapper.device = torch.device(device)
 
@@ -886,6 +891,10 @@ def train_ulti_hybrid(
                 avg_pacc = total_pacc / n_train
                 avg_sol_vloss = total_sol_vloss / max(1, sol_count)
                 avg_def_vloss = total_def_vloss / max(1, def_count)
+
+            # Re-export ONNX sessions with updated weights
+            if _is_onnx:
+                wrapper.sync_weights(net)
 
             # ---- 3. Update stats ----
             stats.step = step
