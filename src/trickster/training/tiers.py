@@ -120,6 +120,22 @@ TIERS: dict[str, Tier] = {
         sol_sims=60, def_sims=24,
         lr_start=1e-3, lr_end=1e-4,
     ),
+    "knight3": Tier(
+        label="Knight3", index=15,
+        description="Knight3 — e2e-heavy 30/70 split (256×4, 80k total)",
+        steps=750, games_per_step=8, train_steps=50, buffer_size=50_000,
+        e2e_steps=7000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=190_000,
+        sol_sims=60, def_sims=24,
+        lr_start=1e-3, lr_end=1e-4,
+    ),
+    "knight4": Tier(
+        label="Knight4", index=16,
+        description="Knight4 — pure e2e from scratch (256×4, 80k total)",
+        steps=0, games_per_step=8, train_steps=50, buffer_size=50_000,
+        e2e_steps=10000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=270_000,
+        sol_sims=60, def_sims=24,
+        lr_start=1e-3, lr_end=1e-4,
+    ),
     "bishop": Tier(
         label="Bishop", index=3,
         description="Bishop — larger net (384×4, 120k total)",

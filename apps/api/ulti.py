@@ -332,6 +332,9 @@ class UltiSession:
     opponent_sources: list[str] = field(default_factory=lambda: ["random", "random"])
     # Trump chosen by NN bidding (used in _resolve_auction for non-red adu games)
     nn_chosen_trump: Optional[Suit] = None
+    # Post-game analysis: initial hands (set when play begins) and card-by-card log
+    initial_hands: Optional[list[list[Card]]] = None  # [3] × 10 cards, set at play start
+    play_history: list[tuple[int, Card]] = field(default_factory=list)  # (player, card)
 
 
 _sessions: dict[str, UltiSession] = {}
@@ -1213,6 +1216,10 @@ def _start_play_phase(sess: UltiSession) -> None:
     sess.phase = "play"
     sess.kontra_done = False  # Will be set True after trick 1 kontra decisions
 
+    # Snapshot hands for post-game analysis (before any cards are played).
+    sess.initial_hands = [list(h) for h in sess.state.hands]
+    sess.play_history = []
+
     # Pre-initialize component_kontras (all at 0) so the encoder
     # can read them from the start.
     bid = sess.winning_bid
@@ -1321,6 +1328,7 @@ def _advance_ai_one(sess: UltiSession) -> None:
         return
 
     card = _ai_pick_card(sess)
+    sess.play_history.append((cp, card))
     result = play_card(st, card)
 
     if result is not None:
@@ -1601,6 +1609,7 @@ def play(game_id: str, body: dict[str, Any]) -> dict[str, Any]:
     if card not in legal:
         raise HTTPException(400, f"Illegal card: {card}")
 
+    sess.play_history.append((cp, card))
     result = play_card(sess.state, card)
 
     if result is not None:
@@ -1875,6 +1884,168 @@ def analyze(game_id: str, body: dict[str, Any] = {}) -> dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+#  Post-game analysis — full replay with perfect-information solver
+# ---------------------------------------------------------------------------
+
+
+def _detect_contract_type(sess: UltiSession) -> str:
+    """Return the solver contract string for a session."""
+    bid = sess.winning_bid
+    if bid is None:
+        return "parti"
+    gs = sess.state
+    if gs.betli:
+        return "betli"
+    comps = bid.components or frozenset()
+    if "durchmars" in comps:
+        return "durchmars"
+    if "ulti" in comps:
+        return "parti_ulti"
+    return "parti"
+
+
+@router.post("/{game_id}/analyze-game")
+def analyze_game(game_id: str) -> dict[str, Any]:
+    """Replay a finished game with perfect-information solving.
+
+    For every card played, the solver evaluates all legal moves at that
+    position (with all hands visible).  A card is a *blunder* ("??") if
+    the position was winning before the card and losing after it.
+
+    Returns a list of steps (one per card played) plus the initial
+    hands and talon, so the frontend can render a card-by-card
+    navigation board.
+    """
+    sess = _sessions.get(game_id)
+    if not sess:
+        raise HTTPException(404, "Game not found")
+    if sess.phase != "done":
+        raise HTTPException(400, "Game is not finished yet")
+    if not sess.initial_hands or not sess.play_history:
+        raise HTTPException(400, "No play history recorded for this game")
+
+    # Import solver (Cython if available, else Python fallback)
+    try:
+        from trickster._solver_core import solve_root as _solve
+    except ImportError:
+        from trickster.solver import solve_root as _solve
+
+    contract = _detect_contract_type(sess)
+    final_gs = sess.state
+
+    # Reconstruct a fresh GameState at trick 0 with all hands visible.
+    gs = GameState(
+        hands=[list(h) for h in sess.initial_hands],
+        soloist=final_gs.soloist,
+        trump=final_gs.trump,
+        betli=final_gs.betli,
+        scores=[0, 0, 0],
+        captured=[[], [], []],
+        dealer=final_gs.dealer,
+        leader=final_gs.leader if final_gs.trick_history else next_player(final_gs.dealer),
+        trick_no=0,
+        trick_cards=[],
+        last_trick=None,
+        contract_type=final_gs.contract_type,
+    )
+    # Set leader to the first trick's leader from history
+    if final_gs.trick_history:
+        gs.leader = final_gs.trick_history[0][0]
+
+    # Marriage points from the original game (declared before trick 1)
+    gs.marriages = list(final_gs.marriages) if final_gs.marriages else []
+    gs.marriages_declared = True
+    # Apply marriage scores (they were added before play started)
+    for _p, _s, mpts in gs.marriages:
+        gs.scores[_p] += mpts
+    # Talon discards (points go to defenders at settlement, but track them)
+    gs.talon_discards = list(final_gs.talon_discards) if final_gs.talon_discards else []
+
+    steps: list[dict[str, Any]] = []
+
+    # Initial position evaluation (before any card is played)
+    try:
+        init_values = _solve(gs, contract=contract)
+        best_init = max(init_values.values()) if init_values else 0.0
+        is_soloist_turn = (current_player(gs) == gs.soloist)
+        init_eval = best_init if is_soloist_turn else min(init_values.values())
+    except Exception:
+        init_eval = 0.0
+
+    for i, (player, card) in enumerate(sess.play_history):
+        # Solve the position BEFORE this card is played
+        step: dict[str, Any] = {
+            "index": i,
+            "player": player,
+            "card": _card_json(card),
+            "trickNo": gs.trick_no,
+            "trickPos": len(gs.trick_cards),  # 0, 1, or 2
+        }
+
+        try:
+            values = _solve(gs, contract=contract)
+        except Exception:
+            values = {}
+
+        if values:
+            is_max = (player == gs.soloist)
+            best_val = max(values.values()) if is_max else min(values.values())
+            played_val = values.get(card, best_val)
+
+            # Card evaluations for display
+            card_evals: list[dict[str, Any]] = []
+            for c, v in values.items():
+                card_evals.append({
+                    "card": _card_json(c),
+                    "value": round(v, 1),
+                    "isBest": (v == best_val) if is_max else (v == best_val),
+                })
+            step["evals"] = card_evals
+            step["playedValue"] = round(played_val, 1)
+            step["bestValue"] = round(best_val, 1)
+
+            # Blunder: the played card flips the position from winning to
+            # losing (from the perspective of the player who moved).
+            # For soloist: winning = positive, losing = negative/zero.
+            # For defender: winning = negative (lower is better for them
+            # because values are soloist-perspective).
+            if is_max:
+                blunder = best_val > 0 and played_val <= 0 and played_val < best_val
+            else:
+                blunder = best_val < 0 and played_val >= 0 and played_val > best_val
+            # Also mark as blunder if there's a significant value drop
+            # even if both are on the same side (e.g., 40→15 is a mistake)
+            val_diff = abs(best_val - played_val)
+            is_mistake = val_diff >= 5 and not blunder  # "?" for mistakes
+            step["blunder"] = blunder
+            step["mistake"] = is_mistake
+
+        else:
+            step["evals"] = []
+            step["playedValue"] = 0.0
+            step["bestValue"] = 0.0
+            step["blunder"] = False
+            step["mistake"] = False
+
+        steps.append(step)
+
+        # Now actually play the card to advance the state
+        play_card(gs, card)
+
+    return {
+        "initialHands": [[_card_json(c) for c in h] for h in sess.initial_hands],
+        "talon": [_card_json(c) for c in (sess.state.talon_discards or [])],
+        "soloist": final_gs.soloist,
+        "trump": final_gs.trump.value if final_gs.trump else None,
+        "betli": final_gs.betli,
+        "contract": contract,
+        "bidLabel": sess.winning_bid.label() if sess.winning_bid else "Passz",
+        "steps": steps,
+        "totalCards": len(sess.play_history),
+    }
+
+
 @router.get("/models")
 def list_models() -> dict[str, Any]:
     """List available model sources for opponent selection.
@@ -1885,115 +2056,3 @@ def list_models() -> dict[str, Any]:
     return {"models": sources}
 
 
-# ---------------------------------------------------------------------------
-#  Parti Practice — training-style deals (no auction, straight to play)
-# ---------------------------------------------------------------------------
-
-
-@router.post("/parti/new")
-def parti_new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
-    """Start a Parti practice game (same deals as training).
-
-    Deals 10-10-10 + 2 talon.  Talon goes to defender points.
-    Hearts trump (Piros Passz).  No auction, no discard,
-    straight to the play phase.
-
-    Soloist = next_player(dealer), rotating each round.
-
-    Optional body fields:
-      - ``seed``: int — deal seed
-      - ``dealer``: int — dealer index (0-2), rotates soloist
-      - ``opponents``: [string, string] — model sources for seat 1, 2
-    """
-    seed = body.get("seed")
-    if seed is None:
-        seed = random.randint(0, 2**31)
-    seed = int(seed)
-
-    dealer_arg = body.get("dealer")
-    if dealer_arg is not None:
-        dealer = int(dealer_arg) % 3
-    else:
-        dealer = 0
-
-    opponents = body.get("opponents", ["random", "random"])
-    if not isinstance(opponents, list) or len(opponents) != 2:
-        opponents = ["random", "random"]
-
-    game = _get_ulti_game()
-
-    # Use the first opponent's parti wrapper for deal enrichment
-    wrapper = _get_wrapper_for_contract(opponents[0], "parti")
-
-    # Deal enrichment: keep competitive deals only
-    VAL_LO = -0.20
-    VAL_HI = +0.35
-    MAX_ATTEMPTS = 50
-    best_node = None
-    best_val = -999.0
-    best_dist = 999.0
-    for attempt in range(MAX_ATTEMPTS):
-        attempt_seed = seed + attempt * 100_000
-        node = game.new_game(
-            seed=attempt_seed,
-            training_mode="simple",
-            starting_leader=dealer,
-        )
-        set_contract(node.gs, node.gs.soloist, trump=Suit.HEARTS)
-
-        if wrapper is not None:
-            sol = node.gs.soloist
-            feats = game.encode_state(node, sol)
-            val = wrapper.predict_value(feats)
-            dist = abs(val)
-            if dist < best_dist:
-                best_node, best_val, best_dist = node, val, dist
-            if VAL_LO <= val <= VAL_HI:
-                best_node, best_val = node, val
-                break
-        else:
-            best_node, best_val = node, 0.0
-            break
-
-    node = best_node
-    gs = node.gs
-
-    from trickster.games.ulti.auction import BID_BY_RANK
-    parti_bid = BID_BY_RANK[2]   # Piros passz (red Parti)
-
-    sess = UltiSession(
-        id=str(uuid.uuid4()),
-        state=gs,
-        talon=list(gs.talon_discards),
-        phase="play",
-        seed=seed,
-        dealer=dealer,
-        auction=None,
-        winning_bid=parti_bid,
-        component_kontras={"parti": 0},
-        kontra_done=False,
-        opponent_sources=opponents,
-    )
-    _sessions[sess.id] = sess
-
-    # Declare marriages before play
-    declare_all_marriages(gs)
-
-    # Generate marriage bubbles
-    for player in range(3):
-        pts = marriage_points(gs, player)
-        if pts > 0:
-            parts = []
-            for p, _suit, mpts in gs.marriages:
-                if p == player:
-                    parts.append(f"Van {mpts}-{'em' if mpts == 40 else 'am'}!")
-            sess.bubbles.append({"player": player, "text": " ".join(parts)})
-
-    # If AI leads, play one card
-    cp = current_player(gs)
-    if cp != HUMAN:
-        _advance_ai_one(sess)
-
-    result = _public_state(sess)
-    result["dealValue"] = round(best_val, 3)  # value-head assessment
-    return result

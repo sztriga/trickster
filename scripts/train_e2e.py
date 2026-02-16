@@ -98,7 +98,7 @@ def main() -> None:
     lines = [
         "END-TO-END ULTI TRAINING",
         f"Tier: {tier_name} — {tier.description}",
-        f"Phase 1: base training ({len(CONTRACT_KEYS)} contracts × {tier.total_games:,} games each)",
+        f"Phase 1: {'SKIP (from scratch)' if tier.steps == 0 else f'base training ({len(CONTRACT_KEYS)} contracts × {tier.total_games:,} games each)'}",
         f"Phase 2: bidding training ({bidding_steps:,} steps × {tier.e2e_gpi} games/step)",
     ]
     w = max(len(l) for l in lines) + 4
@@ -112,7 +112,10 @@ def main() -> None:
     print()
 
     # ── Phase 1: Base Training ──
-    if not args.skip_base:
+    skip_base = args.skip_base or tier.steps == 0
+    from_scratch = tier.steps == 0 and not args.base_from
+
+    if not skip_base:
         print("━" * 60)
         print("  PHASE 1 — BASE CONTRACT TRAINING")
         print("━" * 60)
@@ -140,6 +143,9 @@ def main() -> None:
         elapsed = time.perf_counter() - t0
         print(f"  Phase 1 complete in {fmt_time(elapsed)}")
         print()
+    elif from_scratch:
+        print("  Phase 1 skipped (training from scratch — random init)")
+        print()
     else:
         base_tier = args.base_from or tier_name
         source = f"{base_tier}_base"
@@ -162,19 +168,22 @@ def main() -> None:
 
     t_phase2 = time.perf_counter()
 
-    base_tier = args.base_from or tier_name
-    source = f"{base_tier}_base"
-    model_paths = resolve_paths(source)
     initial_nets = {}
-    print(f"  Loading base models ({source}):")
-    for key in CONTRACT_KEYS:
-        path = model_paths[key]
-        net = load_net(path, device="cpu")
-        if net is not None:
-            initial_nets[key] = net
-            print(f"    {key:<8} ← {path}")
-        else:
-            print(f"    {key:<8} — not found, starting fresh")
+    if from_scratch:
+        print("  Starting from random weights (no base models)")
+    else:
+        base_tier = args.base_from or tier_name
+        source = f"{base_tier}_base"
+        model_paths = resolve_paths(source)
+        print(f"  Loading base models ({source}):")
+        for key in CONTRACT_KEYS:
+            path = model_paths[key]
+            net = load_net(path, device="cpu")
+            if net is not None:
+                initial_nets[key] = net
+                print(f"    {key:<8} ← {path}")
+            else:
+                print(f"    {key:<8} — not found, starting fresh")
     print()
 
     pool_sources = args.opponent_pool or []

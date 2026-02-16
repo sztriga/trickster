@@ -1,16 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ultiAnalyze,
+  ultiAnalyzeGame,
   ultiAuction,
   ultiBid,
   ultiContinue,
   ultiKontra,
   ultiListModels,
   ultiNewGame,
-  ultiPartiNew,
   ultiPlay,
   ultiTrump,
   type AnalysisResult,
+  type GameAnalysis,
+  type GameAnalysisStep,
   type UltiCard,
   type UltiState,
 } from "./ulti-api";
@@ -142,6 +144,29 @@ export function UltiApp() {
   const [analysisEnabled, setAnalysisEnabled] = useState(false);
   const [analysisSource, setAnalysisSource] = useState("");
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
+
+  // Post-game analysis board
+  const [gameAnalysis, setGameAnalysis] = useState<GameAnalysis | null>(null);
+  const [analysisStep, setAnalysisStep] = useState(0);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+
+  // Keyboard navigation for analysis board
+  useEffect(() => {
+    if (!gameAnalysis) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "ArrowLeft") {
+        setAnalysisStep(s => Math.max(0, s - 1));
+        e.preventDefault();
+      } else if (e.key === "ArrowRight") {
+        setAnalysisStep(s => Math.min(gameAnalysis.totalCards, s + 1));
+        e.preventDefault();
+      } else if (e.key === "Escape") {
+        setGameAnalysis(null);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [gameAnalysis]);
   const analysisKey = useRef("");  // tracks position for cache invalidation
 
   const legalSet = useMemo(() => {
@@ -289,6 +314,22 @@ export function UltiApp() {
     return s;
   }, [analysis]);
 
+  /** Open post-game analysis board. */
+  async function openGameAnalysis() {
+    if (!state) return;
+    setAnalysisLoading(true);
+    setErr("");
+    try {
+      const ga = await ultiAnalyzeGame(state.gameId);
+      setGameAnalysis(ga);
+      setAnalysisStep(0);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setAnalysisLoading(false);
+    }
+  }
+
   /** Start the next round within the current match. */
   async function nextRound() {
     setErr(""); setBusy(true);
@@ -312,7 +353,6 @@ export function UltiApp() {
     setMatchScores([0, 0, 0]);
     recordedGameId.current = null;
     setShowScorecard(false);
-    setIsPartiMode(false);
     setScreen("game");
     setErr(""); setBusy(true);
     try {
@@ -334,7 +374,6 @@ export function UltiApp() {
     setMatchScores([0, 0, 0]);
     recordedGameId.current = null;
     setShowScorecard(false);
-    setIsPartiMode(false);
     setScreen("lobby");
   }
 
@@ -376,46 +415,6 @@ export function UltiApp() {
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
-
-  // Parti practice mode
-  const [isPartiMode, setIsPartiMode] = useState(false);
-
-  /** Start a Parti practice game (training-style deal, no auction). */
-  async function startParti() {
-    setRoundHistory([]);
-    setMatchScores([0, 0, 0]);
-    recordedGameId.current = null;
-    setShowScorecard(false);
-    setIsPartiMode(true);
-    setErr(""); setBusy(true);
-    try {
-      const st = await ultiPartiNew(null, undefined, activeOpponents);
-      setState(st);
-      setSelectedDiscards(new Set());
-      setSelectedBidIdx(0);
-      setShowCaptured(false);
-      bubble0.clear(); bubble1.clear(); bubble2.clear();
-      lastBubbleKey.current = "";
-    } catch (e) { setErr(String(e)); }
-    finally { setBusy(false); }
-  }
-
-  /** Next round in Parti practice — rotate dealer so soloist cycles. */
-  async function nextPartiRound() {
-    setErr(""); setBusy(true);
-    try {
-      const nextDealer = state ? (state.dealer + 1) % 3 : 0;
-      const st = await ultiPartiNew(null, nextDealer, activeOpponents);
-      setState(st);
-      setSelectedDiscards(new Set());
-      setSelectedBidIdx(0);
-      setShowCaptured(false);
-      bubble0.clear(); bubble1.clear(); bubble2.clear();
-      lastBubbleKey.current = "";
-    } catch (e) { setErr(String(e)); }
-    finally { setBusy(false); }
-  }
-
 
   // Captured cards reveal toggle
   const [showCaptured, setShowCaptured] = useState(false);
@@ -527,9 +526,7 @@ export function UltiApp() {
         <div className="brand">
           <div className="title">Trickster Ulti</div>
           <div className="subtitle">
-            {isPartiMode
-              ? `Piros Parti gyakorlás | Te: ${matchScores[0]} | ${PLAYER_LABEL[1]}: ${matchScores[1]} | ${PLAYER_LABEL[2]}: ${matchScores[2]}`
-              : roundHistory.length > 0
+            {roundHistory.length > 0
                 ? `${roundHistory.length}. kör | Te: ${matchScores[0]} | ${PLAYER_LABEL[1]}: ${matchScores[1]} | ${PLAYER_LABEL[2]}: ${matchScores[2]}`
                 : `${PLAYER_LABEL[1]} vs Te vs ${PLAYER_LABEL[2]}`}
           </div>
@@ -551,9 +548,7 @@ export function UltiApp() {
           {state && phase !== "bid" && phase !== "auction" && phase !== "trump_select" && state.contract && (
             <div className="ulti-contract-badge">
               <span className={`ulti-badge ${state.betli ? "ulti-badge-betli" : "ulti-badge-normal"}`}>
-                {isPartiMode
-                  ? (state.contract.bid.trumpMode === "red" ? "Piros Parti" : "Parti")
-                  : state.contract.bid.label}
+                {state.contract.bid.label}
                 {!state.betli && state.trump && (
                   <>
                     {" — Adu: "}
@@ -568,11 +563,6 @@ export function UltiApp() {
               </span>
               <span className="ulti-badge-value">
                 {state.contract.displayWin}p / -{state.contract.displayLoss}p
-                {isPartiMode && state.dealValue != null && (
-                  <span className="ulti-deal-value" title="Játékos esélye (value head)">
-                    {" "}| v={state.dealValue > 0 ? "+" : ""}{state.dealValue.toFixed(2)}
-                  </span>
-                )}
               </span>
             </div>
           )}
@@ -970,8 +960,11 @@ export function UltiApp() {
           {/* Next round + scorecard buttons when done */}
           {phase === "done" && (
             <div className="ulti-done-actions">
-              <button className="btn btn-primary" onClick={isPartiMode ? nextPartiRound : nextRound} disabled={busy}>
+              <button className="btn btn-primary" onClick={nextRound} disabled={busy}>
                 Következő kör
+              </button>
+              <button className="btn" onClick={openGameAnalysis} disabled={busy || analysisLoading}>
+                {analysisLoading ? "Elemzés..." : "Elemzés"}
               </button>
               {roundHistory.length > 0 && (
                 <button className="btn" onClick={() => setShowScorecard(true)}>
@@ -1206,6 +1199,178 @@ export function UltiApp() {
           {analysis.sims != null && <span className="ulti-analysis-sims">{analysis.sims} sim</span>}
         </div>
       )}
+
+      {/* Post-game analysis board */}
+      {gameAnalysis && (() => {
+        const ga = gameAnalysis;
+        const step = analysisStep;
+        const curStep: GameAnalysisStep | null = step > 0 ? ga.steps[step - 1] : null;
+
+        // Reconstruct hands at the current step: start from initial hands,
+        // remove cards that have been played up to (but not including) this step.
+        const hands: UltiCard[][] = ga.initialHands.map(h => [...h]);
+
+        for (let i = 0; i < step; i++) {
+          const s = ga.steps[i];
+          const hand = hands[s.player];
+          const idx = hand.findIndex(c => c.suit === s.card.suit && c.rank === s.card.rank);
+          if (idx >= 0) hand.splice(idx, 1);
+        }
+
+        // Build trick area: show cards in the current trick at this step.
+        // The current trick is determined by the last played card's trickNo.
+        const trickSlots: Record<number, { card: UltiCard; blunder?: boolean; mistake?: boolean }> = {};
+        if (step > 0) {
+          const curTrickNo = ga.steps[step - 1].trickNo;
+          for (let i = 0; i < step; i++) {
+            const s = ga.steps[i];
+            if (s.trickNo === curTrickNo) {
+              trickSlots[s.player] = { card: s.card, blunder: s.blunder, mistake: s.mistake };
+            }
+          }
+        }
+
+        // Card evaluation at current step (before this card was played)
+        const nextStep: GameAnalysisStep | null = step < ga.steps.length ? ga.steps[step] : null;
+
+        // Build eval map for the next card to play (highlighting legal moves)
+        const evalMap = new Map<string, { value: number; isBest: boolean }>();
+        if (nextStep) {
+          for (const ev of nextStep.evals) {
+            evalMap.set(`${ev.card.suit}-${ev.card.rank}`, { value: ev.value, isBest: ev.isBest });
+          }
+        }
+
+        const renderHand = (playerIdx: number, position: "top" | "left" | "right" | "bottom") => {
+          const hand = hands[playerIdx];
+          const isNextPlayer = nextStep?.player === playerIdx;
+          return (
+            <div className={`pgab-hand pgab-hand-${position}`}>
+              <div className="pgab-hand-label">
+                {playerIdx === 0 ? "Te" : PLAYER_LABEL[playerIdx]}
+                {playerIdx === ga.soloist && <span className="ulti-role-tag ulti-role-soloist"> J</span>}
+              </div>
+              <div className="pgab-cards">
+                {hand.map((c, ci) => {
+                  const key = `${c.suit}-${c.rank}`;
+                  const ev = isNextPlayer ? evalMap.get(key) : undefined;
+                  return (
+                    <div key={ci} className={`pgab-card${ev?.isBest ? " pgab-card-best" : ""}`}>
+                      <img className="card-hand" src={ultiCardUrl(c)} alt={ultiCardLabel(c)} />
+                      {ev && (
+                        <span className={`pgab-card-eval ${ev.value > 0 ? "pgab-eval-good" : ev.value < 0 ? "pgab-eval-bad" : "pgab-eval-neutral"}`}>
+                          {ev.value > 0 ? "+" : ""}{ev.value.toFixed(0)}
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        };
+
+        return (
+          <div className="modal-overlay pgab-overlay" onClick={() => setGameAnalysis(null)}>
+            <div className="pgab-board" onClick={(e) => e.stopPropagation()}>
+
+              {/* Header */}
+              <div className="pgab-header">
+                <span className="pgab-title">Játék elemzés — {ga.bidLabel}</span>
+                <button className="btn pgab-close" onClick={() => setGameAnalysis(null)}>✕</button>
+              </div>
+
+              {/* Board layout */}
+              <div className="pgab-layout">
+                {/* AI opponents at top */}
+                {renderHand(1, "left")}
+                {renderHand(2, "right")}
+
+                {/* Trick area in center */}
+                <div className="pgab-trick-area">
+                  {[1, 2, 0].map(p => {
+                    const slot = trickSlots[p];
+                    if (!slot) return <div key={p} className="pgab-trick-slot pgab-trick-empty" />;
+                    return (
+                      <div key={p} className={`pgab-trick-slot${slot.blunder ? " pgab-blunder" : slot.mistake ? " pgab-mistake" : ""}`}>
+                        <img className="card-trick" src={ultiCardUrl(slot.card)} alt={ultiCardLabel(slot.card)} />
+                        {slot.blunder && <span className="pgab-blunder-tag">??</span>}
+                        {slot.mistake && <span className="pgab-mistake-tag">?</span>}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Human hand at bottom */}
+                {renderHand(0, "bottom")}
+              </div>
+
+              {/* Talon */}
+              {ga.talon.length > 0 && (
+                <div className="pgab-talon">
+                  Talon: {ga.talon.map((c, i) => (
+                    <img key={i} className="card-mini" src={ultiCardUrl(c)} alt={ultiCardLabel(c)} />
+                  ))}
+                </div>
+              )}
+
+              {/* Info bar: current step evaluation */}
+              {curStep && (
+                <div className="pgab-eval-bar">
+                  <span className="pgab-eval-player">{curStep.player === 0 ? "Te" : PLAYER_LABEL[curStep.player]}</span>
+                  <span> → </span>
+                  <span>{ultiCardLabel(curStep.card)}</span>
+                  <span className={`pgab-eval-value ${curStep.playedValue > 0 ? "pgab-eval-good" : curStep.playedValue < 0 ? "pgab-eval-bad" : ""}`}>
+                    {" "}({curStep.playedValue > 0 ? "+" : ""}{curStep.playedValue.toFixed(0)})
+                  </span>
+                  {curStep.blunder && <span className="pgab-blunder-badge">??</span>}
+                  {curStep.mistake && <span className="pgab-mistake-badge">?</span>}
+                  {!curStep.blunder && !curStep.mistake && curStep.playedValue === curStep.bestValue && (
+                    <span className="pgab-best-badge">✓</span>
+                  )}
+                </div>
+              )}
+
+              {/* Timeline scrubber with blunder markers */}
+              <div className="pgab-timeline">
+                {ga.steps.map((s, i) => (
+                  <div
+                    key={i}
+                    className={`pgab-timeline-tick${i + 1 === step ? " pgab-tick-active" : ""}${s.blunder ? " pgab-tick-blunder" : s.mistake ? " pgab-tick-mistake" : ""}`}
+                    onClick={() => setAnalysisStep(i + 1)}
+                    title={`${i + 1}. ${ultiCardLabel(s.card)}${s.blunder ? " ??" : s.mistake ? " ?" : ""}`}
+                  >
+                    {s.trickPos === 0 && <span className="pgab-tick-divider" />}
+                    {s.blunder ? "!!" : s.mistake ? "?" : ""}
+                  </div>
+                ))}
+              </div>
+
+              {/* Navigation arrows */}
+              <div className="pgab-nav">
+                <button
+                  className="btn pgab-nav-btn"
+                  onClick={() => setAnalysisStep(Math.max(0, step - 1))}
+                  disabled={step <= 0}
+                >
+                  ◀
+                </button>
+                <span className="pgab-nav-label">
+                  {step} / {ga.totalCards}
+                  {curStep && ` — ${curStep.trickNo + 1}. ütés`}
+                </span>
+                <button
+                  className="btn pgab-nav-btn"
+                  onClick={() => setAnalysisStep(Math.min(ga.totalCards, step + 1))}
+                  disabled={step >= ga.totalCards}
+                >
+                  ▶
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }

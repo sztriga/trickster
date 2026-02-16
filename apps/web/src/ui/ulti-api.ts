@@ -111,7 +111,6 @@ export type UltiState = {
   capturedTricks: UltiCard[][];
   bubbles: { player: number; text: string }[];
   opponents: [string, string];
-  dealValue?: number;
   talonCards: UltiCard[] | null;
 };
 
@@ -179,19 +178,6 @@ export function ultiContinue(gameId: string): Promise<UltiState> {
   return post(`/${gameId}/continue`);
 }
 
-/** Start a Parti practice game (training-style deal, no auction). */
-export function ultiPartiNew(
-  seed?: number | null,
-  dealer?: number,
-  opponents?: [string, string],
-): Promise<UltiState> {
-  const body: Record<string, unknown> = {};
-  if (seed != null) body.seed = seed;
-  if (dealer != null) body.dealer = dealer;
-  if (opponents) body.opponents = opponents;
-  return post("/parti/new", body);
-}
-
 /** List available model sources from the server. */
 export async function ultiListModels(): Promise<string[]> {
   const res = await fetch(`${BASE}/models`);
@@ -234,6 +220,38 @@ export async function ultiAnalyze(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ source, sims, dets }),
   });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/** Post-game analysis: card-by-card replay with perfect-info solver. */
+export type GameAnalysisStep = {
+  index: number;
+  player: number;
+  card: UltiCard;
+  trickNo: number;
+  trickPos: number;  // 0, 1, or 2 within the trick
+  evals: { card: UltiCard; value: number; isBest: boolean }[];
+  playedValue: number;
+  bestValue: number;
+  blunder: boolean;
+  mistake: boolean;
+};
+
+export type GameAnalysis = {
+  initialHands: UltiCard[][];  // [3] × N cards
+  talon: UltiCard[];
+  soloist: number;
+  trump: string | null;
+  betli: boolean;
+  contract: string;
+  bidLabel: string;
+  steps: GameAnalysisStep[];
+  totalCards: number;
+};
+
+export async function ultiAnalyzeGame(gameId: string): Promise<GameAnalysis> {
+  const res = await fetch(`${BASE}/${gameId}/analyze-game`, { method: "POST" });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
