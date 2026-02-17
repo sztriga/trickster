@@ -9,8 +9,11 @@ Phase 2 — Bidding training:
     Takes the Phase 1 models and trains them together with value-head
     bidding, kontra, and neural discard.  Produces the final e2e models.
 
+Multiple tiers can be trained sequentially in a single invocation.
+
 Usage:
-    python scripts/train_e2e.py knight                          # full pipeline
+    python scripts/train_e2e.py knight                          # single tier
+    python scripts/train_e2e.py knight knight_balanced knight_heavy knight_pure  # batch
     python scripts/train_e2e.py bishop --workers 6              # heavier tier
     python scripts/train_e2e.py knight --skip-base              # Phase 2 only
     python scripts/train_e2e.py knight --bidding-steps 4000 -v  # verbose
@@ -57,37 +60,9 @@ from trickster.training.tiers import (
 )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="End-to-end Ulti training: base models → bidding",
-    )
-    parser.add_argument(
-        "tier", choices=list(TIERS.keys()),
-        help="Tier to train (defines net size, MCTS budget, etc.)",
-    )
-    parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--skip-base", action="store_true",
-                        help="Skip Phase 1 (base models must already exist)")
-    parser.add_argument("--base-from", type=str, default=None,
-                        help="Load base models from a different tier (e.g. bronze)")
-    parser.add_argument("--bidding-steps", type=int, default=None,
-                        help="Override bidding training steps")
-    parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--opponent-pool", nargs="*", default=None,
-        help="Model sources for opponent pool (e.g. scout knight). "
-             "Defenders in pool games use a randomly chosen pool model.",
-    )
-    parser.add_argument(
-        "--pool-frac", type=float, default=0.5,
-        help="Fraction of games played vs pool opponents (default 0.5)",
-    )
-    args = parser.parse_args()
-
-    tier = TIERS[args.tier]
-    tier_name = args.tier
+def train_tier(tier_name: str, args) -> None:
+    """Train a single tier (Phase 1 + Phase 2)."""
+    tier = TIERS[tier_name]
     bidding_steps = args.bidding_steps or tier.e2e_steps
     resolved_device = auto_device(
         tier.body_units, tier.body_layers,
@@ -292,7 +267,7 @@ def main() -> None:
     print("  │")
     print(f"  │  Tier:     {tier_name}")
     print(f"  │  Output:   {save_base}/")
-    print(f"  │  Phase 1:  {fmt_time(elapsed_total - elapsed_phase2) if not args.skip_base else 'skipped'}")
+    print(f"  │  Phase 1:  {fmt_time(elapsed_total - elapsed_phase2) if not skip_base else 'skipped'}")
     print(f"  │  Phase 2:  {fmt_time(elapsed_phase2)} "
           f"({total_games:,} games, {total_passes:,} passes)")
     print(f"  │  Total:    {fmt_time(elapsed_total)}")
@@ -311,6 +286,68 @@ def main() -> None:
 
     print("  └" + "─" * w)
     print()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="End-to-end Ulti training: base models → bidding. "
+                    "Supports multiple tiers in one invocation.",
+    )
+    parser.add_argument(
+        "tiers", nargs="+", choices=list(TIERS.keys()),
+        metavar="TIER",
+        help=f"Tier(s) to train: {', '.join(TIERS.keys())}",
+    )
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--skip-base", action="store_true",
+                        help="Skip Phase 1 (base models must already exist)")
+    parser.add_argument("--base-from", type=str, default=None,
+                        help="Load base models from a different tier (e.g. bronze)")
+    parser.add_argument("--bidding-steps", type=int, default=None,
+                        help="Override bidding training steps")
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--opponent-pool", nargs="*", default=None,
+        help="Model sources for opponent pool (e.g. scout knight). "
+             "Defenders in pool games use a randomly chosen pool model.",
+    )
+    parser.add_argument(
+        "--pool-frac", type=float, default=0.5,
+        help="Fraction of games played vs pool opponents (default 0.5)",
+    )
+    args = parser.parse_args()
+
+    # Validate tier names (argparse choices with nargs="+" gives poor errors)
+    valid = set(TIERS.keys())
+    bad = [t for t in args.tiers if t not in valid]
+    if bad:
+        parser.error(f"unknown tier(s): {', '.join(bad)}. "
+                     f"Choose from: {', '.join(valid)}")
+
+    n = len(args.tiers)
+    t_all = time.perf_counter()
+
+    if n > 1:
+        print()
+        print(f"  Queued {n} tiers: {', '.join(args.tiers)}")
+
+    for i, tier_name in enumerate(args.tiers, 1):
+        if n > 1:
+            print()
+            print("=" * 64)
+            print(f"  TIER {i}/{n}: {tier_name}")
+            print("=" * 64)
+        train_tier(tier_name, args)
+
+    if n > 1:
+        elapsed = time.perf_counter() - t_all
+        print("=" * 64)
+        print(f"  ALL {n} TIERS COMPLETE in {fmt_time(elapsed)}")
+        print(f"  Trained: {', '.join(args.tiers)}")
+        print("=" * 64)
+        print()
 
 
 if __name__ == "__main__":

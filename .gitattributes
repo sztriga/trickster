@@ -1,0 +1,4 @@
+models/**/*.pt filter=lfs diff=lfs merge=lfs -text
+models/**/*.pkl filter=lfs diff=lfs merge=lfs -text
+models/**/train_info.json filter=lfs diff=lfs merge=lfs -text
+models/**/spec.json filter=lfs diff=lfs merge=lfs -text
