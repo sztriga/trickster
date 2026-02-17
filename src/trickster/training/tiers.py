@@ -74,6 +74,10 @@ class Tier:
     body_layers: int = 4
     batch_size: int = 64
 
+    # GPU flag — when True the training loop uses CUDA + cross-game
+    # inference batching instead of CPU + ONNX.
+    gpu: bool = False
+
     @property
     def total_games(self) -> int:
         return self.steps * self.games_per_step
@@ -224,5 +228,17 @@ TIERS: dict[str, Tier] = {
         sol_sims=1000, def_sims=400, sol_dets=16, def_dets=12,
         pimc_dets=200, endgame_tricks=8,
         lr_start=1e-3, lr_end=5e-5,
+    ),
+    # GPU branch: large model, requires CUDA
+    "king": Tier(
+        label="King", index=20,
+        description="King — GPU large model (2048×8, 256k total)",
+        steps=4000, games_per_step=16, train_steps=100, buffer_size=200_000,
+        e2e_steps=4000, e2e_gpi=16, e2e_train_steps=100, e2e_buffer_size=200_000,
+        sol_sims=150, def_sims=60, sol_dets=4, def_dets=3,
+        pimc_dets=80, endgame_tricks=7,
+        body_units=2048, body_layers=8, batch_size=256,
+        lr_start=3e-4, lr_end=2e-5,
+        gpu=True,
     ),
 }

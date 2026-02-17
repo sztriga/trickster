@@ -36,6 +36,7 @@ from trickster.training.bidding_loop import (
     train_with_bidding,
 )
 from trickster.training.contract_loop import train_one_tier
+from trickster.model import _ort_available
 from trickster.training.model_io import (
     DK_LABELS,
     auto_device,
@@ -88,8 +89,23 @@ def main() -> None:
     tier = TIERS[args.tier]
     tier_name = args.tier
     bidding_steps = args.bidding_steps or tier.e2e_steps
-    resolved_device = auto_device(tier.body_units, tier.body_layers, force=args.device)
+    resolved_device = auto_device(
+        tier.body_units, tier.body_layers,
+        force=args.device, gpu_tier=tier.gpu,
+    )
     params = estimate_params(tier.body_units, tier.body_layers)
+
+    # Inference/solver backend strings
+    if resolved_device == "cpu":
+        inf_str = "ONNX (CPU)" if _ort_available() else "PyTorch (CPU)"
+    else:
+        inf_str = f"PyTorch ({resolved_device.upper()})"
+    solver_str = SOLVER_ENGINE
+
+    # Warn if GPU tier falls back to CPU (no CUDA)
+    if tier.gpu and resolved_device == "cpu":
+        print("\n  WARNING: GPU tier selected but no CUDA device available — "
+              "falling back to CPU.\n")
 
     t0 = time.perf_counter()
 
@@ -107,8 +123,13 @@ def main() -> None:
         print(f"║  {l:<{w-2}}║")
     print("╚" + "═" * w + "╝")
     print(f"  Net: {tier.body_units}×{tier.body_layers} (~{params:,} params)")
-    print(f"  Device: {resolved_device}")
-    print(f"  Workers: {args.workers}  Solver: {SOLVER_ENGINE}")
+    print(f"  Inference: {inf_str}  |  Solver: {solver_str}")
+    if tier.gpu and resolved_device != "cpu":
+        print(f"  Self-play: {tier.games_per_step} concurrent games (GPU batching)")
+    elif args.workers > 1:
+        print(f"  Self-play: {args.workers} workers (process pool)")
+    else:
+        print(f"  Self-play: sequential")
     print()
 
     # ── Phase 1: Base Training ──
@@ -131,7 +152,7 @@ def main() -> None:
             train_one_tier(
                 tier, spec,
                 seed=args.seed,
-                device=args.device,
+                device=resolved_device,
                 num_workers=args.workers,
                 enrichment=True,
                 verbose=args.verbose,
@@ -211,7 +232,7 @@ def main() -> None:
         contract_keys=CONTRACT_KEYS,
         num_workers=args.workers,
         seed=args.seed,
-        device=args.device,
+        device=resolved_device,
         opponent_pool=pool_sources,
         pool_frac=args.pool_frac,
     )

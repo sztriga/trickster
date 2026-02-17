@@ -731,14 +731,6 @@ def train_with_bidding(
 
                 stats.total_games += 1
 
-            # Move nets to CPU for self-play (GPU used only for SGD).
-            # Not needed when using ONNX — sessions are independent.
-            _any_onnx = any(isinstance(s.wrapper, OnnxUltiWrapper) for s in slots.values())
-            if use_gpu and executor is None and not _any_onnx:
-                for slot in slots.values():
-                    slot.net.to("cpu")
-                    slot.wrapper.device = torch.device("cpu")
-
             if executor is not None:
                 # --- Parallel self-play ---
                 all_state_dicts = {
@@ -778,12 +770,6 @@ def train_with_bidding(
                         opp_wrappers=opp_w,
                     )
                     _collect_result(dkey, samples)
-
-            # Move nets back to training device for SGD
-            if use_gpu and not _any_onnx:
-                for slot in slots.values():
-                    slot.net.to(device)
-                    slot.wrapper.device = torch.device(device)
 
             # -- SGD for each contract that has enough data --
             step_model_vloss: dict[str, float] = {}

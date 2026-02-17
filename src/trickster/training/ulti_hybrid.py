@@ -84,6 +84,7 @@ class UltiTrainConfig:
 
     # -- Parallelism --
     num_workers: int = 1
+    concurrent_games: int = 1  # cross-game GPU batching (auto-set for GPU tiers)
 
     # -- Deal enrichment --
     enrichment: bool = False
@@ -694,13 +695,19 @@ def train_ulti_hybrid(
 
     # -- Parallel self-play pool --
     executor = None
+    batch_server = None
     net_kwargs = {
         "input_dim": game.state_dim,
         "body_units": cfg.body_units,
         "body_layers": cfg.body_layers,
         "action_dim": game.action_space_size,
     }
-    if cfg.num_workers > 1:
+    if cfg.concurrent_games > 1:
+        from trickster.batch_inference import BatchInferenceServer
+
+        batch_server = BatchInferenceServer(wrapper, drain_ms=1.0)
+        batch_server.start()
+    elif cfg.num_workers > 1:
         from concurrent.futures import ProcessPoolExecutor
 
         executor = ProcessPoolExecutor(
@@ -801,12 +808,59 @@ def train_ulti_hybrid(
                     sp_pts_sum, sp_total, step_samples = _collect_results(
                         futures, buffer, stats,
                     )
+            elif batch_server is not None:
+                # --- Threaded self-play with GPU batching ---
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _play_game_threaded(g_seed: int):
+                    use_enrich = (
+                        past_warmup
+                        and thresh > -999.0
+                        and (g_seed % cfg.games_per_step) / cfg.games_per_step
+                        >= cfg.enrich_random_frac
+                    )
+                    init_state = None
+                    if cfg.neural_discard:
+                        init_state = _new_game_with_neural_discard(
+                            UltiGame(), batch_server, g_seed,
+                            training_mode=cfg.training_mode,
+                            dealer=g_seed % 3,
+                        )
+                    elif use_enrich:
+                        init_state, _ = _value_enriched_new_game(
+                            UltiGame(), batch_server, g_seed,
+                            min_value=thresh,
+                            training_mode=cfg.training_mode,
+                        )
+                    return _play_one_game(
+                        UltiGame(), batch_server, sol_cfg, def_cfg, g_seed,
+                        endgame_tricks=cfg.endgame_tricks,
+                        pimc_dets=cfg.pimc_dets,
+                        solver_temp=cfg.solver_temp,
+                        training_mode=cfg.training_mode,
+                        initial_state=init_state,
+                        solver_teacher=cfg.solver_teacher,
+                        kontra_enabled=cfg.kontra_enabled,
+                    )
+
+                with ThreadPoolExecutor(max_workers=cfg.concurrent_games) as tpool:
+                    game_seeds = [
+                        cfg.seed + step * 1000 + g
+                        for g in range(cfg.games_per_step)
+                    ]
+                    futs = [tpool.submit(_play_game_threaded, s) for s in game_seeds]
+                    for f in as_completed(futs):
+                        samples = f.result()
+                        sol_r = [r for _, _, _, r, is_sol in samples if is_sol]
+                        if sol_r:
+                            sp_total += 1
+                            sp_pts_sum += sol_r[0]
+                        for s, m, p, r, is_sol in samples:
+                            buffer.push(s, m, p, r, is_soloist=is_sol)
+                        step_samples += len(samples)
+                        stats.total_games += 1
             else:
                 # --- Sequential self-play (no workers) ---
-                if not _is_onnx and use_gpu:
-                    net.to("cpu")
-                    wrapper.device = torch.device("cpu")
-
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
 
@@ -850,10 +904,6 @@ def train_ulti_hybrid(
                         buffer.push(s, m, p, r, is_soloist=is_sol)
                     step_samples += len(samples)
                     stats.total_games += 1
-
-                if not _is_onnx and use_gpu:
-                    net.to(device)
-                    wrapper.device = torch.device(device)
 
             stats.total_samples += step_samples
 
@@ -931,9 +981,11 @@ def train_ulti_hybrid(
                 avg_sol_vloss = total_sol_vloss / max(1, sol_count)
                 avg_def_vloss = total_def_vloss / max(1, def_count)
 
-            # Re-export ONNX sessions with updated weights
+            # Re-export ONNX sessions / sync batch server weights
             if _is_onnx:
                 wrapper.sync_weights(net)
+            elif batch_server is not None:
+                batch_server.sync_weights(net)
 
             # ---- 3. Update stats ----
             stats.step = step
@@ -962,6 +1014,8 @@ def train_ulti_hybrid(
                 f.cancel()
         if executor is not None:
             executor.shutdown(wait=False)
+        if batch_server is not None:
+            batch_server.stop()
 
     stats.train_time_s = time.perf_counter() - t0
     return net, stats

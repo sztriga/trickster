@@ -22,9 +22,6 @@ from trickster.model import UltiNet, UltiNetWrapper, make_wrapper
 #  Device selection
 # ---------------------------------------------------------------------------
 
-_GPU_PARAM_THRESHOLD = 3_000_000
-
-
 def estimate_params(body_units: int, body_layers: int) -> int:
     """Rough parameter estimate (dominant term: L × U²)."""
     return body_layers * body_units * body_units
@@ -34,19 +31,26 @@ def auto_device(
     body_units: int = 256,
     body_layers: int = 4,
     force: str | None = None,
+    *,
+    gpu_tier: bool = False,
 ) -> str:
-    """Pick training device based on model size and available hardware."""
+    """Pick training device.
+
+    CPU tiers use ONNX Runtime for fast single-sample inference.
+    GPU tiers (``gpu_tier=True``) use PyTorch on CUDA with cross-game
+    inference batching.
+
+    Returns ``"cpu"`` unless the tier requests GPU **and** hardware
+    is available, or the caller explicitly forces a device.
+    """
     if force is not None and force != "auto":
         return force
 
-    params = estimate_params(body_units, body_layers)
-    if params < _GPU_PARAM_THRESHOLD:
-        return "cpu"
-
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
+    if gpu_tier:
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
     return "cpu"
 
 

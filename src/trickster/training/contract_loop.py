@@ -13,7 +13,7 @@ import torch
 
 from trickster.games.ulti.adapter import UltiGame
 from trickster.hybrid import SOLVER_ENGINE
-from trickster.model import UltiNet
+from trickster.model import UltiNet, _ort_available
 from trickster.train_utils import _GAME_PTS_MAX
 from trickster.training.model_io import auto_device
 from trickster.training.tiers import ContractSpec, Tier
@@ -38,6 +38,14 @@ def _build_config(
     enrichment: bool,
     leaf_batch_size: int = 8,
 ) -> UltiTrainConfig:
+    # GPU tiers: use cross-game batching, disable process pool
+    if tier.gpu and device not in ("cpu",):
+        concurrent = tier.games_per_step
+        workers = 1
+    else:
+        concurrent = 1
+        workers = num_workers
+
     return UltiTrainConfig(
         steps=tier.steps,
         games_per_step=tier.games_per_step,
@@ -56,7 +64,8 @@ def _build_config(
         body_units=tier.body_units,
         body_layers=tier.body_layers,
         leaf_batch_size=leaf_batch_size,
-        num_workers=num_workers,
+        num_workers=workers,
+        concurrent_games=concurrent,
         enrichment=enrichment,
         seed=seed,
         device=device,
@@ -171,16 +180,28 @@ def train_one_tier(
             body_layers=cfg.body_layers, action_dim=game.action_space_size,
         ).parameters()
     )
-    resolved = auto_device(cfg.body_units, cfg.body_layers, force=cfg.device)
+    resolved = auto_device(cfg.body_units, cfg.body_layers, force=cfg.device,
+                           gpu_tier=tier.gpu)
+
+    # Inference backend
+    if resolved == "cpu":
+        inf_backend = "ONNX (CPU)" if _ort_available() else "PyTorch (CPU)"
+    else:
+        inf_backend = f"PyTorch ({resolved.upper()})"
+
     print(f"    Net: {cfg.body_units}x{cfg.body_layers} ({param_count:,} params)")
-    print(f"    MCTS: sol={cfg.sol_sims}s def={cfg.def_sims}s | "
-          f"Solver: {SOLVER_ENGINE} (endgame={cfg.endgame_tricks}t, "
-          f"PIMC={cfg.pimc_dets}d)")
+    print(f"    Inference: {inf_backend}  |  Solver: {SOLVER_ENGINE}")
+    print(f"    MCTS: sol={cfg.sol_sims}s def={cfg.def_sims}s  "
+          f"endgame={cfg.endgame_tricks}t  PIMC={cfg.pimc_dets}d")
     print(f"    LR: {cfg.lr_start} → {cfg.lr_end} (cosine)  "
           f"batch={cfg.batch_size}  SGD/step={cfg.train_steps}  "
           f"buffer={cfg.buffer_size:,}")
-    workers_str = f"{cfg.num_workers} (parallel)" if cfg.num_workers > 1 else "1 (sequential)"
-    print(f"    Workers: {workers_str}")
+    if cfg.concurrent_games > 1:
+        print(f"    Self-play: {cfg.concurrent_games} concurrent games (GPU batching)")
+    elif cfg.num_workers > 1:
+        print(f"    Self-play: {cfg.num_workers} workers (process pool)")
+    else:
+        print(f"    Self-play: sequential")
     print()
 
     # Train
