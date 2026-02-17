@@ -1,14 +1,16 @@
-"""Build script for the Cython alpha-beta solver extension.
+"""Build script for all Cython extensions.
 
 Usage:
     pip install cython                              # one-time
     python setup_cython.py build_ext --inplace      # compile
 
-The compiled extension (_solver_core.pyd on Windows, .so on Linux)
-is placed next to the .pyx source in src/trickster/.
+Extensions built:
+    trickster._solver_core              — Ulti alpha-beta endgame solver
+    trickster.games.snapszer._fast_minimax — Snapszer alpha-beta + PIMC
 
 After building, verify with:
     python -c "from trickster._solver_core import solve_root; print('OK')"
+    python -c "from trickster.games.snapszer._fast_minimax import c_alphabeta; print('OK')"
 """
 
 from setuptools import setup, Extension
@@ -19,10 +21,14 @@ extensions = [
         name="trickster._solver_core",
         sources=["src/trickster/_solver_core.pyx"],
     ),
+    Extension(
+        name="trickster.games.snapszer._fast_minimax",
+        sources=["src/trickster/games/snapszer/_fast_minimax.pyx"],
+    ),
 ]
 
 setup(
-    name="trickster-solver-ext",
+    name="trickster-cython-ext",
     ext_modules=cythonize(
         extensions,
         compiler_directives={
@@ -34,5 +40,5 @@ setup(
         },
     ),
     package_dir={"": "src"},
-    packages=["trickster"],
+    packages=["trickster", "trickster.games.snapszer"],
 )

@@ -57,13 +57,13 @@ echo "  Done. Using $(python3 --version)"
 # ── Python dependencies ──────────────────────────────
 echo "[3/5] Installing Python packages..."
 pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-pip install -q numpy cython fastapi uvicorn
+pip install -q numpy cython fastapi uvicorn onnxruntime
 pip install -e . -q
 echo "  Done."
 
-# ── Cython solver ────────────────────────────────────
-echo "[4/5] Building Cython alpha-beta solver..."
-python3 setup_cython.py build_ext --inplace 2>&1 | tail -3
+# ── Cython extensions ─────────────────────────────────
+echo "[4/5] Building Cython extensions (Ulti solver + Snapszer minimax)..."
+python3 setup_cython.py build_ext --inplace 2>&1 | tail -5
 echo ""
 
 # ── Verify ───────────────────────────────────────────
@@ -72,7 +72,9 @@ FAIL=0
 
 python3 -c "import torch; print(f'  PyTorch {torch.__version__}: OK')" || FAIL=1
 python3 -c "import numpy; print(f'  NumPy {numpy.__version__}: OK')" || FAIL=1
-python3 -c "from trickster._solver_core import solve_root; print('  Cython solver: OK')" || FAIL=1
+python3 -c "import onnxruntime as ort; print(f'  ONNX Runtime {ort.__version__}: OK')" || FAIL=1
+python3 -c "from trickster._solver_core import solve_root; print('  Cython solver (Ulti): OK')" || FAIL=1
+python3 -c "from trickster.games.snapszer._fast_minimax import c_alphabeta; print('  Cython solver (Snapszer): OK')" || FAIL=1
 python3 -c "
 from trickster.training.tiers import TIERS
 from trickster.training.model_io import resolve_paths

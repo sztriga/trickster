@@ -9,8 +9,9 @@ build/
 
 # Cython build artifacts
 *.so
-_fast_minimax.c
-_solver_core.c
+*.pyd
+**/_fast_minimax.c
+**/_solver_core.c
 
 # Virtual environments
 .venv/
@@ -34,11 +35,7 @@ node_modules/
 # TypeScript build cache
 tsconfig.tsbuildinfo
 
-# Models (large binary files — train locally, don't commit)
-models/**/*.pt
-models/**/*.pkl
-models/**/train_info.json
-models/**/spec.json
+# Models — tracked via Git LFS (see .gitattributes)
 
 # Misc
 .pytest_cache/
