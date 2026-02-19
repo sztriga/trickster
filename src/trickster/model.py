@@ -3,7 +3,7 @@
 Architecture:
     Input → Shared Backbone (L × U + LayerNorm + ReLU)
             ├── Policy Head (sol/def)  → LogSoftmax
-            ├── Value Head  (sol/def)  → unbounded scalar
+            ├── Value Head  (sol/def)  → unbounded scalar (also used for bidding)
             └── Auction Head (multi-component)
 
 Inference wrappers (``UltiNetWrapper``, ``OnnxUltiWrapper``,

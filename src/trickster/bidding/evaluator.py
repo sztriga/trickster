@@ -1,16 +1,12 @@
-"""Hand evaluation using play-phase value heads.
+"""Hand evaluation using the soloist value head.
 
 Given a 12-card hand (after talon pickup), evaluates all feasible
 (contract, trump, discard) combinations and returns the expected
 stakes for each.
 
-The value head directly predicts expected game-point outcome
-*including* the piros multiplier and kontra dynamics.  There is
-no external P(win) × payoff calculation — the AI learns from
-training what the actual expected stakes are for each hand/contract
-combination.
-
-This is the core of the bidding system — no separate bidding NN needed.
+The soloist value head (value_fc_sol) is trained on all game
+positions including trick-0 pre-game states, predicting the
+expected game-point payoff from the soloist's perspective.
 """
 from __future__ import annotations
 
@@ -58,26 +54,13 @@ class ContractEval:
     trump: Suit | None    # None for betli
     is_piros: bool
     best_discard: DiscardChoice
-    game_pts: float       # raw NN prediction: expected per-defender stakes
-    stakes_pts: float     # risk-adjusted value used for bidding decisions
+    game_pts: float       # mean NN prediction across discards (for bid decision)
+    stakes_pts: float     # same as game_pts (for bid threshold comparison)
 
 
 # ---------------------------------------------------------------------------
 #  Setup helpers
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-#  Kontra tax: pessimism multiplier for marginal bids
-# ---------------------------------------------------------------------------
-#
-# The value head tends to overestimate marginal hands because it doesn't
-# fully price in the risk of a defender Kontra (which doubles the loss).
-# For predictions below _KONTRA_TAX_THRESHOLD we shrink the expected
-# payoff by _KONTRA_TAX_MULT, making the agent more reluctant to bid
-# hands it isn't confident about.
-
-_KONTRA_TAX_THRESHOLD = 4.0   # pts/defender — below this, apply tax
-_KONTRA_TAX_MULT = 0.7        # multiplier for marginal predictions
 
 _GAME = UltiGame()
 
@@ -251,23 +234,20 @@ def evaluate_contract(
     if not feats_batch:
         return None
 
-    # Batch value-head inference
+    # Batch soloist-value-head inference
     states_np = np.stack(feats_batch)
     values = wrapper.batch_value(states_np)  # (N,) normalised values
 
-    # Pick best discard
+    # Best discard (max) — used for actual card selection
     best_idx = int(np.argmax(values))
     best_val = float(values[best_idx])
-    # Un-normalise: value = (sol_pts * 2) / _GAME_PTS_MAX → sol_pts = val * MAX / 2
     best_pts = best_val * _GAME_PTS_MAX / 2
 
-    # Kontra tax: deflate marginal predictions to discourage speculative bids.
-    # The value head overestimates low-confidence hands because it doesn't
-    # fully account for the downside risk of defender Kontra.
-    if best_pts < _KONTRA_TAX_THRESHOLD:
-        adjusted_pts = best_pts * _KONTRA_TAX_MULT
-    else:
-        adjusted_pts = best_pts
+    # Mean value — used for bid/no-bid decision.
+    # Taking the max over N noisy predictions inflates the estimate;
+    # the mean is unbiased and reflects the true hand strength.
+    mean_val = float(np.mean(values))
+    mean_pts = mean_val * _GAME_PTS_MAX / 2
 
     return ContractEval(
         contract_key=contract_def.key,
@@ -278,8 +258,8 @@ def evaluate_contract(
             value=best_val,
             game_pts=best_pts,
         ),
-        game_pts=best_pts,
-        stakes_pts=adjusted_pts,
+        game_pts=mean_pts,
+        stakes_pts=mean_pts,
     )
 
 

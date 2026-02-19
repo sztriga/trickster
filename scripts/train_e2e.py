@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
-"""End-to-end Ulti training: base models + bidding.
+"""Ulti training with bidding.
 
-Phase 1 — Base training:
-    Trains individual contract models (parti, ulti, betli, 40-100) at the
-    chosen tier using hybrid self-play.
-
-Phase 2 — Bidding training:
-    Takes the Phase 1 models and trains them together with value-head
-    bidding, kontra, and neural discard.  Produces the final e2e models.
+Trains all contract models together from scratch using value-head
+bidding, kontra, and neural discard.
 
 Multiple tiers can be trained sequentially in a single invocation.
 
 Usage:
     python scripts/train_e2e.py knight_light                     # single tier
-    python scripts/train_e2e.py knight_light knight_balanced knight_heavy knight_pure  # batch
-    python scripts/train_e2e.py bishop --workers 6              # heavier tier
-    python scripts/train_e2e.py silver --base-from bronze       # Phase 2 only, use bronze base
-    python scripts/train_e2e.py knight --bidding-steps 4000 -v  # verbose
+    python scripts/train_e2e.py knight_light knight_balanced      # batch
+    python scripts/train_e2e.py bronze --steps 4000 -v            # override steps
+    python scripts/train_e2e.py bronze --workers 4                # parallel
 """
 from __future__ import annotations
 
@@ -37,14 +31,11 @@ from trickster.training.bidding_loop import (
     DISPLAY_ORDER,
     train_with_bidding,
 )
-from trickster.training.contract_loop import train_one_tier
 from trickster.model import _ort_available
 from trickster.training.model_io import (
     DK_LABELS,
     auto_device,
     estimate_params,
-    load_net,
-    resolve_paths,
 )
 from trickster.training.progress import (
     bidding_progress_bar,
@@ -60,9 +51,9 @@ from trickster.training.tiers import (
 
 
 def train_tier(tier_name: str, args) -> None:
-    """Train a single tier (Phase 1 + Phase 2)."""
+    """Train a single tier from scratch."""
     tier = TIERS[tier_name]
-    bidding_steps = args.bidding_steps or tier.e2e_steps
+    steps = args.steps or tier.steps
     resolved_device = auto_device(
         tier.body_units, tier.body_layers,
         force=args.device, gpu_tier=tier.gpu,
@@ -86,10 +77,10 @@ def train_tier(tier_name: str, args) -> None:
     # Banner
     print()
     lines = [
-        "END-TO-END ULTI TRAINING",
+        "ULTI TRAINING",
         f"Tier: {tier_name} — {tier.description}",
-        f"Phase 1: {'SKIP (from scratch)' if tier.steps == 0 else f'base training ({len(CONTRACT_KEYS)} contracts × {tier.total_games:,} games each)'}",
-        f"Phase 2: bidding training ({bidding_steps:,} steps × {tier.e2e_gpi} games/step)",
+        f"Budget: {steps:,} steps × {tier.games_per_step} games/step"
+        f" = {steps * tier.games_per_step:,} deals",
     ]
     w = max(len(l) for l in lines) + 4
     print("╔" + "═" * w + "╗")
@@ -106,88 +97,15 @@ def train_tier(tier_name: str, args) -> None:
         print(f"  Self-play: sequential")
     print()
 
-    # ── Phase 1: Base Training ──
-    # base_from: if set, skip Phase 1 and load that tier's base models.
-    # tier.steps == 0 (e.g. knight_pure): no base phase; from scratch unless base_from set.
-    base_from = args.base_from
-    skip_base = base_from is not None or tier.steps == 0
-    from_scratch = tier.steps == 0 and base_from is None
-
-    if not skip_base:
-        print("━" * 60)
-        print("  PHASE 1 — BASE CONTRACT TRAINING")
-        print("━" * 60)
-        print()
-
-        for ckey in CONTRACT_KEYS:
-            spec = CONTRACTS[ckey]
-            print(f"  ┌─ {tier_name}/{ckey}: {spec.display_name} " + "─" * 30)
-            print(f"  │  Budget: {tier.steps} steps × {tier.games_per_step} gpi = "
-                  f"{tier.total_games:,} games")
-
-            train_one_tier(
-                tier, spec, ckey, tier_name,
-                seed=args.seed,
-                device=resolved_device,
-                num_workers=args.workers,
-                enrichment=True,
-                verbose=args.verbose,
-            )
-
-            print(f"  └─ {tier_name}/{ckey} complete")
-            print()
-
-        elapsed = time.perf_counter() - t0
-        print(f"  Phase 1 complete in {fmt_time(elapsed)}")
-        print()
-    elif from_scratch:
-        print("  Phase 1 skipped (training from scratch — random init)")
-        print()
-    else:
-        base_tier = base_from if base_from is not None else tier_name
-        source = f"{base_tier}_base"
-        paths = resolve_paths(source)
-        missing = [k for k, p in paths.items() if not (p / "model.pt").exists()]
-        if missing:
-            print(f"  ERROR: --base-from {base_tier} but missing base models ({source}): {', '.join(missing)}")
-            sys.exit(1)
-        if base_from == tier_name:
-            print(f"  Phase 1 skipped (using existing {source} models)")
-        else:
-            print(f"  Phase 1 skipped (using base models from {source})")
-        print()
-
-    # ── Phase 2: Bidding Training ──
-    print("━" * 60)
-    print("  PHASE 2 — BIDDING TRAINING")
-    print("━" * 60)
-    print()
-
-    t_phase2 = time.perf_counter()
-
-    initial_nets = {}
-    if from_scratch:
-        print("  Starting from random weights (no base models)")
-    else:
-        base_tier = base_from if base_from is not None else tier_name
-        source = f"{base_tier}_base"
-        model_paths = resolve_paths(source)
-        print(f"  Loading base models ({source}):")
-        for key in CONTRACT_KEYS:
-            path = model_paths[key]
-            net = load_net(path, device="cpu")
-            if net is not None:
-                initial_nets[key] = net
-                print(f"    {key:<8} ← {path}")
-            else:
-                print(f"    {key:<8} — not found, starting fresh")
+    # ── Training ──
+    print("  Starting from random weights")
     print()
 
     pool_sources = args.opponent_pool or []
     cfg = BiddingTrainConfig(
-        steps=bidding_steps,
-        games_per_step=tier.e2e_gpi,
-        train_steps=tier.e2e_train_steps,
+        steps=steps,
+        games_per_step=tier.games_per_step,
+        train_steps=tier.train_steps,
         sol_sims=tier.sol_sims,
         sol_dets=tier.sol_dets,
         def_sims=tier.def_sims,
@@ -200,10 +118,10 @@ def train_tier(tier_name: str, args) -> None:
         body_layers=tier.body_layers,
         lr_start=5e-4,
         lr_end=1e-4,
-        buffer_size=tier.e2e_buffer_size,
+        buffer_size=tier.buffer_size,
         batch_size=tier.batch_size,
         max_discards=15,
-        min_bid_pts=0.5,
+        min_bid_pts=0.0,
         exploration_frac=0.2,
         contract_keys=CONTRACT_KEYS,
         num_workers=args.workers,
@@ -213,9 +131,9 @@ def train_tier(tier_name: str, args) -> None:
         pool_frac=args.pool_frac,
     )
 
-    e2e_reuse = (bidding_steps * cfg.train_steps * cfg.batch_size) / cfg.buffer_size
-    print(f"  Budget: {bidding_steps} steps × {cfg.games_per_step} gpi "
-          f"= {bidding_steps * cfg.games_per_step:,} deals")
+    e2e_reuse = (steps * cfg.train_steps * cfg.batch_size) / cfg.buffer_size
+    print(f"  Budget: {steps} steps × {cfg.games_per_step} gpi "
+          f"= {steps * cfg.games_per_step:,} deals")
     print(f"  SGD: {cfg.train_steps}/step  buffer={cfg.buffer_size:,}  "
           f"batch={cfg.batch_size}  reuse={e2e_reuse:.0f}x")
     print(f"  Contracts: {', '.join(DK_LABELS[dk] for dk in DISPLAY_ORDER)}")
@@ -229,7 +147,7 @@ def train_tier(tier_name: str, args) -> None:
     progress_fn = (bidding_progress_verbose if args.verbose else bidding_progress_bar)(cfg)
     slots, final_stats = train_with_bidding(
         cfg,
-        initial_nets=initial_nets,
+        initial_nets={},
         on_progress=progress_fn,
     )
 
@@ -254,8 +172,7 @@ def train_tier(tier_name: str, args) -> None:
         }, out_dir / "model.pt")
 
     # Final Summary
-    elapsed_total = time.perf_counter() - t0
-    elapsed_phase2 = time.perf_counter() - t_phase2
+    elapsed = time.perf_counter() - t0
 
     total_games = sum(s.games for s in slots.values())
     total_deals = cfg.steps * cfg.games_per_step
@@ -263,14 +180,12 @@ def train_tier(tier_name: str, args) -> None:
 
     print()
     w = 64
-    print("  ┌─ E2E TRAINING COMPLETE " + "─" * (w - 25))
+    print("  ┌─ TRAINING COMPLETE " + "─" * (w - 21))
     print("  │")
     print(f"  │  Tier:     {tier_name}")
     print(f"  │  Output:   {save_base}/")
-    print(f"  │  Phase 1:  {fmt_time(elapsed_total - elapsed_phase2) if not skip_base else 'skipped (base-from)'}")
-    print(f"  │  Phase 2:  {fmt_time(elapsed_phase2)} "
+    print(f"  │  Time:     {fmt_time(elapsed)} "
           f"({total_games:,} games, {total_passes:,} passes)")
-    print(f"  │  Total:    {fmt_time(elapsed_total)}")
     print("  │")
 
     print(f"  │  {'contract':<10} {'games':>5} {'avg_pts':>7} {'win%':>5}")
@@ -290,8 +205,8 @@ def train_tier(tier_name: str, args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="End-to-end Ulti training: base models → bidding. "
-                    "Supports multiple tiers in one invocation.",
+        description="Ulti training with bidding. "
+                    "Trains from scratch — no base models needed.",
     )
     parser.add_argument(
         "tiers", nargs="+", choices=list(TIERS.keys()),
@@ -300,12 +215,8 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--base-from", type=str, default=None, metavar="TIER",
-                        help="Skip Phase 1 and load base models from this tier. "
-                             "E.g. --base-from bronze when training silver. "
-                             "Use --base-from <tier> to reuse that tier's existing base.")
-    parser.add_argument("--bidding-steps", type=int, default=None,
-                        help="Override bidding training steps")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Override training steps")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -319,14 +230,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Validate tier names (argparse choices with nargs="+" gives poor errors)
+    # Validate tier names
     valid = set(TIERS.keys())
     bad = [t for t in args.tiers if t not in valid]
     if bad:
         parser.error(f"unknown tier(s): {', '.join(bad)}. "
-                     f"Choose from: {', '.join(valid)}")
-    if args.base_from is not None and args.base_from not in valid:
-        parser.error(f"--base-from '{args.base_from}' is not a valid tier. "
                      f"Choose from: {', '.join(valid)}")
 
     n = len(args.tiers)

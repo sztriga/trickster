@@ -190,6 +190,19 @@ def _play_one_game(
         is_sol = (player == soloist_idx)
         samples.append((state_feats, mask, pi, reward, is_sol))
 
+    # ── Upweight initial-position samples ──────────────────────────
+    # Trick-0 states are critical for bidding calibration but only
+    # ~3% of training data.  Push extra copies of the first few
+    # samples (trick 0, before any cards are played) so the value
+    # head gets stronger signal on these pre-game positions.
+    _INITIAL_BOOST = 3  # add 3 extra copies of each trick-0 sample
+    # Trick 0 has at most 3 decision points (one per player).
+    # The first ~3 entries in trajectory correspond to trick 0.
+    n_boost = min(3, len(samples))
+    for i in range(n_boost):
+        for _ in range(_INITIAL_BOOST):
+            samples.append(samples[i])
+
     return samples
 
 

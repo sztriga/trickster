@@ -490,7 +490,7 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=500,
                         help="Deals per matchup (default: 500)")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--min-bid-pts", type=float, default=-2.0)
+    parser.add_argument("--min-bid-pts", type=float, default=0.0)
     parser.add_argument("--pass-penalty", type=float, default=2.0)
     parser.add_argument("--max-discards", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42)

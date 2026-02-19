@@ -5,17 +5,17 @@ import from this module so that the bidding/game-setup code is identical.
 
 Key design decision — **blind pickup**: in real Ulti the talon is
 face-down.  A player must commit to picking up *before* seeing the
-cards.  The pickup decision is driven by **constrained Monte Carlo**:
-sample K possible talons from the unknown card pool, evaluate each
-12-card hand with the value head, and compare E[pickup payoff] vs
-E[defender payoff].
+cards.  The pickup decision uses per-contract value heads: encode
+the 10-card hand with each contract's info → batch_value → pick up
+if the best prediction exceeds the threshold.
 """
 from __future__ import annotations
 
-import copy
 import random as _random
 from dataclasses import dataclass
 from typing import Sequence
+
+import numpy as np
 
 from trickster.bidding.evaluator import (
     ContractEval,
@@ -42,11 +42,13 @@ from trickster.games.ulti.auction import (
     submit_pickup,
 )
 from trickster.games.ulti.cards import Card, Rank, Suit, make_deck
-from trickster.games.ulti.game import GameState, next_player
+from trickster.games.ulti.encoder import UltiEncoder
+from trickster.games.ulti.game import GameState, NUM_PLAYERS, next_player
 from trickster.model import UltiNetWrapper
 from trickster.train_utils import _GAME_PTS_MAX
 
 _ALL_CARDS: frozenset[Card] = frozenset(make_deck())
+_PICKUP_ENCODER = UltiEncoder()
 
 
 # ---------------------------------------------------------------------------
@@ -74,118 +76,76 @@ class AuctionResult:
 
 
 # ---------------------------------------------------------------------------
-#  MC-based pickup decision (replaces heuristic)
+#  Per-contract pickup evaluation (~4-8 forward passes)
 # ---------------------------------------------------------------------------
 
-# Default number of talon samples for pickup evaluation.
-_PICKUP_MC_SAMPLES = 8
-# Max discards per (contract, trump) during pickup MC evaluation.
-# Kept low for speed since we're evaluating many talons.
-_PICKUP_MAX_DISCARDS = 8
 
-
-def estimate_pickup_value(
+def _evaluate_pickup(
     gs: GameState,
     player: int,
     dealer: int,
-    wrappers: dict[str, UltiNetWrapper],
-    auction: AuctionState,
-    num_samples: int = _PICKUP_MC_SAMPLES,
-    max_discards: int = _PICKUP_MAX_DISCARDS,
-    rng: _random.Random | None = None,
-) -> bool:
-    """Decide whether to pick up the talon using Monte Carlo evaluation.
+    seat_wrappers: dict[str, UltiNetWrapper],
+    bid_rank: int = 0,
+) -> float:
+    """Evaluate a 10-card hand for pickup using per-contract value heads.
 
-    Samples *num_samples* possible 2-card talons from the unknown card
-    pool (constrained by auction info).  For each sample, evaluates
-    only contracts that map to **legal overbids** — there's no point
-    considering a contract the player can't actually bid.
+    For each contract model, encodes the 10-card hand with that
+    contract's info (trump, betli flag) and uses ``batch_value``
+    (soloist value head) to predict the expected outcome.  Returns
+    the best predicted value across all contracts.
 
-    **E[pickup]** = average best legal-overbid value across MC samples.
-    **Threshold** = 0 for non-Passz (only pick up if positive expected
-    payoff as soloist), pass penalty for Passz (defenders are already
-    getting paid if nobody bids).
-
-    The value head drives the entire decision — no heuristics.
+    ~4-8 forward passes total (one batch per contract model).
     """
-    if rng is None:
-        rng = _random.Random()
-
     hand = gs.hands[player]
-    current_rank = auction.current_bid.rank if auction.current_bid else 0
+    empty_captured: list[list[Card]] = [[] for _ in range(NUM_PLAYERS)]
+    empty_voids = tuple(frozenset[Suit]() for _ in range(NUM_PLAYERS))
 
-    # Threshold: what do I need to beat by picking up?
-    # Against Passz: defenders get +2 pts each, so need E[pickup] > that.
-    # Against real bids: only pick up if I expect positive soloist payoff.
-    if current_rank <= BID_PASSZ.rank:
-        threshold = 2.0 * 2 / _GAME_PTS_MAX  # normalised pass penalty
-    else:
-        threshold = 0.0
+    # Count suits for trump selection
+    suit_counts: dict[Suit, int] = {}
+    for c in hand:
+        suit_counts[c.suit] = suit_counts.get(c.suit, 0) + 1
+    sorted_suits = sorted(suit_counts, key=lambda s: suit_counts[s], reverse=True)
 
-    # Build the unknown card pool, constrained by auction info.
-    known = set(hand)
-    if auction.current_bid is not None:
-        bid_info = BID_TO_CONTRACT.get(auction.current_bid.rank)
-        if bid_info is not None:
-            contract_key, is_piros = bid_info
-            cdef = CONTRACT_DEFS.get(contract_key)
-            if cdef is not None and not cdef.is_betli:
-                _comps: set[str] = {"parti"}
-                if "ulti" in contract_key:
-                    _comps.add("ulti")
-                if "40" in contract_key:
-                    _comps.update({"40", "100"})
-                constraints = build_auction_constraints(gs, frozenset(_comps))
-                for cards in constraints.values():
-                    known.update(cards)
-
-    unknown = [c for c in _ALL_CARDS if c not in known]
-    if len(unknown) < 2:
-        return False
-
-    # Pre-compute which bid ranks are legal overbids.
-    legal_ranks = {b.rank for b in legal_bids(auction)}
-
-    pickup_values: list[float] = []
-    original_hand = gs.hands[player]
-    for _ in range(num_samples):
-        rng.shuffle(unknown)
-        sampled_talon = unknown[:2]
-
-        # Temporarily give the player a 12-card hand.
-        # evaluate_all_contracts → _make_eval_state deepcopies gs
-        # internally, so the original state is never mutated.
-        gs.hands[player] = list(hand) + list(sampled_talon)
-
-        evals = evaluate_all_contracts(
-            gs, player, dealer,
-            wrappers=wrappers,
-            max_discards=max_discards,
+    def _enc(trump: Suit | None, betli: bool) -> np.ndarray:
+        return _PICKUP_ENCODER.encode_state(
+            hand=hand,
+            captured=empty_captured,
+            trick_cards=[],
+            trump=trump,
+            betli=betli,
+            soloist=player,
+            player=player,
+            trick_no=0,
+            scores=[0, 0, 0],
+            known_voids=empty_voids,
+            bid_rank=bid_rank,
+            dealer=dealer,
         )
 
-        # Filter to only contracts that map to legal overbids.
-        best_legal_pts = None
-        for ev in evals:
-            bid_rank = CONTRACT_TO_BID_RANK.get(
-                (ev.contract_key, ev.is_piros),
-            )
-            if bid_rank is not None and bid_rank in legal_ranks:
-                best_legal_pts = ev.game_pts * 2 / _GAME_PTS_MAX
-                break  # evals sorted desc — first legal match is best
+    best_value = float("-inf")
 
-        if best_legal_pts is not None:
-            pickup_values.append(best_legal_pts)
-        # If no legal overbid found for this talon, skip it —
-        # don't penalise, just fewer samples.
+    for contract_key, wrapper in seat_wrappers.items():
+        cdef = CONTRACT_DEFS[contract_key]
+        feats_list: list[np.ndarray] = []
 
-    # Restore original hand.
-    gs.hands[player] = original_hand
+        if cdef.is_betli:
+            feats_list.append(_enc(None, True))
+        elif cdef.piros_only:
+            feats_list.append(_enc(Suit.HEARTS, False))
+        else:
+            # Try top 2 suits as trump
+            for suit in sorted_suits[:2]:
+                feats_list.append(_enc(suit, False))
+            # Also try Hearts for piros variant if not already tried
+            if Suit.HEARTS not in sorted_suits[:2] and Suit.HEARTS in suit_counts:
+                feats_list.append(_enc(Suit.HEARTS, False))
 
-    if not pickup_values:
-        return False
+        if feats_list:
+            states = np.stack(feats_list)
+            vals = wrapper.batch_value(states)
+            best_value = max(best_value, float(vals.max()))
 
-    e_pickup = sum(pickup_values) / len(pickup_values)
-    return e_pickup > threshold
+    return best_value
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +193,7 @@ def best_legal_bid(
     if not evals:
         return None
     for ev in evals:
-        if ev.stakes_pts < min_bid_pts:
+        if ev.game_pts < min_bid_pts:
             break  # sorted desc — rest are worse
         r = _eval_to_auction_bid(ev, auction)
         if r is not None:
@@ -305,7 +265,7 @@ def run_auction(
     dealer: int,
     seat_wrappers: list[dict[str, UltiNetWrapper]],
     *,
-    min_bid_pts: float = 0.5,
+    min_bid_pts: float = 0.0,
     max_discards: int = 15,
 ) -> AuctionResult:
     """Run a competitive 3-player auction.
@@ -451,15 +411,19 @@ def run_auction(
                     submit_pass(a, player)
 
         else:
-            # ── Player has 10 cards → MC pickup decision ──
+            # ── Player has 10 cards → per-contract value-head pickup ──
             should_pickup = False
             if can_pickup(a) and seat_wrappers[player]:
-                should_pickup = estimate_pickup_value(
-                    gs, player, dealer,
-                    wrappers=seat_wrappers[player],
-                    auction=a,
-                    rng=_random.Random(hash((player, len(a.history)))),
+                current_rank = a.current_bid.rank if a.current_bid else 0
+                # Pickup threshold (normalised): must expect to beat the
+                # pass penalty or the current bid.  Uses the same scale
+                # as min_bid_pts: pts * 2 / _GAME_PTS_MAX.
+                threshold = min_bid_pts * 2 / _GAME_PTS_MAX
+                best_val = _evaluate_pickup(
+                    gs, player, dealer, seat_wrappers[player],
+                    bid_rank=current_rank,
                 )
+                should_pickup = best_val > threshold
 
             if should_pickup:
                 gs.hands[player].extend(a.talon)

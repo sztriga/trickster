@@ -157,7 +157,8 @@ class BiddingTrainConfig:
 
     # -- Bidding --
     max_discards: int = 15        # discard pairs per contract eval
-    min_bid_pts: float = 0.5      # minimum expected pts/defender to bid (must expect profit)
+    min_bid_pts: float = 0.0      # minimum expected pts/defender to bid (end of training)
+    min_bid_pts_start: float = 4.0  # starting bid threshold (annealed → min_bid_pts)
     pass_penalty: float = 2.0     # pts per defender when everyone passes
     exploration_frac: float = 0.2  # fraction of games with random contract
 
@@ -286,7 +287,7 @@ def _play_bidding_game_in_worker(
     args: tuple,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
     """Worker entry-point for parallel bidding self-play."""
-    (all_state_dicts, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, exploration) = args
+    (all_state_dicts, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, exploration, min_bid_override) = args
 
     # Load latest weights into worker nets
     for key, sd in all_state_dicts.items():
@@ -307,6 +308,7 @@ def _play_bidding_game_in_worker(
         _BW_GAME, _BW_WRAPPERS, sol_mcts_cfg, def_mcts_cfg, seed, cfg,
         exploration=exploration,
         opp_wrappers=opp_w,
+        min_bid_pts_override=min_bid_override,
     )
 
 
@@ -397,6 +399,7 @@ def _play_one_bidding_game(
     cfg: BiddingTrainConfig,
     exploration: bool = False,
     opp_wrappers: dict[str, UltiNetWrapper] | None = None,
+    min_bid_pts_override: float | None = None,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
     """Play one game with competitive auction bidding.
 
@@ -410,10 +413,10 @@ def _play_one_bidding_game(
         decisions instead of *wrappers*.  Only soloist samples are
         collected (defender policy is off-policy for the training model).
 
-    Returns (display_key, samples, predicted_value) where display_key
-    encodes both the contract and whether it's piros (e.g. "p.parti",
-    "ulti").  predicted_value is the value head's bid-time estimate
-    (game_pts) for calibration tracking.
+    Returns (display_key, samples, predicted_value) where
+    display_key encodes both the contract and whether it's piros
+    (e.g. "p.parti", "ulti").  predicted_value is the value head's
+    bid-time estimate (game_pts) for calibration tracking.
     Returns ("__pass__", [], 0.0) when everyone passes.
     """
     rng = random.Random(seed)
@@ -443,10 +446,11 @@ def _play_one_bidding_game(
             initial_bidder=soloist,  # exploration: soloist is always first bidder
         )
     else:
+        effective_min_bid = min_bid_pts_override if min_bid_pts_override is not None else cfg.min_bid_pts
         seat_wrappers = [wrappers, wrappers, wrappers]
         result = run_auction(
             gs, talon, dealer, seat_wrappers,
-            min_bid_pts=cfg.min_bid_pts,
+            min_bid_pts=effective_min_bid,
             max_discards=cfg.max_discards,
         )
         soloist = result.soloist
@@ -688,6 +692,7 @@ def train_with_bidding(
         "body_layers": cfg.body_layers,
         "max_discards": cfg.max_discards,
         "min_bid_pts": cfg.min_bid_pts,
+        "min_bid_pts_start": cfg.min_bid_pts_start,
         "pass_penalty": cfg.pass_penalty,
         "exploration_frac": cfg.exploration_frac,
         "kontra_enabled": cfg.kontra_enabled,
@@ -714,6 +719,9 @@ def train_with_bidding(
             for slot in slots.values():
                 for pg in slot.optimizer.param_groups:
                     pg["lr"] = lr
+
+            # -- Anneal min_bid_pts: high → low (compensates for max-over-evals inflation) --
+            cur_min_bid = _cosine_lr(step, cfg.steps, cfg.min_bid_pts_start, cfg.min_bid_pts)
 
             # -- Self-play --
             step_dk_games: dict[str, int] = {dk: 0 for dk in DISPLAY_ORDER}
@@ -782,6 +790,7 @@ def train_with_bidding(
                         game_seed,
                         cfg_dict,
                         exploration,
+                        cur_min_bid,
                     ))
                 for dkey, samples, pred_val in executor.map(
                     _play_bidding_game_in_worker, tasks,
@@ -802,6 +811,7 @@ def train_with_bidding(
                         game, wrappers, sol_cfg, def_cfg, game_seed, cfg,
                         exploration=exploration,
                         opp_wrappers=opp_w,
+                        min_bid_pts_override=cur_min_bid,
                     )
                     _collect_result(dkey, samples, pred_val)
 
@@ -833,17 +843,7 @@ def train_with_bidding(
 
                     log_probs, values = slot.net.forward_dual(s_t, m_t, is_sol_t)
 
-                    # Pessimism-weighted value loss: penalise soloist
-                    # over-predictions 2.5x to discourage hallucinated wins.
-                    # Defender samples use symmetric loss.
-                    residual = values - z_t
-                    over_predict = residual > 0
-                    sol_over = is_sol_t & over_predict
-                    weight = torch.ones_like(residual)
-                    weight[sol_over] = 2.5
-                    value_loss = (weight * F.huber_loss(
-                        values, z_t, delta=1.0, reduction="none",
-                    )).mean()
+                    value_loss = F.huber_loss(values, z_t, delta=1.0)
 
                     # Off-policy samples (pool game defenders) contribute to
                     # value loss but not policy loss — the policy target came

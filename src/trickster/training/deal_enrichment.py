@@ -64,19 +64,12 @@ def _value_enriched_new_game(
 
 
 def _enrichment_threshold(step: int, total_steps: int) -> float:
-    """Anneal the minimum soloist value from 0.0 -> -1.0 over training.
+    """Return the minimum soloist value threshold for deal filtering.
 
-    Phase 1 (first 25%):   v >= 0.0   (only "even-ish or better" deals)
-    Phase 2 (25%-60%):     v >= -0.25  (slightly losing included)
-    Phase 3 (60%+):        disabled    (all deals accepted)
-
-    Returns the threshold, or -999 to signal "accept everything".
+    Currently disabled — always returns -999 (accept all deals).
+    The value head must see the full distribution of hands (including
+    bad ones) to produce accurate predictions for bidding.
     """
-    frac = step / max(1, total_steps)
-    if frac < 0.25:
-        return 0.0
-    if frac < 0.60:
-        return -0.25
     return -999.0
 
 

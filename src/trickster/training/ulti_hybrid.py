@@ -493,17 +493,7 @@ def train_ulti_hybrid(
 
                     log_probs, values = net.forward_dual(s_t, m_t, is_sol_t)
 
-                    # Pessimism-weighted value loss: penalise soloist
-                    # over-predictions 2.5x to discourage hallucinated wins.
-                    # Defender samples use symmetric loss.
-                    residual = values - z_t
-                    over_predict = residual > 0
-                    sol_over = is_sol_t & over_predict
-                    weight = torch.ones_like(residual)
-                    weight[sol_over] = 2.5
-                    value_loss = (weight * F.huber_loss(
-                        values, z_t, delta=1.0, reduction="none",
-                    )).mean()
+                    value_loss = F.huber_loss(values, z_t, delta=1.0)
 
                     policy_loss = -(pi_t * log_probs).sum(dim=-1).mean()
                     loss = value_loss + policy_loss
