@@ -93,6 +93,7 @@ class UltiNode:
     is_open: bool = False
     contract_components: frozenset[str] | None = None
     dealer: int = 0
+    initial_bidder: int = -1
     component_kontras: dict[str, int] = field(default_factory=dict)
     must_have: dict[int, frozenset[Card]] = field(default_factory=dict)
 
@@ -105,6 +106,7 @@ class UltiNode:
             is_open=self.is_open,
             contract_components=self.contract_components,
             dealer=self.dealer,
+            initial_bidder=self.initial_bidder,
             component_kontras=dict(self.component_kontras),
             must_have=dict(self.must_have),
         )
@@ -212,6 +214,7 @@ class UltiGame:
             is_open=state.is_open,
             contract_components=state.contract_components,
             dealer=state.dealer,
+            initial_bidder=state.initial_bidder,
             component_kontras=state.component_kontras,
             must_have=state.must_have,
         )
@@ -374,6 +377,7 @@ class UltiGame:
             is_open=state.is_open,
             contract_components=state.contract_components,
             dealer=state.dealer,
+            initial_bidder=state.initial_bidder,
             component_kontras=state.component_kontras,
             must_have=state.must_have,
         )
@@ -407,6 +411,7 @@ class UltiGame:
             soloist_saw_talon=True,
             dealer=state.dealer,
             component_kontras=state.component_kontras if state.component_kontras else None,
+            initial_bidder=state.initial_bidder,
             # v3: soloist sees talon cards
             talon_cards=gs.talon_discards,
         )

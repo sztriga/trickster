@@ -58,13 +58,26 @@ class ContractEval:
     trump: Suit | None    # None for betli
     is_piros: bool
     best_discard: DiscardChoice
-    game_pts: float       # expected per-defender stakes (best discard, includes piros)
-    stakes_pts: float     # same as game_pts (kept for API compat)
+    game_pts: float       # raw NN prediction: expected per-defender stakes
+    stakes_pts: float     # risk-adjusted value used for bidding decisions
 
 
 # ---------------------------------------------------------------------------
 #  Setup helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+#  Kontra tax: pessimism multiplier for marginal bids
+# ---------------------------------------------------------------------------
+#
+# The value head tends to overestimate marginal hands because it doesn't
+# fully price in the risk of a defender Kontra (which doubles the loss).
+# For predictions below _KONTRA_TAX_THRESHOLD we shrink the expected
+# payoff by _KONTRA_TAX_MULT, making the agent more reluctant to bid
+# hands it isn't confident about.
+
+_KONTRA_TAX_THRESHOLD = 4.0   # pts/defender — below this, apply tax
+_KONTRA_TAX_MULT = 0.7        # multiplier for marginal predictions
 
 _GAME = UltiGame()
 
@@ -77,6 +90,7 @@ def _make_eval_state(
     contract_def: ContractDef,
     is_piros: bool,
     dealer: int,
+    initial_bidder: int = -1,
 ) -> UltiNode:
     """Build a UltiNode ready for value-head evaluation.
 
@@ -131,6 +145,7 @@ def _make_eval_state(
         is_red=is_piros,
         contract_components=comps_frozen,
         dealer=dealer,
+        initial_bidder=initial_bidder,
         must_have=constraints,
     )
 
@@ -186,7 +201,10 @@ def evaluate_contract(
 
     if len(all_discards) > max_discards and not contract_def.is_betli:
         # Heuristic pruning: prefer discarding low-value non-trump cards.
+        # Also rewards discards that create voids (enabling future trumping).
         # Score each pair: lower is better to discard.
+        hand_nontump_suits = set(c.suit for c in hand if c.suit != trump)
+
         def _discard_score(pair: tuple[Card, Card]) -> float:
             score = 0.0
             for c in pair:
@@ -202,6 +220,14 @@ def evaluate_contract(
                 if contract_def.key == "ulti":
                     if c == Card(trump, Rank.SEVEN):
                         score += 1000
+            # Reward void creation: discarding both cards of a side suit
+            # lets us trump that suit later — a major strategic advantage.
+            remaining_suits = set(
+                c.suit for c in hand
+                if c not in pair and c.suit != trump
+            )
+            new_voids = hand_nontump_suits - remaining_suits
+            score -= len(new_voids) * 20
             return score
 
         all_discards.sort(key=_discard_score)
@@ -233,12 +259,15 @@ def evaluate_contract(
     best_idx = int(np.argmax(values))
     best_val = float(values[best_idx])
     # Un-normalise: value = (sol_pts * 2) / _GAME_PTS_MAX → sol_pts = val * MAX / 2
-    # The value head is trained on outcomes that include piros and kontra.
-    # Early in training it may overestimate marginal hands, but the
-    # feedback loop (bid → get kontrad → lose → lower estimate) should
-    # correct this over time.  Keep the bid threshold at the pass penalty
-    # so the model gets to experience and learn from marginal-hand losses.
     best_pts = best_val * _GAME_PTS_MAX / 2
+
+    # Kontra tax: deflate marginal predictions to discourage speculative bids.
+    # The value head overestimates low-confidence hands because it doesn't
+    # fully account for the downside risk of defender Kontra.
+    if best_pts < _KONTRA_TAX_THRESHOLD:
+        adjusted_pts = best_pts * _KONTRA_TAX_MULT
+    else:
+        adjusted_pts = best_pts
 
     return ContractEval(
         contract_key=contract_def.key,
@@ -250,7 +279,7 @@ def evaluate_contract(
             game_pts=best_pts,
         ),
         game_pts=best_pts,
-        stakes_pts=best_pts,
+        stakes_pts=adjusted_pts,
     )
 
 

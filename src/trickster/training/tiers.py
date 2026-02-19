@@ -19,15 +19,13 @@ class ContractSpec:
     """Contract-specific settings for training."""
     display_name: str       # "PARTI", "BETLI", etc.
     training_mode: str      # passed to UltiGame.new_game()
-    model_dir: str          # subdirectory under models/
-    name_prefix: str        # tier name prefix (P, U, H, B)
 
 
 CONTRACTS: dict[str, ContractSpec] = {
-    "parti": ContractSpec("PARTI", "simple", "parti", "P"),
-    "ulti": ContractSpec("ULTI", "ulti", "ulti", "U"),
-    "40-100": ContractSpec("40-100", "40-100", "40-100", "H"),
-    "betli": ContractSpec("BETLI", "betli", "betli", "B"),
+    "parti": ContractSpec("PARTI", "simple"),
+    "ulti": ContractSpec("ULTI", "ulti"),
+    "40-100": ContractSpec("40-100", "40-100"),
+    "betli": ContractSpec("BETLI", "betli"),
 }
 
 CONTRACT_KEYS = list(CONTRACTS.keys())
@@ -41,7 +39,6 @@ CONTRACT_KEYS = list(CONTRACTS.keys())
 class Tier:
     """Hyperparameters for one training strength level."""
     label: str
-    index: int
     description: str
 
     # Base (single-contract) training
@@ -94,30 +91,26 @@ class Tier:
     def e2e_reuse(self) -> float:
         return (self.e2e_steps * self.e2e_train_steps * self.batch_size) / self.e2e_buffer_size
 
-    def tier_name(self, prefix: str) -> str:
-        return f"{prefix}{self.index}-{self.label}"
-
-
 TIERS: dict[str, Tier] = {
     # Capacity branch: bigger nets, moderate games
     "scout": Tier(
-        label="Scout", index=1,
+        label="Scout",
         description="Scout — fast iteration (256×4, 24k total, 67/33 split)",
         steps=500, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=1000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=50_000,
         sol_sims=40, def_sims=20,
         lr_start=1e-3, lr_end=2e-4,
     ),
-    "knight": Tier(
-        label="Knight", index=2,
-        description="Knight — proven baseline (256×4, 80k total, 80/20 split)",
+    "knight_light": Tier(
+        label="Knight-Light",
+        description="Knight Light — 80/20 base/bidding split (256×4, 80k total)",
         steps=2000, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=2000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=50_000,
         sol_sims=60, def_sims=24,
         lr_start=1e-3, lr_end=1e-4,
     ),
     "knight_balanced": Tier(
-        label="Knight-Bal", index=14,
+        label="Knight-Bal",
         description="Knight Balanced — 50/50 base/bidding split (256×4, 80k total)",
         steps=1200, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=5200, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=140_000,
@@ -125,7 +118,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "knight_heavy": Tier(
-        label="Knight-Heavy", index=15,
+        label="Knight-Heavy",
         description="Knight Heavy — 30/70 base/bidding split (256×4, 80k total)",
         steps=750, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=7000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=190_000,
@@ -133,7 +126,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "knight_pure": Tier(
-        label="Knight-Pure", index=16,
+        label="Knight-Pure",
         description="Knight Pure — 100% bidding from scratch (256×4, 80k total)",
         steps=0, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=10000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=270_000,
@@ -141,7 +134,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "bishop": Tier(
-        label="Bishop", index=3,
+        label="Bishop",
         description="Bishop — larger net (384×4, 120k total)",
         steps=2000, games_per_step=12, train_steps=50, buffer_size=50_000,
         e2e_steps=2000, e2e_gpi=12, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -150,7 +143,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "rook": Tier(
-        label="Rook", index=4,
+        label="Rook",
         description="Rook — wide+deep (512×6, 120k total)",
         steps=2000, games_per_step=12, train_steps=50, buffer_size=50_000,
         e2e_steps=2000, e2e_gpi=12, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -159,7 +152,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=5e-5,
     ),
     "captain": Tier(
-        label="Captain", index=5,
+        label="Captain",
         description="Captain — max capacity (1024×6, 180k total, GPU)",
         steps=3000, games_per_step=12, train_steps=50, buffer_size=75_000,
         e2e_steps=3000, e2e_gpi=12, e2e_train_steps=50, e2e_buffer_size=75_000,
@@ -169,7 +162,7 @@ TIERS: dict[str, Tier] = {
     ),
     # Volume branch: same 256×4 net, more games
     "bronze": Tier(
-        label="Bronze", index=7,
+        label="Bronze",
         description="Bronze — 2× Knight data (256×4, 160k total)",
         steps=2000, games_per_step=16, train_steps=50, buffer_size=50_000,
         e2e_steps=2000, e2e_gpi=16, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -177,7 +170,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "silver": Tier(
-        label="Silver", index=8,
+        label="Silver",
         description="Silver — 6× Knight data (256×4, 480k total)",
         steps=4000, games_per_step=24, train_steps=50, buffer_size=100_000,
         e2e_steps=4000, e2e_gpi=24, e2e_train_steps=50, e2e_buffer_size=100_000,
@@ -185,7 +178,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=5e-5,
     ),
     "gold": Tier(
-        label="Gold", index=9,
+        label="Gold",
         description="Gold — 16× Knight data (256×4, 1.3M total)",
         steps=8000, games_per_step=32, train_steps=50, buffer_size=200_000,
         e2e_steps=8000, e2e_gpi=32, e2e_train_steps=50, e2e_buffer_size=200_000,
@@ -194,7 +187,7 @@ TIERS: dict[str, Tier] = {
     ),
     # Search branch: same 256×4 net, deeper MCTS + PIMC
     "hawk": Tier(
-        label="Hawk", index=10,
+        label="Hawk",
         description="Hawk — 3× search depth (256×4, 48k total)",
         steps=1000, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=2000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -203,7 +196,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "eagle": Tier(
-        label="Eagle", index=11,
+        label="Eagle",
         description="Eagle — 6× search depth (256×4, 38k total)",
         steps=800, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=1500, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -212,7 +205,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=1e-4,
     ),
     "falcon": Tier(
-        label="Falcon", index=12,
+        label="Falcon",
         description="Falcon — 12× search depth (256×4, 24k total)",
         steps=500, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=1000, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -221,7 +214,7 @@ TIERS: dict[str, Tier] = {
         lr_start=1e-3, lr_end=5e-5,
     ),
     "oracle": Tier(
-        label="Oracle", index=13,
+        label="Oracle",
         description="Oracle — max search (256×4, 14k total)",
         steps=300, games_per_step=8, train_steps=50, buffer_size=50_000,
         e2e_steps=600, e2e_gpi=8, e2e_train_steps=50, e2e_buffer_size=50_000,
@@ -231,7 +224,7 @@ TIERS: dict[str, Tier] = {
     ),
     # GPU branch: large model, requires CUDA
     "king": Tier(
-        label="King", index=20,
+        label="King",
         description="King — GPU large model (2048×8, 256k total)",
         steps=4000, games_per_step=16, train_steps=100, buffer_size=200_000,
         e2e_steps=4000, e2e_gpi=16, e2e_train_steps=100, e2e_buffer_size=200_000,

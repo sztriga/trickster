@@ -30,11 +30,11 @@ v2 upgrades ("detective model"):
   Contract DNA                     8       215
   Trick momentum (leaders)        10       223
   Trick momentum (winners)        10       233
-  Auction context                 10       243
-  Marriage memory                  6       253
-  Talon cards (soloist only)      32       259
+  Auction context                 12       243
+  Marriage memory                  6       255
+  Talon cards (soloist only)      32       261
   ───────────────────────────────────────────────
-  Total                          291
+  Total                          293
 
 Cards are indexed as ``suit_idx * 8 + rank_idx`` (0 .. 31).
 
@@ -93,10 +93,11 @@ _SEVEN_OFF = _MARRIAGE_OFF + 4                #  1  seven-in-hand
 _CONTRACT_OFF = _SEVEN_OFF + 1                #  8  contract DNA
 _LEAD_HIST_OFF = _CONTRACT_OFF + 8            # 10  trick leaders
 _WIN_HIST_OFF = _LEAD_HIST_OFF + TRICKS_PER_GAME  # 10  trick winners
-_AUCTION_OFF = _WIN_HIST_OFF + TRICKS_PER_GAME    # 10  auction context
-_MAR_MEM_OFF = _AUCTION_OFF + 10              #  6  marriage memory
+_AUCTION_OFF = _WIN_HIST_OFF + TRICKS_PER_GAME    # 12  auction context
+_AUCTION_DIM = 12
+_MAR_MEM_OFF = _AUCTION_OFF + _AUCTION_DIM    #  6  marriage memory
 _TALON_OFF = _MAR_MEM_OFF + 6                 # 32  talon cards (soloist only)
-STATE_DIM = _TALON_OFF + NUM_CARDS            # 291
+STATE_DIM = _TALON_OFF + NUM_CARDS            # 293
 
 # Relative position encoding values
 _REL_ME = 0.33
@@ -159,6 +160,7 @@ class UltiEncoder:
         dealer: int = 0,
         component_kontras: dict[str, int] | None = None,
         talon_cards: Sequence[Card] | None = None,
+        initial_bidder: int = -1,
     ) -> np.ndarray:
         """Encode observable state into a 1-D float64 array (259 dims)."""
         x = np.zeros(STATE_DIM, dtype=np.float64)
@@ -277,6 +279,13 @@ class UltiEncoder:
                 x[_AUCTION_OFF + 5 + ki] = level / 2.0  # 0, 0.5, or 1.0
         has_ulti = contract_components is not None and "ulti" in contract_components
         x[_AUCTION_OFF + 9] = 1.0 if has_ulti else 0.0
+
+        # [10]  initial bidder relative position (who first picked up talon)
+        if initial_bidder >= 0:
+            x[_AUCTION_OFF + 10] = _relative_position(initial_bidder, player)
+        # [11]  soloist was overbidder (picked up after initial bidder)
+        if initial_bidder >= 0 and initial_bidder != soloist:
+            x[_AUCTION_OFF + 11] = 1.0
 
         # ── Section 14: Marriage memory (6) ──────────────────────────
         # Per-player declared marriage totals (normalised by 100)

@@ -14,9 +14,9 @@ Models can include "random" for a baseline random player.
 Each model can optionally specify a search speed (e.g. "knight:deep").
 
 Usage:
-    python scripts/tournament.py knight knight_balanced random --games 500 --workers 6
-    python scripts/tournament.py knight:fast bishop:deep random --games 1000
-    python scripts/tournament.py knight knight_balanced knight_heavy knight_pure --games 300
+    python scripts/tournament.py knight_light knight_balanced random --games 500 --workers 6
+    python scripts/tournament.py knight_light:fast bishop:deep random --games 1000
+    python scripts/tournament.py knight_light knight_balanced knight_heavy knight_pure --games 300
 """
 from __future__ import annotations
 
@@ -35,21 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from trickster.bidding.evaluator import evaluate_all_contracts, pick_best_bid
-from trickster.bidding.registry import BID_TO_CONTRACT, MAX_SUPPORTED_RANK
+from trickster.bidding.auction_runner import run_auction, setup_bid_game
 from trickster.games.ulti.adapter import UltiGame, UltiNode
-from trickster.games.ulti.auction import (
-    AuctionState,
-    BID_BY_RANK,
-    SUPPORTED_BID_RANKS,
-    can_pickup,
-    create_auction,
-    legal_bids,
-    submit_bid,
-    submit_pass,
-    submit_pickup,
-)
-from trickster.games.ulti.game import deal, next_player
+from trickster.games.ulti.game import deal
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 from trickster.mcts import MCTSConfig
 from trickster.model import UltiNetWrapper
@@ -58,7 +46,6 @@ from trickster.training.bidding_loop import (
     DISPLAY_ORDER,
     _display_key,
     _kontrable_units,
-    _setup_bid_game,
 )
 from trickster.training.model_io import (
     DK_LABELS,
@@ -109,14 +96,6 @@ def _parse_entrant(arg: str, default_speed: str) -> tuple[str, str]:
     return arg, default_speed
 
 
-# ---------------------------------------------------------------------------
-#  Bid rank reverse lookup (same as eval_bidding.py)
-# ---------------------------------------------------------------------------
-
-_CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
-    v: k for k, v in BID_TO_CONTRACT.items()
-}
-
 _BID_THRESHOLD = -2.0
 _BID_MAX_DISCARDS = 15
 
@@ -141,109 +120,8 @@ class DealResult:
 
 
 # ---------------------------------------------------------------------------
-#  Auction + play (reused from eval_bidding.py)
+#  Kontra (per-seat models)
 # ---------------------------------------------------------------------------
-
-def _nn_eval_to_auction_bid(ev, auction: AuctionState):
-    bid_rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
-    if bid_rank is None or bid_rank not in SUPPORTED_BID_RANKS:
-        return None
-    bid_obj = BID_BY_RANK.get(bid_rank)
-    if bid_obj is None:
-        return None
-    if bid_obj not in legal_bids(auction):
-        return None
-    return bid_obj, list(ev.best_discard.discard)
-
-
-def _best_legal_nn_bid(gs, player, dealer, wrappers, auction, min_bid_pts, max_discards):
-    evals = evaluate_all_contracts(
-        gs, player, dealer, wrappers=wrappers, max_discards=max_discards,
-    )
-    if not evals:
-        return None
-    for ev in evals:
-        if ev.game_pts < min_bid_pts:
-            break
-        r = _nn_eval_to_auction_bid(ev, auction)
-        if r is not None:
-            bid_obj, discards = r
-            return ev, bid_obj, discards
-    return None
-
-
-def _run_auction(gs, seat_wrappers, dealer, talon, min_bid_pts, max_discards):
-    from trickster.games.ulti.auction import BID_PASSZ, ai_initial_bid
-
-    first_bidder = next_player(dealer)
-    gs.hands[first_bidder].extend(talon)
-    a = create_auction(first_bidder, talon)
-    winning_eval = None
-
-    while not a.done:
-        player = a.turn
-        if (a.current_bid is not None
-                and a.current_bid.rank >= MAX_SUPPORTED_RANK
-                and not a.awaiting_bid):
-            submit_pass(a, player)
-            continue
-
-        if a.awaiting_bid:
-            wrappers = seat_wrappers[player]
-            result = None
-            if wrappers:
-                result = _best_legal_nn_bid(
-                    gs, player, dealer, wrappers, a, min_bid_pts, max_discards,
-                )
-            if result is not None:
-                ev, bid_obj, discards = result
-                for c in discards:
-                    gs.hands[player].remove(c)
-                submit_bid(a, player, bid_obj, discards)
-                winning_eval = ev
-            else:
-                if a.current_bid is None:
-                    bid_obj, discards = ai_initial_bid(gs.hands[player])
-                    for c in discards:
-                        gs.hands[player].remove(c)
-                    submit_bid(a, player, bid_obj, discards)
-                    winning_eval = None
-                else:
-                    legal = legal_bids(a)
-                    if legal:
-                        bid_obj = legal[0]
-                        discards = gs.hands[player][:2]
-                        for c in discards:
-                            gs.hands[player].remove(c)
-                        submit_bid(a, player, bid_obj, discards)
-                        winning_eval = None
-                    else:
-                        submit_pass(a, player)
-        else:
-            should_pickup = False
-            wrappers = seat_wrappers[player]
-            if wrappers and can_pickup(a):
-                sim_hand = list(gs.hands[player]) + list(a.talon)
-                orig = gs.hands[player]
-                gs.hands[player] = sim_hand
-                try:
-                    result = _best_legal_nn_bid(
-                        gs, player, dealer, wrappers, a, min_bid_pts, max_discards,
-                    )
-                    should_pickup = result is not None
-                finally:
-                    gs.hands[player] = orig
-            if should_pickup:
-                gs.hands[player].extend(a.talon)
-                submit_pickup(a, player)
-            else:
-                submit_pass(a, player)
-
-    soloist = a.winner
-    if a.current_bid is not None and a.current_bid.rank <= BID_PASSZ.rank:
-        return soloist, None
-    return soloist, winning_eval
-
 
 def _decide_kontra(game, state, contract_key, seat_wrappers):
     gs = state.gs
@@ -288,9 +166,14 @@ def _play_one_deal(
 
     gs, talon = deal(seed=seed, dealer=dealer)
 
-    soloist, bid = _run_auction(
-        gs, seat_wrappers, dealer, talon, min_bid_pts, max_discards,
+    # --- Competitive auction (shared with training) ---
+    auction_result = run_auction(
+        gs, talon, dealer, seat_wrappers,
+        min_bid_pts=min_bid_pts,
+        max_discards=max_discards,
     )
+    soloist = auction_result.soloist
+    bid = auction_result.bid
 
     def _pts(raw: float) -> float:
         return raw * _GAME_PTS_MAX
@@ -313,10 +196,10 @@ def _play_one_deal(
     dkey = _display_key(bid.contract_key, bid.is_piros)
     mkey = bid.contract_key
 
-    if len(gs.hands[soloist]) == 10:
-        gs.hands[soloist].extend(list(bid.best_discard.discard))
-
-    state = _setup_bid_game(game, gs, soloist, dealer, bid)
+    state = setup_bid_game(
+        game, gs, soloist, dealer, bid,
+        initial_bidder=auction_result.initial_bidder,
+    )
 
     players: list[HybridPlayer | None] = [None, None, None]
     for seat in range(3):
@@ -597,8 +480,8 @@ def main() -> None:
     )
     parser.add_argument(
         "models", nargs="+", metavar="MODEL",
-        help="Model sources to enter (e.g. knight knight_balanced random). "
-             "Append :speed for per-model search speed (e.g. knight:deep).",
+        help="Model sources to enter (e.g. knight_light knight_balanced random). "
+             "Append :speed for per-model search speed (e.g. knight_light:deep).",
     )
     parser.add_argument(
         "--speed", default="fast", choices=list(SPEEDS.keys()),

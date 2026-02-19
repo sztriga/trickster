@@ -1,0 +1,14 @@
+{
+  "tier": "knight_heavy",
+  "contract": "ulti",
+  "steps": 750,
+  "games_per_step": 8,
+  "total_games": 6000,
+  "sol_sims": 60,
+  "def_sims": 24,
+  "endgame_tricks": 6,
+  "pimc_dets": 20,
+  "body_units": 256,
+  "body_layers": 4,
+  "train_time_s": 218.4
+}

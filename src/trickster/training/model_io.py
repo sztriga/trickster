@@ -1,12 +1,12 @@
 """Model loading, device selection, and path conventions for Ulti.
 
 Path conventions:
-    Base:  models/<contract>/<prefix><index>-<Label>/model.pt
-    E2E:   models/e2e/<name>/<contract>/model.pt
+    Base:  models/ulti/<tier>/base/<contract>/model.pt
+    Final: models/ulti/<name>/final/<contract>/model.pt
 
 Source names:
-    "knight"       →  models/e2e/knight/parti/model.pt, ...
-    "knight_base"  →  models/parti/P2-Knight/model.pt, ...
+    "knight_light"       →  models/ulti/knight_light/final/parti/model.pt, ...
+    "knight_light_base"  →  models/ulti/knight_light/base/parti/model.pt, ...
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import torch
 
 from trickster.games.ulti.adapter import UltiGame
 from trickster.model import UltiNet, UltiNetWrapper, make_wrapper
+from trickster.training.tiers import TIERS
 
 
 # ---------------------------------------------------------------------------
@@ -60,57 +61,29 @@ def auto_device(
 
 _CONTRACT_KEYS = ["parti", "ulti", "40-100", "betli"]
 
-# contract → (directory name, base-model prefix letter)
-_CONTRACT_META: dict[str, tuple[str, str]] = {
-    "parti":  ("parti",  "P"),
-    "ulti":   ("ulti",   "U"),
-    "40-100": ("40-100", "H"),
-    "betli":  ("betli",  "B"),
-}
-
-# tier name → index used in base-model directory names
-_TIER_INDEX: dict[str, int] = {
-    "scout":   1,
-    "knight":  2,
-    "knight_balanced": 14,
-    "knight_heavy": 15,
-    "knight_pure": 16,
-    "bishop":  3,
-    "rook":    4,
-    "captain": 5,
-    "bronze":  7,
-    "silver":  8,
-    "gold":    9,
-    "hawk":   10,
-    "eagle":  11,
-    "falcon": 12,
-    "oracle": 13,
-}
+_ULTI_ROOT = Path("models/ulti")
 
 
 def _base_path(contract: str, tier: str) -> Path:
-    dir_name, prefix = _CONTRACT_META[contract]
-    idx = _TIER_INDEX.get(tier, 0)
-    return Path("models") / dir_name / f"{prefix}{idx}-{tier.title()}"
+    return _ULTI_ROOT / tier / "base" / contract
 
 
 def _e2e_path(contract: str, name: str) -> Path:
-    dir_name, _ = _CONTRACT_META[contract]
-    return Path("models") / "e2e" / name / dir_name
+    return _ULTI_ROOT / name / "final" / contract
 
 
 def resolve_paths(source: str) -> dict[str, Path]:
     """Resolve a source name to contract model paths.
 
-    "knight"       → e2e models
-    "knight_base"  → base (intermediate) models
+    "knight_light"       → final (e2e) models
+    "knight_light_base"  → base (intermediate) models
     """
     if source.endswith("_base"):
         tier = source.removesuffix("_base")
-        if tier not in _TIER_INDEX:
+        if tier not in TIERS:
             raise ValueError(
                 f"Unknown base tier '{tier}'. "
-                f"Known tiers: {', '.join(_TIER_INDEX)}"
+                f"Known tiers: {', '.join(TIERS)}"
             )
         return {c: _base_path(c, tier) for c in _CONTRACT_KEYS}
 
@@ -120,23 +93,30 @@ def resolve_paths(source: str) -> dict[str, Path]:
 def list_available_sources(models_root: str | Path = "models") -> list[str]:
     """Scan the filesystem and return source keys that have models."""
     root = Path(models_root)
+    ulti_dir = root / "ulti"
     sources: list[str] = []
 
-    # Base models
-    for tier in _TIER_INDEX:
-        paths = {c: _base_path(c, tier) for c in _CONTRACT_KEYS}
-        if any((p / "model.pt").exists() for p in paths.values()):
-            sources.append(f"{tier}_base")
+    if not ulti_dir.is_dir():
+        return sources
 
-    # E2E models
-    e2e_dir = root / "e2e"
-    if e2e_dir.is_dir():
-        for tier_dir in sorted(e2e_dir.iterdir()):
-            if tier_dir.is_dir():
-                name = tier_dir.name
-                paths = {c: _e2e_path(c, name) for c in _CONTRACT_KEYS}
-                if any((p / "model.pt").exists() for p in paths.values()):
-                    sources.append(name)
+    for model_dir in sorted(ulti_dir.iterdir()):
+        if not model_dir.is_dir():
+            continue
+        name = model_dir.name
+
+        # Final (e2e) models
+        final_dir = model_dir / "final"
+        if final_dir.is_dir() and any(
+            (final_dir / c / "model.pt").exists() for c in _CONTRACT_KEYS
+        ):
+            sources.append(name)
+
+        # Base models
+        base_dir = model_dir / "base"
+        if base_dir.is_dir() and any(
+            (base_dir / c / "model.pt").exists() for c in _CONTRACT_KEYS
+        ):
+            sources.append(f"{name}_base")
 
     return sources
 

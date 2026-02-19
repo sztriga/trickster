@@ -5,7 +5,7 @@ contract models loaded via ``model_io.load_wrappers``.
 
 Game flow: BID → AUCTION → TRUMP_SELECT → KONTRA → PLAY → DONE.
 
-Each AI seat can use a different trained model (e.g. scout, knight).
+Each AI seat can use a different trained model (e.g. scout, knight_light).
 The model is selected at game creation via the ``opponents`` parameter.
 """
 

@@ -1,9 +1,14 @@
-"""Multi-contract training loop with value-head-driven bidding.
+"""Multi-contract training loop with competitive auction bidding.
 
-Instead of training one contract with random deals, this loop:
-  1. Deals a random 12-card hand
-  2. Uses all models' value heads to pick the best contract+trump+discard
-  3. Plays the chosen contract with that model
+Each training game runs a realistic 3-player auction (identical to
+evaluation) so the model learns from the same game dynamics it will
+face during eval.  The shared auction logic lives in
+:mod:`trickster.bidding.auction_runner`.
+
+The loop:
+  1. Deals cards + 2-card talon
+  2. Runs a competitive auction (blind pickup, overbid, etc.)
+  3. Plays the chosen contract with MCTS+solver
   4. Adds samples to that contract's replay buffer
 
 Each contract model improves on hands that were *actually bid*, not
@@ -29,6 +34,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from trickster.bidding.auction_runner import (
+    AuctionResult,
+    run_auction,
+    setup_bid_game,
+)
 from trickster.bidding.evaluator import (
     ContractEval,
     evaluate_all_contracts,
@@ -39,11 +49,7 @@ from trickster.games.ulti.adapter import UltiGame, UltiNode
 from trickster.games.ulti.cards import Card
 from trickster.games.ulti.game import (
     deal,
-    declare_all_marriages,
-    discard_talon,
     next_player,
-    pickup_talon,
-    set_contract,
     Suit,
 )
 from trickster.hybrid import HybridPlayer
@@ -151,7 +157,7 @@ class BiddingTrainConfig:
 
     # -- Bidding --
     max_discards: int = 15        # discard pairs per contract eval
-    min_bid_pts: float = -2.0     # minimum expected pts/defender to bid (matches pass penalty)
+    min_bid_pts: float = 0.5      # minimum expected pts/defender to bid (must expect profit)
     pass_penalty: float = 2.0     # pts per defender when everyone passes
     exploration_frac: float = 0.2  # fraction of games with random contract
 
@@ -159,7 +165,7 @@ class BiddingTrainConfig:
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
 
     # -- Opponent pool --
-    opponent_pool: list[str] = field(default_factory=list)  # e.g. ["scout", "knight"]
+    opponent_pool: list[str] = field(default_factory=list)  # e.g. ["scout", "knight_light"]
     pool_frac: float = 0.5         # fraction of games played vs pool opponents
 
     # -- Contracts to train (model keys) --
@@ -181,6 +187,28 @@ class BiddingTrainConfig:
 # ---------------------------------------------------------------------------
 #  Stats
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class CalibrationRecord:
+    """Per-contract calibration: predicted value vs actual outcome."""
+
+    predicted_sum: float = 0.0   # sum of value-head predictions (soloist perspective)
+    actual_sum: float = 0.0      # sum of actual game outcomes (soloist perspective)
+    count: int = 0
+
+    @property
+    def predicted_avg(self) -> float:
+        return self.predicted_sum / self.count if self.count else 0.0
+
+    @property
+    def actual_avg(self) -> float:
+        return self.actual_sum / self.count if self.count else 0.0
+
+    @property
+    def bias(self) -> float:
+        """Positive = overestimates, negative = underestimates."""
+        return self.predicted_avg - self.actual_avg
 
 
 @dataclass
@@ -213,6 +241,9 @@ class BiddingTrainStats:
 
     # Cumulative per-model-key
     cumulative_samples: dict[str, int] = field(default_factory=dict)
+
+    # Per-display-key calibration (predicted bid value vs actual outcome)
+    calibration: dict[str, CalibrationRecord] = field(default_factory=dict)
 
     # Slots reference (for the callback to access histories)
     _slots: dict | None = field(default=None, repr=False)
@@ -253,7 +284,7 @@ def _init_bidding_worker(
 
 def _play_bidding_game_in_worker(
     args: tuple,
-) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]]:
+) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
     """Worker entry-point for parallel bidding self-play."""
     (all_state_dicts, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, exploration) = args
 
@@ -353,31 +384,6 @@ def _decide_kontra(
 
 
 # ---------------------------------------------------------------------------
-#  Setup a deal from a bid result
-# ---------------------------------------------------------------------------
-
-
-def _setup_bid_game(
-    game: UltiGame,
-    gs,
-    soloist: int,
-    dealer: int,
-    bid: ContractEval,
-) -> UltiNode:
-    """Apply the bid result to a game state, returning a ready-to-play node.
-
-    The gs must have the soloist's hand at 12 cards.
-    """
-    from trickster.bidding.evaluator import _make_eval_state
-
-    cdef = CONTRACT_DEFS[bid.contract_key]
-    return _make_eval_state(
-        gs, soloist, bid.trump, bid.best_discard.discard,
-        cdef, bid.is_piros, dealer,
-    )
-
-
-# ---------------------------------------------------------------------------
 #  Play one game with bidding
 # ---------------------------------------------------------------------------
 
@@ -391,8 +397,11 @@ def _play_one_bidding_game(
     cfg: BiddingTrainConfig,
     exploration: bool = False,
     opp_wrappers: dict[str, UltiNetWrapper] | None = None,
-) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]]:
-    """Play one game with value-head bidding.
+) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
+    """Play one game with competitive auction bidding.
+
+    Uses the same :func:`run_auction` as evaluation so that
+    training and eval play exactly the same game.
 
     Parameters
     ----------
@@ -401,45 +410,58 @@ def _play_one_bidding_game(
         decisions instead of *wrappers*.  Only soloist samples are
         collected (defender policy is off-policy for the training model).
 
-    Returns (display_key, samples) where display_key encodes both
-    the contract and whether it's piros (e.g. "p.parti", "ulti").
-    Returns ("__pass__", []) when everyone passes.
+    Returns (display_key, samples, predicted_value) where display_key
+    encodes both the contract and whether it's piros (e.g. "p.parti",
+    "ulti").  predicted_value is the value head's bid-time estimate
+    (game_pts) for calibration tracking.
+    Returns ("__pass__", [], 0.0) when everyone passes.
     """
     rng = random.Random(seed)
     dealer = seed % 3
-    soloist = next_player(dealer)
     pool_game = opp_wrappers is not None
 
-    # 1. Deal 12 cards
+    # 1. Deal cards
     gs, talon = deal(seed=seed, dealer=dealer)
-    pickup_talon(gs, soloist, talon)
 
-    # 2. Evaluate all contracts (always — exploration picks randomly)
-    evals = evaluate_all_contracts(
-        gs, soloist, dealer,
-        wrappers=wrappers,
-        max_discards=cfg.max_discards,
-    )
-
-    if not evals:
-        return "__pass__", []
-
-    # 3. Pick a bid
+    # 2. Run the competitive auction (all seats use training wrappers)
     if exploration:
-        # Random exploration: pick any feasible contract
+        # Exploration: skip auction, first bidder evaluates all contracts
+        # and picks one at random.
+        soloist = next_player(dealer)
+        gs.hands[soloist].extend(talon)
+        evals = evaluate_all_contracts(
+            gs, soloist, dealer,
+            wrappers=wrappers,
+            max_discards=cfg.max_discards,
+        )
+        if not evals:
+            return "__pass__", [], 0.0
         bid = rng.choice(evals)
+        dkey = _display_key(bid.contract_key, bid.is_piros)
+        state = setup_bid_game(
+            game, gs, soloist, dealer, bid,
+            initial_bidder=soloist,  # exploration: soloist is always first bidder
+        )
     else:
-        bid = pick_best_bid(evals, min_stakes_pts=cfg.min_bid_pts)
-        if bid is None:
-            # Everyone passes — soloist pays penalty, no game played.
-            return "__pass__", []
+        seat_wrappers = [wrappers, wrappers, wrappers]
+        result = run_auction(
+            gs, talon, dealer, seat_wrappers,
+            min_bid_pts=cfg.min_bid_pts,
+            max_discards=cfg.max_discards,
+        )
+        soloist = result.soloist
 
-    dkey = _display_key(bid.contract_key, bid.is_piros)
+        if result.bid is None:
+            return "__pass__", [], 0.0
 
-    # 4. Setup game state from the bid
-    state = _setup_bid_game(game, gs, soloist, dealer, bid)
+        bid = result.bid
+        dkey = _display_key(bid.contract_key, bid.is_piros)
+        state = setup_bid_game(
+            game, gs, soloist, dealer, bid,
+            initial_bidder=result.initial_bidder,
+        )
 
-    # 5. Get wrappers for play
+    # 3. Get wrappers for play
     sol_wrapper = wrappers.get(bid.contract_key)
     if sol_wrapper is None:
         sol_wrapper = next(iter(wrappers.values()))
@@ -453,7 +475,7 @@ def _play_one_bidding_game(
 
     soloist_idx = state.gs.soloist
 
-    # 6. Play the game
+    # 4. Play the game
     sol_hybrid = HybridPlayer(
         game, sol_wrapper,
         mcts_config=sol_cfg,
@@ -517,13 +539,15 @@ def _play_one_bidding_game(
 
         state = game.apply(state, action)
 
-    # 7. Label with outcome
+    # 5. Label with outcome
     samples: list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool, bool]] = []
     for state_feats, mask, pi, player, is_sol, on_pol in trajectory:
         reward = simple_outcome(state, player)
         samples.append((state_feats, mask, pi, reward, is_sol, on_pol))
 
-    return dkey, samples
+    # Predicted bid value for calibration (game_pts from value head at bid time).
+    predicted_value = bid.game_pts if bid is not None else 0.0
+    return dkey, samples, predicted_value
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +657,7 @@ def train_with_bidding(
     cum_dk_games: dict[str, int] = {dk: 0 for dk in DISPLAY_ORDER}
     cum_dk_pts: dict[str, float] = {dk: 0.0 for dk in DISPLAY_ORDER}
     cum_dk_wins: dict[str, int] = {dk: 0 for dk in DISPLAY_ORDER}
+    calibration: dict[str, CalibrationRecord] = {}
 
     # -- Parallel pool --
     executor = None
@@ -699,6 +724,7 @@ def train_with_bidding(
             def _collect_result(
                 dkey: str,
                 samples: list,
+                predicted_value: float = 0.0,
             ) -> None:
                 """Route one game's results to the correct slot."""
                 nonlocal step_passes
@@ -729,6 +755,14 @@ def train_with_bidding(
                         step_dk_wins[dkey] = step_dk_wins.get(dkey, 0) + 1
                         cum_dk_wins[dkey] = cum_dk_wins.get(dkey, 0) + 1
 
+                    # Calibration tracking: predicted bid value vs actual outcome
+                    if dkey not in calibration:
+                        calibration[dkey] = CalibrationRecord()
+                    cal = calibration[dkey]
+                    cal.predicted_sum += predicted_value
+                    cal.actual_sum += sol_game_pts
+                    cal.count += 1
+
                 stats.total_games += 1
 
             if executor is not None:
@@ -749,10 +783,10 @@ def train_with_bidding(
                         cfg_dict,
                         exploration,
                     ))
-                for dkey, samples in executor.map(
+                for dkey, samples, pred_val in executor.map(
                     _play_bidding_game_in_worker, tasks,
                 ):
-                    _collect_result(dkey, samples)
+                    _collect_result(dkey, samples, pred_val)
             else:
                 # --- Sequential self-play ---
                 for g in range(cfg.games_per_step):
@@ -764,12 +798,12 @@ def train_with_bidding(
                     if pool_wrappers_list and pool_rng.random() < cfg.pool_frac:
                         opp_w = pool_rng.choice(pool_wrappers_list)
 
-                    dkey, samples = _play_one_bidding_game(
+                    dkey, samples, pred_val = _play_one_bidding_game(
                         game, wrappers, sol_cfg, def_cfg, game_seed, cfg,
                         exploration=exploration,
                         opp_wrappers=opp_w,
                     )
-                    _collect_result(dkey, samples)
+                    _collect_result(dkey, samples, pred_val)
 
             # -- SGD for each contract that has enough data --
             step_model_vloss: dict[str, float] = {}
@@ -843,6 +877,7 @@ def train_with_bidding(
             stats.cumulative_pts = dict(cum_dk_pts)
             stats.cumulative_wins = dict(cum_dk_wins)
             stats.cumulative_samples = {k: slots[k].samples for k in cfg.contract_keys}
+            stats.calibration = dict(calibration)
             stats._slots = slots
 
             if on_progress:

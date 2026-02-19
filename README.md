@@ -14,10 +14,10 @@ pip install cython
 python setup_cython.py build_ext --inplace
 
 # Train end-to-end (base models + bidding in one pipeline)
-python scripts/train_e2e.py knight --workers 6
+python scripts/train_e2e.py knight_light --workers 6
 
 # Evaluate
-python scripts/eval_bidding.py --seats knight knight scout --games 2000 --workers 6
+python scripts/eval_bidding.py --seats knight_light knight_light scout --games 2000 --workers 6
 
 # Play in the browser
 PYTHONPATH=src uvicorn apps.api.ulti:app --reload --port 8000
@@ -83,16 +83,17 @@ Training is a unified two-phase pipeline via `train_e2e.py`.
 
 ```bash
 # Full pipeline (Phase 1 + Phase 2)
-python scripts/train_e2e.py knight --workers 6
+python scripts/train_e2e.py knight_light --workers 6
 
-# Skip Phase 1 if base models already exist
-python scripts/train_e2e.py knight --skip-base --workers 6
+# Skip Phase 1, use existing base models (--base-from <tier>)
+python scripts/train_e2e.py knight_light --base-from knight_light --workers 6
+python scripts/train_e2e.py silver --base-from bronze --workers 6  # use bronze base
 
 # Verbose output (per-step details)
-python scripts/train_e2e.py knight --workers 6 -v
+python scripts/train_e2e.py knight_light --workers 6 -v
 
 # Override bidding steps
-python scripts/train_e2e.py knight --workers 6 --bidding-steps 4000
+python scripts/train_e2e.py knight_light --workers 6 --bidding-steps 4000
 ```
 
 ### Phase 1: Base Contract Training
@@ -126,7 +127,7 @@ Each tier defines the full training budget — network size, MCTS search depth, 
 | Tier | Net | Base games | E2E games | MCTS (sol/def) |
 |---|---|---|---|---|
 | Scout | 256×4 | 4k | 8k | 40 / 20 |
-| Knight | 256×4 | 16k | 16k | 60 / 24 |
+| Knight Light | 256×4 | 16k | 16k | 60 / 24 |
 | Bishop | 384×4 | 24k | 24k | 80 / 30 |
 | Rook | 512×6 | 24k | 24k | 80 / 30 |
 
@@ -136,8 +137,8 @@ Additional tiers (bronze, silver, gold, hawk, eagle, falcon, oracle) explore vol
 
 | Key | Description | Path |
 |---|---|---|
-| `knight_base` | Pre-trained Knight models (Phase 1) | `models/<contract>/X2-Knight/` |
-| `knight` | Bidding-trained Knight models (Phase 2) | `models/e2e/knight/` |
+| `knight_light_base` | Pre-trained Knight Light models (Phase 1) | `models/<contract>/X2-Knight-Light/` |
+| `knight_light` | Bidding-trained Knight Light models (Phase 2) | `models/e2e/knight_light/` |
 
 ---
 
@@ -147,13 +148,13 @@ Full end-to-end evaluation with 3 seats, bidding, kontra, and mixed model tiers:
 
 ```bash
 # E2E models head-to-head
-python scripts/eval_bidding.py --seats knight knight scout --games 2000 --workers 6
+python scripts/eval_bidding.py --seats knight_light knight_light scout --games 2000 --workers 6
 
 # Different search speeds
-python scripts/eval_bidding.py --seats knight:deep knight:fast scout:normal --games 2000 --workers 6
+python scripts/eval_bidding.py --seats knight_light:deep knight_light:fast scout:normal --games 2000 --workers 6
 
 # Global speed override
-python scripts/eval_bidding.py --seats knight knight scout --speed normal --games 2000 --workers 6
+python scripts/eval_bidding.py --seats knight_light knight_light scout --speed normal --games 2000 --workers 6
 ```
 
 Speed presets (estimated for 2000 deals @ 6 workers):
@@ -269,8 +270,8 @@ The same scoring engine is used for training, evaluation, and the UI.
 
 | Script | Purpose | Example |
 |---|---|---|
-| `train_e2e.py` | Full training pipeline (base + bidding) | `python scripts/train_e2e.py knight --workers 6` |
-| `eval_bidding.py` | 3-seat end-to-end evaluation | `python scripts/eval_bidding.py --seats knight knight scout --games 2000 --workers 6` |
+| `train_e2e.py` | Full training pipeline (base + bidding) | `python scripts/train_e2e.py knight_light --workers 6` |
+| `eval_bidding.py` | 3-seat end-to-end evaluation | `python scripts/eval_bidding.py --seats knight_light knight_light scout --games 2000 --workers 6` |
 
 ---
 
@@ -319,6 +320,6 @@ apps/
 
 models/
   e2e/
-    knight/                # E2E trained models
+    knight_light/         # E2E trained models
   snapszer/                # Snapszer models
 ```

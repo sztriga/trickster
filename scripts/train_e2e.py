@@ -12,10 +12,10 @@ Phase 2 — Bidding training:
 Multiple tiers can be trained sequentially in a single invocation.
 
 Usage:
-    python scripts/train_e2e.py knight                          # single tier
-    python scripts/train_e2e.py knight knight_balanced knight_heavy knight_pure  # batch
+    python scripts/train_e2e.py knight_light                     # single tier
+    python scripts/train_e2e.py knight_light knight_balanced knight_heavy knight_pure  # batch
     python scripts/train_e2e.py bishop --workers 6              # heavier tier
-    python scripts/train_e2e.py knight --skip-base              # Phase 2 only
+    python scripts/train_e2e.py silver --base-from bronze       # Phase 2 only, use bronze base
     python scripts/train_e2e.py knight --bidding-steps 4000 -v  # verbose
 """
 from __future__ import annotations
@@ -29,7 +29,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from trickster.bidding.registry import CONTRACT_DEFS
 from trickster.games.ulti.adapter import UltiGame
 from trickster.hybrid import SOLVER_ENGINE
 from trickster.train_utils import _GAME_PTS_MAX
@@ -108,8 +107,11 @@ def train_tier(tier_name: str, args) -> None:
     print()
 
     # ── Phase 1: Base Training ──
-    skip_base = args.skip_base or tier.steps == 0
-    from_scratch = tier.steps == 0 and not args.base_from
+    # base_from: if set, skip Phase 1 and load that tier's base models.
+    # tier.steps == 0 (e.g. knight_pure): no base phase; from scratch unless base_from set.
+    base_from = args.base_from
+    skip_base = base_from is not None or tier.steps == 0
+    from_scratch = tier.steps == 0 and base_from is None
 
     if not skip_base:
         print("━" * 60)
@@ -119,13 +121,12 @@ def train_tier(tier_name: str, args) -> None:
 
         for ckey in CONTRACT_KEYS:
             spec = CONTRACTS[ckey]
-            name = tier.tier_name(spec.name_prefix)
-            print(f"  ┌─ {name}: {spec.display_name} " + "─" * 30)
+            print(f"  ┌─ {tier_name}/{ckey}: {spec.display_name} " + "─" * 30)
             print(f"  │  Budget: {tier.steps} steps × {tier.games_per_step} gpi = "
                   f"{tier.total_games:,} games")
 
             train_one_tier(
-                tier, spec,
+                tier, spec, ckey, tier_name,
                 seed=args.seed,
                 device=resolved_device,
                 num_workers=args.workers,
@@ -133,7 +134,7 @@ def train_tier(tier_name: str, args) -> None:
                 verbose=args.verbose,
             )
 
-            print(f"  └─ {name} complete")
+            print(f"  └─ {tier_name}/{ckey} complete")
             print()
 
         elapsed = time.perf_counter() - t0
@@ -143,17 +144,17 @@ def train_tier(tier_name: str, args) -> None:
         print("  Phase 1 skipped (training from scratch — random init)")
         print()
     else:
-        base_tier = args.base_from or tier_name
+        base_tier = base_from if base_from is not None else tier_name
         source = f"{base_tier}_base"
         paths = resolve_paths(source)
         missing = [k for k, p in paths.items() if not (p / "model.pt").exists()]
         if missing:
-            print(f"  ERROR: --skip-base but missing base models ({source}): {', '.join(missing)}")
+            print(f"  ERROR: --base-from {base_tier} but missing base models ({source}): {', '.join(missing)}")
             sys.exit(1)
-        if args.base_from:
-            print(f"  Phase 1 skipped (borrowing base models from {source})")
-        else:
+        if base_from == tier_name:
             print(f"  Phase 1 skipped (using existing {source} models)")
+        else:
+            print(f"  Phase 1 skipped (using base models from {source})")
         print()
 
     # ── Phase 2: Bidding Training ──
@@ -168,7 +169,7 @@ def train_tier(tier_name: str, args) -> None:
     if from_scratch:
         print("  Starting from random weights (no base models)")
     else:
-        base_tier = args.base_from or tier_name
+        base_tier = base_from if base_from is not None else tier_name
         source = f"{base_tier}_base"
         model_paths = resolve_paths(source)
         print(f"  Loading base models ({source}):")
@@ -202,7 +203,7 @@ def train_tier(tier_name: str, args) -> None:
         buffer_size=tier.e2e_buffer_size,
         batch_size=tier.batch_size,
         max_discards=15,
-        min_bid_pts=-2.0,
+        min_bid_pts=0.5,
         exploration_frac=0.2,
         contract_keys=CONTRACT_KEYS,
         num_workers=args.workers,
@@ -233,12 +234,11 @@ def train_tier(tier_name: str, args) -> None:
     )
 
     # Save
-    save_base = Path(f"models/e2e/{tier_name}")
+    save_base = Path(f"models/ulti/{tier_name}/final")
     game = UltiGame()
 
     for key, slot in slots.items():
-        cdef = CONTRACT_DEFS[key]
-        out_dir = save_base / cdef.model_dir
+        out_dir = save_base / key
         out_dir.mkdir(parents=True, exist_ok=True)
         torch.save({
             "model_state_dict": slot.net.state_dict(),
@@ -246,7 +246,7 @@ def train_tier(tier_name: str, args) -> None:
             "body_layers": cfg.body_layers,
             "input_dim": game.state_dim,
             "action_dim": game.action_space_size,
-            "training_mode": cdef.training_mode,
+            "training_mode": CONTRACTS[key].training_mode,
             "method": "bidding_hybrid",
             "total_games": slot.games,
             "total_samples": slot.samples,
@@ -267,7 +267,7 @@ def train_tier(tier_name: str, args) -> None:
     print("  │")
     print(f"  │  Tier:     {tier_name}")
     print(f"  │  Output:   {save_base}/")
-    print(f"  │  Phase 1:  {fmt_time(elapsed_total - elapsed_phase2) if not skip_base else 'skipped'}")
+    print(f"  │  Phase 1:  {fmt_time(elapsed_total - elapsed_phase2) if not skip_base else 'skipped (base-from)'}")
     print(f"  │  Phase 2:  {fmt_time(elapsed_phase2)} "
           f"({total_games:,} games, {total_passes:,} passes)")
     print(f"  │  Total:    {fmt_time(elapsed_total)}")
@@ -300,17 +300,17 @@ def main() -> None:
     )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--verbose", "-v", action="store_true")
-    parser.add_argument("--skip-base", action="store_true",
-                        help="Skip Phase 1 (base models must already exist)")
-    parser.add_argument("--base-from", type=str, default=None,
-                        help="Load base models from a different tier (e.g. bronze)")
+    parser.add_argument("--base-from", type=str, default=None, metavar="TIER",
+                        help="Skip Phase 1 and load base models from this tier. "
+                             "E.g. --base-from bronze when training silver. "
+                             "Use --base-from <tier> to reuse that tier's existing base.")
     parser.add_argument("--bidding-steps", type=int, default=None,
                         help="Override bidding training steps")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--opponent-pool", nargs="*", default=None,
-        help="Model sources for opponent pool (e.g. scout knight). "
+        help="Model sources for opponent pool (e.g. scout knight_light). "
              "Defenders in pool games use a randomly chosen pool model.",
     )
     parser.add_argument(
@@ -324,6 +324,9 @@ def main() -> None:
     bad = [t for t in args.tiers if t not in valid]
     if bad:
         parser.error(f"unknown tier(s): {', '.join(bad)}. "
+                     f"Choose from: {', '.join(valid)}")
+    if args.base_from is not None and args.base_from not in valid:
+        parser.error(f"--base-from '{args.base_from}' is not a valid tier. "
                      f"Choose from: {', '.join(valid)}")
 
     n = len(args.tiers)

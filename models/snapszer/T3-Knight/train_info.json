@@ -1,0 +1,20 @@
+{
+  "method": "alphazero",
+  "iterations": 200,
+  "games_per_iter": 40,
+  "total_games": 8000,
+  "total_samples": 95957,
+  "bootstrap_games": 3000,
+  "sims": 50,
+  "dets": 4,
+  "train_steps": 80,
+  "batch_size": 32,
+  "buffer_capacity": 20000,
+  "lr": 0.01,
+  "l2": 0.0001,
+  "seed": 42,
+  "workers": 4,
+  "vmse": 0.36494,
+  "pce": 1.408971,
+  "train_time_s": 309.5
+}

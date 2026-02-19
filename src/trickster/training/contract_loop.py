@@ -154,6 +154,8 @@ def progress_verbose(tier: Tier):
 def train_one_tier(
     tier: Tier,
     spec: ContractSpec,
+    contract_key: str,
+    tier_key: str,
     *,
     seed: int = 42,
     device: str = "auto",
@@ -162,8 +164,7 @@ def train_one_tier(
     verbose: bool = False,
 ) -> tuple[UltiNet, Path]:
     """Train one tier for one contract.  Returns (net, model_dir)."""
-    tier_name = tier.tier_name(spec.name_prefix)
-    model_dir = Path("models") / spec.model_dir / tier_name
+    model_dir = Path("models/ulti") / tier_key / "base" / contract_key
     model_dir.mkdir(parents=True, exist_ok=True)
 
     game = UltiGame()
@@ -248,7 +249,7 @@ def train_one_tier(
     }, model_dir / "model.pt")
 
     (model_dir / "train_info.json").write_text(json.dumps({
-        "tier": tier_name,
+        "tier": tier_key,
         "contract": spec.training_mode,
         "steps": tier.steps,
         "games_per_step": tier.games_per_step,
