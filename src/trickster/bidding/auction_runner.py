@@ -147,15 +147,18 @@ def estimate_pickup_value(
     legal_ranks = {b.rank for b in legal_bids(auction)}
 
     pickup_values: list[float] = []
+    original_hand = gs.hands[player]
     for _ in range(num_samples):
         rng.shuffle(unknown)
         sampled_talon = unknown[:2]
 
-        gs_copy = copy.deepcopy(gs)
-        gs_copy.hands[player] = list(hand) + list(sampled_talon)
+        # Temporarily give the player a 12-card hand.
+        # evaluate_all_contracts → _make_eval_state deepcopies gs
+        # internally, so the original state is never mutated.
+        gs.hands[player] = list(hand) + list(sampled_talon)
 
         evals = evaluate_all_contracts(
-            gs_copy, player, dealer,
+            gs, player, dealer,
             wrappers=wrappers,
             max_discards=max_discards,
         )
@@ -174,6 +177,9 @@ def estimate_pickup_value(
             pickup_values.append(best_legal_pts)
         # If no legal overbid found for this talon, skip it —
         # don't penalise, just fewer samples.
+
+    # Restore original hand.
+    gs.hands[player] = original_hand
 
     if not pickup_values:
         return False

@@ -833,7 +833,18 @@ def train_with_bidding(
 
                     log_probs, values = slot.net.forward_dual(s_t, m_t, is_sol_t)
 
-                    value_loss = F.huber_loss(values, z_t, delta=1.0)
+                    # Pessimism-weighted value loss: penalise soloist
+                    # over-predictions 2.5x to discourage hallucinated wins.
+                    # Defender samples use symmetric loss.
+                    residual = values - z_t
+                    over_predict = residual > 0
+                    sol_over = is_sol_t & over_predict
+                    weight = torch.ones_like(residual)
+                    weight[sol_over] = 2.5
+                    value_loss = (weight * F.huber_loss(
+                        values, z_t, delta=1.0, reduction="none",
+                    )).mean()
+
                     # Off-policy samples (pool game defenders) contribute to
                     # value loss but not policy loss — the policy target came
                     # from a different model so it's not a valid gradient signal.

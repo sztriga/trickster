@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-KNIGHTS="knight_light knight_balanced knight_heavy knight_pure"
+KNIGHTS="knight_light knight_balanced"
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
