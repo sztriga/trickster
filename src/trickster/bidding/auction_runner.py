@@ -11,7 +11,6 @@ if the best prediction exceeds the threshold.
 """
 from __future__ import annotations
 
-import copy as _copy
 import random as _random
 from dataclasses import dataclass
 from typing import Sequence
@@ -42,16 +41,14 @@ from trickster.games.ulti.auction import (
     submit_pass,
     submit_pickup,
 )
-from trickster.games.ulti.cards import Card, Suit
-from trickster.games.ulti.game import (
-    GameState,
-    NUM_PLAYERS,
-    declare_all_marriages,
-    next_player,
-    set_contract,
-)
+from trickster.games.ulti.cards import Card, Rank, Suit, make_deck
+from trickster.games.ulti.encoder import UltiEncoder
+from trickster.games.ulti.game import GameState, NUM_PLAYERS, next_player
 from trickster.model import UltiNetWrapper
 from trickster.train_utils import _GAME_PTS_MAX
+
+_ALL_CARDS: frozenset[Card] = frozenset(make_deck())
+_PICKUP_ENCODER = UltiEncoder()
 
 
 # ---------------------------------------------------------------------------
@@ -83,35 +80,25 @@ class AuctionResult:
 # ---------------------------------------------------------------------------
 
 
-_PICKUP_GAME = UltiGame()
-
-
-@dataclass
-class PickupEval:
-    """Result of 10-card pickup evaluation."""
-    value: float          # best normalised value across eligible contracts
-    bid_rank: int         # bid rank of the best contract
-    contract_key: str     # contract key of the best contract
-    is_piros: bool        # whether the best contract is piros
-    trump: Suit | None    # trump suit of the best contract
-
-
 def _evaluate_pickup(
     gs: GameState,
     player: int,
     dealer: int,
     seat_wrappers: dict[str, UltiNetWrapper],
     bid_rank: int = 0,
-) -> PickupEval | None:
+) -> float:
     """Evaluate a 10-card hand for pickup using per-contract value heads.
 
-    Builds a proper game state for each eligible contract (with trump,
-    marriages, constraints — same as the 12-card evaluator, just without
-    discards).  Only considers contracts that can legally overbid the
-    current bid.  Returns the best evaluation, or None if no contract
-    is eligible.
+    For each contract model, encodes the 10-card hand with that
+    contract's info (trump, betli flag) and uses ``batch_value``
+    (soloist value head) to predict the expected outcome.  Returns
+    the best predicted value across all contracts.
+
+    ~4-8 forward passes total (one batch per contract model).
     """
     hand = gs.hands[player]
+    empty_captured: list[list[Card]] = [[] for _ in range(NUM_PLAYERS)]
+    empty_voids = tuple(frozenset[Suit]() for _ in range(NUM_PLAYERS))
 
     # Count suits for trump selection
     suit_counts: dict[Suit, int] = {}
@@ -119,81 +106,46 @@ def _evaluate_pickup(
         suit_counts[c.suit] = suit_counts.get(c.suit, 0) + 1
     sorted_suits = sorted(suit_counts, key=lambda s: suit_counts[s], reverse=True)
 
-    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
-    best: PickupEval | None = None
+    def _enc(trump: Suit | None, betli: bool) -> np.ndarray:
+        return _PICKUP_ENCODER.encode_state(
+            hand=hand,
+            captured=empty_captured,
+            trick_cards=[],
+            trump=trump,
+            betli=betli,
+            soloist=player,
+            player=player,
+            trick_no=0,
+            scores=[0, 0, 0],
+            known_voids=empty_voids,
+            bid_rank=bid_rank,
+            dealer=dealer,
+        )
+
+    best_value = float("-inf")
 
     for contract_key, wrapper in seat_wrappers.items():
         cdef = CONTRACT_DEFS[contract_key]
+        feats_list: list[np.ndarray] = []
 
         if cdef.is_betli:
-            variants = [(None, False), (None, True)]  # betli, P.betli
+            feats_list.append(_enc(None, True))
         elif cdef.piros_only:
-            variants = [(Suit.HEARTS, True)]
+            feats_list.append(_enc(Suit.HEARTS, False))
         else:
-            variants = []
+            # Try top 2 suits as trump
             for suit in sorted_suits[:2]:
-                variants.append((suit, suit == Suit.HEARTS))
+                feats_list.append(_enc(suit, False))
+            # Also try Hearts for piros variant if not already tried
             if Suit.HEARTS not in sorted_suits[:2] and Suit.HEARTS in suit_counts:
-                variants.append((Suit.HEARTS, True))
-
-        feats_list: list[np.ndarray] = []
-        variant_info: list[tuple[int, str, bool, Suit | None]] = []
-        for trump, is_piros in variants:
-            overbid_rank = CONTRACT_TO_BID_RANK.get((contract_key, is_piros))
-            if overbid_rank is None or overbid_rank <= bid_rank:
-                continue
-
-            gs2 = _copy.deepcopy(gs)
-            gs2.soloist = player
-            set_contract(gs2, player, trump=trump, betli=cdef.is_betli)
-
-            if cdef.key == "ulti":
-                gs2.has_ulti = True
-            gs2.training_mode = cdef.training_mode
-
-            restrict = None
-            if cdef.key == "40-100":
-                restrict = "40"
-            declare_all_marriages(gs2, soloist_marriage_restrict=restrict)
-
-            if cdef.is_betli:
-                comps_frozen = frozenset({"betli"})
-            else:
-                comps: set[str] = {"parti"}
-                if cdef.key == "ulti":
-                    comps.add("ulti")
-                if "40" in cdef.key:
-                    comps.update({"40", "100"})
-                comps_frozen = frozenset(comps)
-
-            constraints = build_auction_constraints(gs2, comps_frozen)
-
-            node = UltiNode(
-                gs=gs2,
-                known_voids=empty_voids,
-                bid_rank=overbid_rank,
-                is_red=is_piros,
-                contract_components=comps_frozen,
-                dealer=dealer,
-                must_have=constraints,
-            )
-            feats = _PICKUP_GAME.encode_state(node, player)
-            feats_list.append(feats)
-            variant_info.append((overbid_rank, contract_key, is_piros, trump))
+                feats_list.append(_enc(Suit.HEARTS, False))
 
         if feats_list:
             states = np.stack(feats_list)
             vals = wrapper.batch_value(states)
-            idx = int(np.argmax(vals))
-            val = float(vals[idx])
-            if best is None or val > best.value:
-                rank, ck, ip, tr = variant_info[idx]
-                best = PickupEval(
-                    value=val, bid_rank=rank,
-                    contract_key=ck, is_piros=ip, trump=tr,
-                )
+            best_value = max(best_value, float(vals.max()))
 
-    return best
+    return best_value
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +296,6 @@ def run_auction(
     a = create_auction(first_bidder, talon)
 
     winning_eval: ContractEval | None = None
-    # Track which contract the 10-card eval found positive per player,
-    # so the stuck fallback can bid that same contract.
-    _pickup_evals: dict[int, int] = {}  # player → bid_rank
 
     while not a.done:
         player = a.turn
@@ -398,45 +347,85 @@ def run_auction(
                 winning_eval = None
 
             else:
-                # Picked up but can't overbid profitably — put the
-                # talon back and bid the contract the 10-card eval
-                # found positive.  Discarding the talon restores
-                # the original hand that was already approved.
-                pickup_bid_rank = _pickup_evals.get(player)
-                bid_obj = BID_BY_RANK.get(pickup_bid_rank) if pickup_bid_rank else None
+                # Picked up but can't overbid profitably — forced bid.
+                # Use NN discards from evaluate_all_contracts.
+                nn_evals = evaluate_all_contracts(
+                    gs, player, dealer,
+                    wrappers=wrappers if wrappers else {},
+                    max_discards=max_discards,
+                ) if wrappers else []
 
-                if bid_obj is None or bid_obj not in legal_bids(a):
-                    # Fallback: lowest legal overbid
-                    legal = legal_bids(a)
-                    supported = [
-                        b for b in legal if b.rank in SUPPORTED_BID_RANKS
-                    ]
-                    bid_obj = supported[0] if supported else (legal[0] if legal else None)
+                legal = legal_bids(a)
+                supported = [
+                    b for b in legal if b.rank in SUPPORTED_BID_RANKS
+                ]
 
-                if bid_obj is None:
-                    submit_pass(a, player)
+                if supported and nn_evals:
+                    # Use the NN's best evaluation to pick both the
+                    # forced contract and discards.
+                    bid_obj = supported[0]
+                    # Find an eval that matches this forced bid, or use
+                    # the best eval's discard.
+                    contract_info = BID_TO_CONTRACT.get(bid_obj.rank)
+                    matched_eval = None
+                    if contract_info:
+                        ck, ip = contract_info
+                        for ev in nn_evals:
+                            if ev.contract_key == ck and ev.is_piros == ip:
+                                matched_eval = ev
+                                break
+                    if matched_eval is None:
+                        matched_eval = nn_evals[0]
+
+                    discards = list(matched_eval.best_discard.discard)
+                    for c in discards:
+                        gs.hands[player].remove(c)
+                    submit_bid(a, player, bid_obj, discards)
+                    winning_eval = matched_eval
                     continue
 
-                discards = list(a.talon)
-                for c in discards:
-                    gs.hands[player].remove(c)
-                forced = _forced_bid_eval(gs.hands[player], bid_obj)
-                submit_bid(a, player, bid_obj, discards)
-                winning_eval = forced
+                elif supported:
+                    # No NN evals — true fallback.
+                    bid_obj = supported[0]
+                    forced = _forced_bid_eval(gs.hands[player], bid_obj)
+                    if forced is not None:
+                        discards = list(forced.best_discard.discard)
+                        for c in discards:
+                            gs.hands[player].remove(c)
+                        submit_bid(a, player, bid_obj, discards)
+                        winning_eval = forced
+                        continue
+
+                # No supported legal bid available — last resort.
+                if legal:
+                    if nn_evals:
+                        discards = _nn_discard(nn_evals)
+                    else:
+                        discards = _fallback_discards(gs.hands[player])
+                    for c in discards:
+                        gs.hands[player].remove(c)
+                    submit_bid(a, player, legal[0], discards)
+                    winning_eval = None
+                else:
+                    # Should never happen; defensive guard.
+                    submit_pass(a, player)
 
         else:
             # ── Player has 10 cards → per-contract value-head pickup ──
-            pickup_eval: PickupEval | None = None
-            threshold = min_bid_pts * 2 / _GAME_PTS_MAX
+            should_pickup = False
             if can_pickup(a) and seat_wrappers[player]:
                 current_rank = a.current_bid.rank if a.current_bid else 0
-                pickup_eval = _evaluate_pickup(
+                # Pickup threshold (normalised): must expect to beat the
+                # pass penalty or the current bid.  Uses the same scale
+                # as min_bid_pts: pts * 2 / _GAME_PTS_MAX.
+                threshold = min_bid_pts * 2 / _GAME_PTS_MAX
+                best_val = _evaluate_pickup(
                     gs, player, dealer, seat_wrappers[player],
                     bid_rank=current_rank,
                 )
+                should_pickup = best_val > threshold
 
-            if pickup_eval is not None and pickup_eval.value > threshold:
-                _pickup_evals[player] = pickup_eval.bid_rank
+            if should_pickup:
                 gs.hands[player].extend(a.talon)
                 submit_pickup(a, player)
             else:
