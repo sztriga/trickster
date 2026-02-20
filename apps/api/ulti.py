@@ -5,7 +5,7 @@ contract models loaded via ``model_io.load_wrappers``.
 
 Game flow: BID → AUCTION → TRUMP_SELECT → KONTRA → PLAY → DONE.
 
-Each AI seat can use a different trained model (e.g. scout, knight_light).
+Each AI seat can use a different trained model (e.g. scout, knight).
 The model is selected at game creation via the ``opponents`` parameter.
 """
 
@@ -36,6 +36,35 @@ from trickster.training.model_io import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+#  AI Strength presets
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StrengthPreset:
+    key: str
+    label: str           # Hungarian display name
+    description: str     # ~time estimate
+    sims: int
+    dets: int
+    endgame_tricks: int
+    pimc_dets: int
+
+STRENGTH_PRESETS: dict[str, StrengthPreset] = {
+    "gyors":  StrengthPreset("gyors",  "Gyors",  "< 1 mp",  sims=30,  dets=2, endgame_tricks=5, pimc_dets=10),
+    "normal": StrengthPreset("normal", "Normál", "~1 mp",   sims=80,  dets=3, endgame_tricks=6, pimc_dets=25),
+    "eros":   StrengthPreset("eros",   "Erős",   "~3 mp",   sims=200, dets=5, endgame_tricks=7, pimc_dets=50),
+    "mester": StrengthPreset("mester", "Mester", "~5 mp",   sims=400, dets=8, endgame_tricks=7, pimc_dets=80),
+}
+DEFAULT_STRENGTH = "normal"
+from trickster.bidding.constants import (
+    KONTRA_THRESHOLD,
+    MAX_DISCARDS,
+    MIN_BID_PTS,
+    REKONTRA_THRESHOLD,
+)
 from trickster.bidding.evaluator import evaluate_all_contracts, pick_best_bid
 from trickster.bidding.registry import BID_TO_CONTRACT, MAX_SUPPORTED_RANK
 from trickster.games.ulti.auction import (
@@ -114,8 +143,6 @@ _CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
 # Matches the pass penalty (-2/defender) so the AI bids whenever it
 # expects to do better than passing.  The value head should learn
 # over training that marginal hands get kontrad and punished.
-_BID_THRESHOLD = -2.0
-_BID_MAX_DISCARDS = 15
 
 
 def _get_ulti_game() -> UltiGame:
@@ -198,32 +225,29 @@ def _session_to_node(sess: "UltiSession") -> UltiNode:
 # ---------------------------------------------------------------------------
 #  AI play config — MCTS + PIMC solver (HybridPlayer)
 #
-#  Tuned for ~0.5-1s per AI move on a modern CPU (single-threaded).
-#  MCTS handles opening tricks; the exact alpha-beta solver kicks in
-#  for the last ``endgame_tricks`` tricks via PIMC determinizations.
+#  Strength-dependent.  Each preset defines sims, dets, endgame_tricks,
+#  and pimc_dets.  The HybridPlayer is cached per (source, contract, strength).
 # ---------------------------------------------------------------------------
 
-_AI_MCTS_CONFIG = MCTSConfig(
-    simulations=80,
-    determinizations=3,
-    c_puct=1.5,
-    dirichlet_alpha=0.0,
-    dirichlet_weight=0.0,
-    use_value_head=True,
-    use_policy_priors=True,
-    visit_temp=0.1,
-)
+def _mcts_config_for_preset(preset: StrengthPreset) -> MCTSConfig:
+    return MCTSConfig(
+        simulations=preset.sims,
+        determinizations=preset.dets,
+        c_puct=1.5,
+        dirichlet_alpha=0.0,
+        dirichlet_weight=0.0,
+        use_value_head=True,
+        use_policy_priors=True,
+        visit_temp=0.1,
+    )
 
-_AI_ENDGAME_TRICKS = 6
-_AI_PIMC_DETS = 25
-
-# Cache: (source, contract_key) → HybridPlayer
-_hybrid_cache: dict[tuple[str, str], HybridPlayer] = {}
+# Cache: (source, contract_key, strength_key) → HybridPlayer
+_hybrid_cache: dict[tuple[str, str, str], HybridPlayer] = {}
 
 
-def _get_hybrid_player(source: str, contract_key: str) -> HybridPlayer | None:
-    """Get a cached HybridPlayer for a given model source + contract."""
-    cache_key = (source, contract_key)
+def _get_hybrid_player(source: str, contract_key: str, preset: StrengthPreset) -> HybridPlayer | None:
+    """Get a cached HybridPlayer for a given model source + contract + strength."""
+    cache_key = (source, contract_key, preset.key)
     if cache_key not in _hybrid_cache:
         wrapper = _get_wrapper_for_contract(source, contract_key)
         if wrapper is None:
@@ -232,9 +256,9 @@ def _get_hybrid_player(source: str, contract_key: str) -> HybridPlayer | None:
         _hybrid_cache[cache_key] = HybridPlayer(
             game=game,
             net=wrapper,
-            mcts_config=_AI_MCTS_CONFIG,
-            endgame_tricks=_AI_ENDGAME_TRICKS,
-            pimc_determinizations=_AI_PIMC_DETS,
+            mcts_config=_mcts_config_for_preset(preset),
+            endgame_tricks=preset.endgame_tricks,
+            pimc_determinizations=preset.pimc_dets,
         )
     return _hybrid_cache[cache_key]
 
@@ -330,6 +354,8 @@ class UltiSession:
     bubbles: list[dict[str, Any]] = field(default_factory=list)
     # Model source for each AI seat: [seat1_source, seat2_source]
     opponent_sources: list[str] = field(default_factory=lambda: ["random", "random"])
+    # AI strength preset key
+    strength: str = DEFAULT_STRENGTH
     # Trump chosen by NN bidding (used in _resolve_auction for non-red adu games)
     nn_chosen_trump: Optional[Suit] = None
     # Post-game analysis: initial hands (set when play begins) and card-by-card log
@@ -533,6 +559,7 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         "capturedTricks": captured_tricks,
         "bubbles": bubbles,
         "opponents": sess.opponent_sources,
+        "strength": sess.strength,
         # Talon cards: revealed only when the game is over.
         "talonCards": [_card_json(c) for c in st.talon_discards] if (
             sess.phase == "done" and st.talon_discards
@@ -827,12 +854,12 @@ def _ai_nn_evaluate(sess: UltiSession, player: int) -> "ContractEval | None":
     evals = evaluate_all_contracts(
         sess.state, player, sess.dealer,
         wrappers=wrappers,
-        max_discards=_BID_MAX_DISCARDS,
+        max_discards=MAX_DISCARDS,
     )
     if not evals:
         return None
 
-    return pick_best_bid(evals, min_stakes_pts=_BID_THRESHOLD)
+    return pick_best_bid(evals, min_stakes_pts=MIN_BID_PTS)
 
 
 def _nn_eval_to_auction_bid(
@@ -1105,14 +1132,11 @@ def _ai_kontra_decision(sess: UltiSession, defender: int) -> bool:
     node = _session_to_node(sess)
     feats = game.encode_state(node, defender)
     v = wrapper.predict_value(feats)
-    return v > 0.0
+    return v > KONTRA_THRESHOLD
 
 
 def _ai_rekontra_decision(sess: UltiSession) -> bool:
-    """AI soloist decides whether to rekontra using the value head.
-
-    Uses the soloist's seat-specific model.  Rekontra when value > 0.
-    """
+    """AI soloist decides whether to rekontra using the value head."""
     soloist = sess.state.soloist
     contract_key = _contract_key_from_bid(sess.winning_bid)
     wrapper = _get_seat_wrapper(sess, soloist, contract_key)
@@ -1123,7 +1147,7 @@ def _ai_rekontra_decision(sess: UltiSession) -> bool:
     node = _session_to_node(sess)
     feats = game.encode_state(node, soloist)
     v = wrapper.predict_value(feats)
-    return v > 0.0
+    return v > REKONTRA_THRESHOLD
 
 
 def _advance_ai_kontra(sess: UltiSession) -> None:
@@ -1306,8 +1330,9 @@ def _ai_pick_card(sess: UltiSession) -> Card:
     seat_idx = player - 1
     source = sess.opponent_sources[seat_idx]
     contract_key = _contract_key_from_bid(sess.winning_bid)
+    preset = STRENGTH_PRESETS.get(sess.strength, STRENGTH_PRESETS[DEFAULT_STRENGTH])
 
-    hybrid = _get_hybrid_player(source, contract_key)
+    hybrid = _get_hybrid_player(source, contract_key, preset)
     if hybrid is None:
         return rng.choice(actions)
 
@@ -1359,6 +1384,7 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
       - ``seed``:  int — deal seed
       - ``dealer``: int — dealer index (0-2)
       - ``opponents``: [string, string] — model sources for seat 1, 2
+      - ``strength``: str — AI strength preset key (gyors/normal/eros/mester)
     """
     seed = body.get("seed")
     if seed is None:
@@ -1374,6 +1400,11 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
     opponents = body.get("opponents", ["random", "random"])
     if not isinstance(opponents, list) or len(opponents) != 2:
         opponents = ["random", "random"]
+
+    # AI strength preset
+    strength = body.get("strength", DEFAULT_STRENGTH)
+    if strength not in STRENGTH_PRESETS:
+        strength = DEFAULT_STRENGTH
 
     st, talon = deal(seed=seed, dealer=dealer)
 
@@ -1393,6 +1424,7 @@ def new_game(body: dict[str, Any] = {}) -> dict[str, Any]:
         dealer=dealer,
         auction=auction,
         opponent_sources=opponents,
+        strength=strength,
     )
     _sessions[sess.id] = sess
 
@@ -1759,7 +1791,7 @@ def _analyze_bid(
         evals = evaluate_all_contracts(
             sess.state, HUMAN, sess.dealer,
             wrappers=wrappers,
-            max_discards=_BID_MAX_DISCARDS,
+            max_discards=MAX_DISCARDS,
         )
     finally:
         if restore_hand is not None:
@@ -1796,7 +1828,7 @@ def _analyze_bid(
 
     # Best legal bid above threshold
     best = next(
-        (ev for ev in legal_evals if ev.game_pts >= _BID_THRESHOLD),
+        (ev for ev in legal_evals if ev.game_pts >= MIN_BID_PTS),
         None,
     )
     rec_discard = None
@@ -1842,11 +1874,9 @@ def _analyze_kontra(
     my_value = sol_value if is_soloist else -sol_value
 
     if sess.phase == "kontra":
-        # Human is defender — kontra if position looks bad for soloist
-        rec = "kontra" if my_value > 0.0 else "pass"
+        rec = "kontra" if my_value > KONTRA_THRESHOLD else "pass"
     else:
-        # Human is soloist — rekontra if position still good
-        rec = "rekontra" if my_value > 0.0 else "pass"
+        rec = "rekontra" if my_value > REKONTRA_THRESHOLD else "pass"
 
     return {"value": round(my_value, 3), "recommendation": rec}
 
@@ -2043,6 +2073,18 @@ def analyze_game(game_id: str) -> dict[str, Any]:
         "bidLabel": sess.winning_bid.label() if sess.winning_bid else "Passz",
         "steps": steps,
         "totalCards": len(sess.play_history),
+    }
+
+
+@router.get("/strengths")
+def list_strengths() -> dict[str, Any]:
+    """List available AI strength presets."""
+    return {
+        "strengths": [
+            {"key": p.key, "label": p.label, "description": p.description}
+            for p in STRENGTH_PRESETS.values()
+        ],
+        "default": DEFAULT_STRENGTH,
     }
 
 

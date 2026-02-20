@@ -55,6 +55,15 @@ from trickster.games.ulti.game import (
 from trickster.hybrid import HybridPlayer
 from trickster.mcts import MCTSConfig
 from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapper
+from trickster.bidding.constants import (
+    EXPLORATION_FRAC,
+    KONTRA_THRESHOLD,
+    MAX_DISCARDS,
+    MIN_BID_PTS,
+    MIN_BID_PTS_START,
+    PASS_PENALTY,
+    REKONTRA_THRESHOLD,
+)
 from trickster.train_utils import ReplayBuffer, simple_outcome, _GAME_PTS_MAX
 
 from .model_io import auto_device, estimate_params
@@ -156,17 +165,17 @@ class BiddingTrainConfig:
     body_layers: int = 4
 
     # -- Bidding --
-    max_discards: int = 15        # discard pairs per contract eval
-    min_bid_pts: float = 0.0      # minimum expected pts/defender to bid (end of training)
-    min_bid_pts_start: float = 4.0  # starting bid threshold (annealed → min_bid_pts)
-    pass_penalty: float = 2.0     # pts per defender when everyone passes
-    exploration_frac: float = 0.2  # fraction of games with random contract
+    max_discards: int = MAX_DISCARDS
+    min_bid_pts: float = MIN_BID_PTS
+    min_bid_pts_start: float = MIN_BID_PTS_START
+    pass_penalty: float = PASS_PENALTY
+    exploration_frac: float = EXPLORATION_FRAC
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
 
     # -- Opponent pool --
-    opponent_pool: list[str] = field(default_factory=list)  # e.g. ["scout", "knight_light"]
+    opponent_pool: list[str] = field(default_factory=list)  # e.g. ["scout", "knight"]
     pool_frac: float = 0.5         # fraction of games played vs pool opponents
 
     # -- Contracts to train (model keys) --
@@ -367,19 +376,17 @@ def _decide_kontra(
         v = wrapper.predict_value(feats)
         def_values.append(v)
 
-    # Kontra when the most confident defender expects to gain.
     max_def_v = max(def_values)
-    kontrad = max_def_v > 0.0
+    kontrad = max_def_v > KONTRA_THRESHOLD
 
     if kontrad:
         for u in units:
             state.component_kontras[u] = 1
 
-    # Rekontra: soloist still expects to win despite the kontra.
     if kontrad:
         feats = game.encode_state(state, soloist)
         sol_v = wrapper.predict_value(feats)
-        if sol_v > 0.0:
+        if sol_v > REKONTRA_THRESHOLD:
             for u in units:
                 if state.component_kontras.get(u, 0) == 1:
                     state.component_kontras[u] = 2

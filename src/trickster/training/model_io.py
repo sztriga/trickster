@@ -1,12 +1,11 @@
 """Model loading, device selection, and path conventions for Ulti.
 
 Path conventions:
-    Base:  models/ulti/<tier>/base/<contract>/model.pt
-    Final: models/ulti/<name>/final/<contract>/model.pt
+    Final: models/ulti/<tier>/final/<contract>/model.pt
 
 Source names:
-    "knight_light"       →  models/ulti/knight_light/final/parti/model.pt, ...
-    "knight_light_base"  →  models/ulti/knight_light/base/parti/model.pt, ...
+    "knight"  →  models/ulti/knight/final/parti/model.pt, ...
+    "bronze"  →  models/ulti/bronze/final/parti/model.pt, ...
 """
 from __future__ import annotations
 
@@ -64,30 +63,16 @@ _CONTRACT_KEYS = ["parti", "ulti", "40-100", "betli"]
 _ULTI_ROOT = Path("models/ulti")
 
 
-def _base_path(contract: str, tier: str) -> Path:
-    return _ULTI_ROOT / tier / "base" / contract
-
-
-def _e2e_path(contract: str, name: str) -> Path:
+def _model_path(contract: str, name: str) -> Path:
     return _ULTI_ROOT / name / "final" / contract
 
 
 def resolve_paths(source: str) -> dict[str, Path]:
     """Resolve a source name to contract model paths.
 
-    "knight_light"       → final (e2e) models
-    "knight_light_base"  → base (intermediate) models
+    "knight" → models/ulti/knight/final/parti/model.pt, etc.
     """
-    if source.endswith("_base"):
-        tier = source.removesuffix("_base")
-        if tier not in TIERS:
-            raise ValueError(
-                f"Unknown base tier '{tier}'. "
-                f"Known tiers: {', '.join(TIERS)}"
-            )
-        return {c: _base_path(c, tier) for c in _CONTRACT_KEYS}
-
-    return {c: _e2e_path(c, source) for c in _CONTRACT_KEYS}
+    return {c: _model_path(c, source) for c in _CONTRACT_KEYS}
 
 
 def list_available_sources(models_root: str | Path = "models") -> list[str]:
@@ -104,19 +89,11 @@ def list_available_sources(models_root: str | Path = "models") -> list[str]:
             continue
         name = model_dir.name
 
-        # Final (e2e) models
         final_dir = model_dir / "final"
         if final_dir.is_dir() and any(
             (final_dir / c / "model.pt").exists() for c in _CONTRACT_KEYS
         ):
             sources.append(name)
-
-        # Base models
-        base_dir = model_dir / "base"
-        if base_dir.is_dir() and any(
-            (base_dir / c / "model.pt").exists() for c in _CONTRACT_KEYS
-        ):
-            sources.append(f"{name}_base")
 
     return sources
 

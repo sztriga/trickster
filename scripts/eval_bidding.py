@@ -18,9 +18,9 @@ Speed presets (estimated for 2000 deals @ 6 workers):
   deep   ~10 min— 400 sims, 8 dets, 80 PIMC
 
 Usage:
-    python scripts/eval_bidding.py --seats knight_light knight_balanced scout --games 2000 --workers 6
-    python scripts/eval_bidding.py --seats knight_light:deep knight_balanced:fast scout:normal
-    python scripts/eval_bidding.py --seats knight_light knight_balanced scout --speed normal
+    python scripts/eval_bidding.py --seats knight knight bronze --games 2000 --workers 6
+    python scripts/eval_bidding.py --seats knight:deep bronze:fast scout:normal
+    python scripts/eval_bidding.py --seats knight knight scout --speed normal
 """
 from __future__ import annotations
 
@@ -42,6 +42,13 @@ from trickster.games.ulti.game import deal
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 from trickster.mcts import MCTSConfig
 from trickster.model import UltiNetWrapper
+from trickster.bidding.constants import (
+    KONTRA_THRESHOLD,
+    MAX_DISCARDS,
+    MIN_BID_PTS,
+    PASS_PENALTY,
+    REKONTRA_THRESHOLD,
+)
 from trickster.train_utils import simple_outcome, _GAME_PTS_MAX
 from trickster.training.bidding_loop import (
     DISPLAY_ORDER,
@@ -52,9 +59,6 @@ from trickster.training.model_io import (
     DK_LABELS,
     load_wrappers,
 )
-
-_BID_THRESHOLD = -2.0
-_BID_MAX_DISCARDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +154,7 @@ def _decide_kontra_eval(
         feats = game.encode_state(state, d)
         def_values.append(w.predict_value(feats))
 
-    kontrad = max(def_values) > 0.0
+    kontrad = max(def_values) > KONTRA_THRESHOLD
     if kontrad:
         for u in units:
             state.component_kontras[u] = 1
@@ -158,7 +162,7 @@ def _decide_kontra_eval(
         sol_w = seat_wrappers[soloist].get(contract_key)
         if sol_w is not None:
             feats = game.encode_state(state, soloist)
-            if sol_w.predict_value(feats) > 0.0:
+            if sol_w.predict_value(feats) > REKONTRA_THRESHOLD:
                 for u in units:
                     if state.component_kontras.get(u, 0) == 1:
                         state.component_kontras[u] = 2
@@ -421,7 +425,7 @@ def main() -> None:
         "--seats", nargs=3, required=True,
         metavar=("SEAT0", "SEAT1", "SEAT2"),
         help="Model source per seat, optionally with :speed suffix "
-             "(e.g. knight_light:deep knight_balanced:fast scout)",
+             "(e.g. knight:deep bronze:fast scout)",
     )
     parser.add_argument(
         "--speed", default="fast", choices=SPEED_NAMES,
@@ -429,10 +433,10 @@ def main() -> None:
     )
     parser.add_argument("--games", type=int, default=2000)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--min-bid-pts", type=float, default=0.0)
-    parser.add_argument("--pass-penalty", type=float, default=2.0)
-    parser.add_argument("--max-discards", type=int, default=15)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--min-bid-pts", type=float, default=MIN_BID_PTS)
+    parser.add_argument("--pass-penalty", type=float, default=PASS_PENALTY)
+    parser.add_argument("--max-discards", type=int, default=MAX_DISCARDS)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     # Parse seats + per-seat speeds
@@ -446,7 +450,7 @@ def main() -> None:
         seat_speed_names.append(speed_name)
         seat_presets.append(SPEEDS[speed_name])
 
-    # Labels for display: "knight_light (fast)" or just "knight_light" if all same speed
+    # Labels for display: "knight (fast)" or just "knight" if all same speed
     all_same_speed = len(set(seat_speed_names)) == 1
     if all_same_speed:
         seat_labels = seat_sources
@@ -501,7 +505,7 @@ def main() -> None:
     # Shuffle deal seeds so card distribution is independent of dealer rotation.
     # Without this, dealer=i%3 would correlate with card seed (seed+i),
     # causing persistent seat bias even in self-play.
-    deal_rng = random.Random(args.seed)
+    deal_rng = random.Random(args.seed)  # None → random each run
     deal_seeds = [deal_rng.randint(0, 2**31) for _ in range(args.games)]
 
     work_args = [

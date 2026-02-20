@@ -7,12 +7,14 @@ import {
   ultiContinue,
   ultiKontra,
   ultiListModels,
+  ultiListStrengths,
   ultiNewGame,
   ultiPlay,
   ultiTrump,
   type AnalysisResult,
   type GameAnalysis,
   type GameAnalysisStep,
+  type StrengthPreset,
   type UltiCard,
   type UltiState,
 } from "./ulti-api";
@@ -91,10 +93,20 @@ export function UltiApp() {
   // Screen: "lobby" (opponent select) or "game" (in-game)
   const [screen, setScreen] = useState<"lobby" | "game">("lobby");
 
-  // Lobby state — fetch available models from the server
+  // Lobby state — fetch available models and strengths from the server
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [opp1, setOpp1] = useState("");
   const [opp2, setOpp2] = useState("");
+  const [strengthPresets, setStrengthPresets] = useState<StrengthPreset[]>([]);
+  const [selectedStrength, setSelectedStrength] = useState("normal");
+
+  // Analysis depth preset for live analysis
+  const [analysisDepth, setAnalysisDepth] = useState<"light" | "normal" | "deep">("normal");
+  const ANALYSIS_DEPTH_MAP = {
+    light:  { sims: 20,  dets: 1, label: "Gyors" },
+    normal: { sims: 40,  dets: 2, label: "Normál" },
+    deep:   { sims: 100, dets: 3, label: "Mély" },
+  };
 
   useEffect(() => {
     ultiListModels()
@@ -109,6 +121,12 @@ export function UltiApp() {
         }
       })
       .catch(() => setAvailableModels([]));
+    ultiListStrengths()
+      .then((data) => {
+        setStrengthPresets(data.strengths);
+        setSelectedStrength((prev) => prev || data.default);
+      })
+      .catch(() => {});
   }, []);
 
   const [state, setState] = useState<UltiState | null>(null);
@@ -276,25 +294,28 @@ export function UltiApp() {
     }
 
     let cancelled = false;
+    const depth = ANALYSIS_DEPTH_MAP[analysisDepth];
     const fetchAnalysis = async () => {
       try {
-        const result = await ultiAnalyze(state.gameId, analysisSource, 40, 2);
+        const result = await ultiAnalyze(state.gameId, analysisSource, depth.sims, depth.dets);
         if (!cancelled) setAnalysis(result);
       } catch { /* ignore */ }
     };
 
     fetchAnalysis();
     // Re-run with more sims after a delay for progressive deepening
+    const deepSims = Math.min(depth.sims * 3, 200);
+    const deepDets = Math.min(depth.dets + 1, 5);
     const t = window.setTimeout(async () => {
       try {
-        const result = await ultiAnalyze(state.gameId, analysisSource, 100, 3);
+        const result = await ultiAnalyze(state.gameId, analysisSource, deepSims, deepDets);
         if (!cancelled) setAnalysis(result);
       } catch { /* ignore */ }
     }, 2000);
 
     return () => { cancelled = true; window.clearTimeout(t); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [analysisEnabled, analysisSource, state?.gameId, state?.phase, state?.currentPlayer, state?.trickNo, state?.trickCards?.length, state?.needsContinue]);
+  }, [analysisEnabled, analysisSource, analysisDepth, state?.gameId, state?.phase, state?.currentPlayer, state?.trickNo, state?.trickCards?.length, state?.needsContinue]);
 
   // Build a map of card key -> analysis score for easy lookup
   const cardScores = useMemo(() => {
@@ -335,7 +356,7 @@ export function UltiApp() {
     setErr(""); setBusy(true);
     try {
       const nextDealer = state ? (state.dealer + 1) % 3 : undefined;
-      const st = await ultiNewGame(null, nextDealer, activeOpponents);
+      const st = await ultiNewGame(null, nextDealer, activeOpponents, selectedStrength);
       setState(st);
       setSelectedDiscards(new Set());
       setSelectedBidIdx(0);
@@ -356,7 +377,7 @@ export function UltiApp() {
     setScreen("game");
     setErr(""); setBusy(true);
     try {
-      const st = await ultiNewGame(null, undefined, opponents);
+      const st = await ultiNewGame(null, undefined, opponents, selectedStrength);
       setState(st);
       setSelectedDiscards(new Set());
       setSelectedBidIdx(0);
@@ -505,6 +526,24 @@ export function UltiApp() {
                 </select>
               </div>
             </div>
+
+            {strengthPresets.length > 0 && (
+              <>
+                <p className="ulti-lobby-subtitle" style={{ marginTop: 16 }}>AI erősség</p>
+                <div className="ulti-strength-selector">
+                  {strengthPresets.map((p) => (
+                    <button
+                      key={p.key}
+                      className={`ulti-strength-btn${selectedStrength === p.key ? " ulti-strength-active" : ""}`}
+                      onClick={() => setSelectedStrength(p.key)}
+                    >
+                      <span className="ulti-strength-label">{p.label}</span>
+                      <span className="ulti-strength-desc">{p.description}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
 
             <button
               className="btn btn-primary ulti-lobby-start"
@@ -1104,7 +1143,9 @@ export function UltiApp() {
               </tbody>
               <tfoot>
                 <tr>
-                  <td colSpan={3}>Összesen</td>
+                  <td></td>
+                  <td></td>
+                  <td>Összesen</td>
                   <td className={matchScores[0] > 0 ? "ulti-sc-pos" : matchScores[0] < 0 ? "ulti-sc-neg" : ""}>{matchScores[0]}</td>
                   <td className={matchScores[1] > 0 ? "ulti-sc-pos" : matchScores[1] < 0 ? "ulti-sc-neg" : ""}>{matchScores[1]}</td>
                   <td className={matchScores[2] > 0 ? "ulti-sc-pos" : matchScores[2] < 0 ? "ulti-sc-neg" : ""}>{matchScores[2]}</td>
@@ -1125,6 +1166,14 @@ export function UltiApp() {
             <div className="modal-title">Beállítások</div>
 
             <div className="ulti-setting-row">
+              <label className="ulti-setting-label">AI erősség</label>
+              <span className="ulti-setting-value">
+                {strengthPresets.find(p => p.key === selectedStrength)?.label ?? selectedStrength}
+                <span className="ulti-setting-hint"> ({strengthPresets.find(p => p.key === selectedStrength)?.description ?? ""})</span>
+              </span>
+            </div>
+
+            <div className="ulti-setting-row">
               <label className="ulti-setting-label">AI elemzés</label>
               <button
                 className={`ulti-toggle ${analysisEnabled ? "ulti-toggle-on" : ""}`}
@@ -1138,19 +1187,35 @@ export function UltiApp() {
             </div>
 
             {analysisEnabled && (
-              <div className="ulti-setting-row">
-                <label className="ulti-setting-label">Elemző modell</label>
-                <select
-                  className="ulti-lobby-select"
-                  value={analysisSource}
-                  onChange={(e) => { setAnalysisSource(e.target.value); setAnalysis(null); }}
-                >
-                  <option value="">— válassz —</option>
-                  {availableModels.map((m) => (
-                    <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
-                  ))}
-                </select>
-              </div>
+              <>
+                <div className="ulti-setting-row">
+                  <label className="ulti-setting-label">Elemző modell</label>
+                  <select
+                    className="ulti-lobby-select"
+                    value={analysisSource}
+                    onChange={(e) => { setAnalysisSource(e.target.value); setAnalysis(null); }}
+                  >
+                    <option value="">— válassz —</option>
+                    {availableModels.map((m) => (
+                      <option key={m} value={m}>{m.charAt(0).toUpperCase() + m.slice(1)}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="ulti-setting-row">
+                  <label className="ulti-setting-label">Elemzés mélység</label>
+                  <div className="ulti-strength-selector ulti-strength-selector-compact">
+                    {(["light", "normal", "deep"] as const).map((d) => (
+                      <button
+                        key={d}
+                        className={`ulti-strength-btn${analysisDepth === d ? " ulti-strength-active" : ""}`}
+                        onClick={() => { setAnalysisDepth(d); setAnalysis(null); }}
+                      >
+                        {ANALYSIS_DEPTH_MAP[d].label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </>
             )}
 
             <div className="modal-actions">

@@ -14,9 +14,9 @@ Models can include "random" for a baseline random player.
 Each model can optionally specify a search speed (e.g. "knight:deep").
 
 Usage:
-    python scripts/tournament.py knight_light knight_balanced random --games 500 --workers 6
-    python scripts/tournament.py knight_light:fast bishop:deep random --games 1000
-    python scripts/tournament.py knight_light knight_balanced knight_heavy knight_pure --games 300
+    python scripts/tournament.py knight bronze random --games 500 --workers 6
+    python scripts/tournament.py knight:fast bishop:deep random --games 1000
+    python scripts/tournament.py scout knight bronze --games 300
 """
 from __future__ import annotations
 
@@ -36,6 +36,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import torch
 
 from trickster.bidding.auction_runner import run_auction, setup_bid_game
+from trickster.bidding.constants import (
+    KONTRA_THRESHOLD,
+    MAX_DISCARDS,
+    MIN_BID_PTS,
+    PASS_PENALTY,
+    REKONTRA_THRESHOLD,
+)
 from trickster.games.ulti.adapter import UltiGame, UltiNode
 from trickster.games.ulti.game import deal
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
@@ -96,8 +103,6 @@ def _parse_entrant(arg: str, default_speed: str) -> tuple[str, str]:
     return arg, default_speed
 
 
-_BID_THRESHOLD = -2.0
-_BID_MAX_DISCARDS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -138,13 +143,13 @@ def _decide_kontra(game, state, contract_key, seat_wrappers):
             continue
         feats = game.encode_state(state, d)
         def_values.append(w.predict_value(feats))
-    if max(def_values) > 0.0:
+    if max(def_values) > KONTRA_THRESHOLD:
         for u in units:
             state.component_kontras[u] = 1
         sol_w = seat_wrappers[soloist].get(contract_key)
         if sol_w is not None:
             feats = game.encode_state(state, soloist)
-            if sol_w.predict_value(feats) > 0.0:
+            if sol_w.predict_value(feats) > REKONTRA_THRESHOLD:
                 for u in units:
                     if state.component_kontras.get(u, 0) == 1:
                         state.component_kontras[u] = 2
@@ -480,8 +485,8 @@ def main() -> None:
     )
     parser.add_argument(
         "models", nargs="+", metavar="MODEL",
-        help="Model sources to enter (e.g. knight_light knight_balanced random). "
-             "Append :speed for per-model search speed (e.g. knight_light:deep).",
+        help="Model sources to enter (e.g. knight bronze random). "
+             "Append :speed for per-model search speed (e.g. knight:deep).",
     )
     parser.add_argument(
         "--speed", default="fast", choices=list(SPEEDS.keys()),
@@ -490,9 +495,9 @@ def main() -> None:
     parser.add_argument("--games", type=int, default=500,
                         help="Deals per matchup (default: 500)")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--min-bid-pts", type=float, default=0.0)
-    parser.add_argument("--pass-penalty", type=float, default=2.0)
-    parser.add_argument("--max-discards", type=int, default=15)
+    parser.add_argument("--min-bid-pts", type=float, default=MIN_BID_PTS)
+    parser.add_argument("--pass-penalty", type=float, default=PASS_PENALTY)
+    parser.add_argument("--max-discards", type=int, default=MAX_DISCARDS)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 

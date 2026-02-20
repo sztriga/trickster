@@ -37,14 +37,10 @@ from trickster.games.ulti.adapter import UltiGame
 from trickster.mcts import MCTSConfig
 from trickster.model import OnnxUltiWrapper, UltiNet, make_wrapper
 from trickster.train_utils import ReplayBuffer
-from trickster.training.deal_enrichment import (
-    _enrichment_threshold,
-    _new_game_with_neural_discard,
-    _value_enriched_new_game,
-)
 from trickster.training.model_io import auto_device
 from trickster.training.self_play import (
     _init_worker,
+    _new_game_with_neural_discard,
     _play_game_in_worker,
     _play_one_game,
 )
@@ -93,11 +89,6 @@ class UltiTrainConfig:
     # -- Parallelism --
     num_workers: int = 1
     concurrent_games: int = 1  # cross-game GPU batching (auto-set for GPU tiers)
-
-    # -- Deal enrichment --
-    enrichment: bool = False
-    enrich_warmup: int = 20        # skip enrichment for first N steps
-    enrich_random_frac: float = 0.3  # fraction of games always random
 
     # -- Value targets --
     solver_teacher: bool = False   # use solver value for MCTS positions
@@ -271,29 +262,19 @@ def train_ulti_hybrid(
 
     # Helpers for building self-play task tuples
     def _build_tasks(step: int):
-        past_warmup = cfg.enrichment and step > cfg.enrich_warmup
-        thresh = (
-            _enrichment_threshold(step, cfg.steps)
-            if past_warmup else -999.0
-        )
         tasks = []
         for g in range(cfg.games_per_step):
-            use_enrich = (
-                past_warmup
-                and thresh > -999.0
-                and (g / cfg.games_per_step) >= cfg.enrich_random_frac
-            )
             tasks.append((
                 {k: v.cpu() for k, v in net.state_dict().items()},
                 sol_cfg, def_cfg,
                 cfg.seed + step * 1000 + g,
                 cfg.endgame_tricks, cfg.pimc_dets, cfg.solver_temp,
                 cfg.training_mode,
-                thresh if use_enrich else -999.0,
+                -999.0,  # enrichment disabled
                 cfg.solver_teacher, cfg.kontra_enabled,
                 cfg.neural_discard,
             ))
-        return tasks, past_warmup, thresh
+        return tasks
 
     def _collect_results(futures, buffer_, stats_):
         """Collect self-play results from completed futures."""
@@ -327,12 +308,6 @@ def train_ulti_hybrid(
             sp_pts_sum = 0.0
             sp_total = 0
 
-            past_warmup = cfg.enrichment and step > cfg.enrich_warmup
-            thresh = (
-                _enrichment_threshold(step, cfg.steps)
-                if past_warmup else -999.0
-            )
-
             if executor is not None:
                 # --- Double-buffered parallel self-play ---
                 #
@@ -350,7 +325,7 @@ def train_ulti_hybrid(
                     _pending_futures = None
                 else:
                     # First iteration — submit and block
-                    tasks, _, _ = _build_tasks(step)
+                    tasks = _build_tasks(step)
                     futures = [executor.submit(_play_game_in_worker, t) for t in tasks]
                     sp_pts_sum, sp_total, step_samples = _collect_results(
                         futures, buffer, stats,
@@ -360,24 +335,12 @@ def train_ulti_hybrid(
                 from concurrent.futures import ThreadPoolExecutor, as_completed
 
                 def _play_game_threaded(g_seed: int):
-                    use_enrich = (
-                        past_warmup
-                        and thresh > -999.0
-                        and (g_seed % cfg.games_per_step) / cfg.games_per_step
-                        >= cfg.enrich_random_frac
-                    )
                     init_state = None
                     if cfg.neural_discard:
                         init_state = _new_game_with_neural_discard(
                             UltiGame(), batch_server, g_seed,
                             training_mode=cfg.training_mode,
                             dealer=g_seed % 3,
-                        )
-                    elif use_enrich:
-                        init_state, _ = _value_enriched_new_game(
-                            UltiGame(), batch_server, g_seed,
-                            min_value=thresh,
-                            training_mode=cfg.training_mode,
                         )
                     return _play_one_game(
                         UltiGame(), batch_server, sol_cfg, def_cfg, g_seed,
@@ -411,23 +374,11 @@ def train_ulti_hybrid(
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
 
-                    use_enrich = (
-                        past_warmup
-                        and thresh > -999.0
-                        and (g / cfg.games_per_step) >= cfg.enrich_random_frac
-                    )
-
                     if cfg.neural_discard:
                         init_state = _new_game_with_neural_discard(
                             game, wrapper, game_seed,
                             training_mode=cfg.training_mode,
                             dealer=game_seed % 3,
-                        )
-                    elif use_enrich:
-                        init_state, _ = _value_enriched_new_game(
-                            game, wrapper, game_seed,
-                            min_value=thresh,
-                            training_mode=cfg.training_mode,
                         )
                     else:
                         init_state = None
@@ -464,7 +415,7 @@ def train_ulti_hybrid(
             # Submit next iteration's self-play *before* SGD so workers
             # run in parallel with training (double-buffering).
             if executor is not None and step < cfg.steps:
-                next_tasks, _, _ = _build_tasks(step + 1)
+                next_tasks = _build_tasks(step + 1)
                 _pending_futures = [
                     executor.submit(_play_game_in_worker, t) for t in next_tasks
                 ]

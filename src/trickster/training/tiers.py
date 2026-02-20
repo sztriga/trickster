@@ -80,22 +80,6 @@ class Tier:
     def reuse(self) -> float:
         return (self.steps * self.train_steps * self.batch_size) / self.buffer_size
 
-    # Aliases so train_e2e.py can use tier.e2e_* uniformly
-    @property
-    def e2e_steps(self) -> int:
-        return self.steps
-
-    @property
-    def e2e_gpi(self) -> int:
-        return self.games_per_step
-
-    @property
-    def e2e_train_steps(self) -> int:
-        return self.train_steps
-
-    @property
-    def e2e_buffer_size(self) -> int:
-        return self.buffer_size
 
 
 TIERS: dict[str, Tier] = {

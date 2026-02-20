@@ -111,6 +111,7 @@ export type UltiState = {
   capturedTricks: UltiCard[][];
   bubbles: { player: number; text: string }[];
   opponents: [string, string];
+  strength: string;
   talonCards: UltiCard[] | null;
 };
 
@@ -130,11 +131,13 @@ export function ultiNewGame(
   seed?: number | null,
   dealer?: number,
   opponents?: [string, string],
+  strength?: string,
 ): Promise<UltiState> {
   const body: Record<string, unknown> = {};
   if (seed != null) body.seed = seed;
   if (dealer != null) body.dealer = dealer;
   if (opponents) body.opponents = opponents;
+  if (strength) body.strength = strength;
   return post("/new", body);
 }
 
@@ -184,6 +187,20 @@ export async function ultiListModels(): Promise<string[]> {
   if (!res.ok) throw new Error(await res.text());
   const data = await res.json();
   return data.models as string[];
+}
+
+/** AI strength preset. */
+export type StrengthPreset = {
+  key: string;
+  label: string;
+  description: string;
+};
+
+/** List available AI strength presets from the server. */
+export async function ultiListStrengths(): Promise<{ strengths: StrengthPreset[]; default: string }> {
+  const res = await fetch(`${BASE}/strengths`);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
 }
 
 /** Analysis result for the current position. */

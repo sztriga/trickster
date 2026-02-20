@@ -80,7 +80,6 @@ python3 -c "from trickster.games.snapszer._fast_minimax import c_alphabeta; prin
 python3 -c "
 from trickster.training.tiers import TIERS
 from trickster.training.model_io import resolve_paths
-from trickster.training.contract_loop import train_one_tier
 from trickster.training.bidding_loop import train_with_bidding
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
 print(f'  Training modules: OK ({len(TIERS)} tiers, solver={SOLVER_ENGINE})')

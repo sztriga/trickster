@@ -7,8 +7,8 @@ bidding, kontra, and neural discard.
 Multiple tiers can be trained sequentially in a single invocation.
 
 Usage:
-    python scripts/train_e2e.py knight_light                     # single tier
-    python scripts/train_e2e.py knight_light knight_balanced      # batch
+    python scripts/train_e2e.py scout                             # quick iteration
+    python scripts/train_e2e.py knight bronze                     # batch
     python scripts/train_e2e.py bronze --steps 4000 -v            # override steps
     python scripts/train_e2e.py bronze --workers 4                # parallel
 """
@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
+from trickster.bidding.constants import EXPLORATION_FRAC, MAX_DISCARDS, MIN_BID_PTS
 from trickster.games.ulti.adapter import UltiGame
 from trickster.hybrid import SOLVER_ENGINE
 from trickster.train_utils import _GAME_PTS_MAX
@@ -120,9 +121,9 @@ def train_tier(tier_name: str, args) -> None:
         lr_end=1e-4,
         buffer_size=tier.buffer_size,
         batch_size=tier.batch_size,
-        max_discards=15,
-        min_bid_pts=0.0,
-        exploration_frac=0.2,
+        max_discards=MAX_DISCARDS,
+        min_bid_pts=MIN_BID_PTS,
+        exploration_frac=EXPLORATION_FRAC,
         contract_keys=CONTRACT_KEYS,
         num_workers=args.workers,
         seed=args.seed,
@@ -221,7 +222,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--opponent-pool", nargs="*", default=None,
-        help="Model sources for opponent pool (e.g. scout knight_light). "
+        help="Model sources for opponent pool (e.g. scout knight). "
              "Defenders in pool games use a randomly chosen pool model.",
     )
     parser.add_argument(
