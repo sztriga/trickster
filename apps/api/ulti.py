@@ -838,6 +838,121 @@ def _compute_final_settlement(
 # ---------------------------------------------------------------------------
 
 
+def _ai_should_pickup_nn(
+    sess: UltiSession,
+    player: int,
+    auction: "AuctionState",
+) -> bool:
+    """Blind pickup decision: evaluate the 10-card hand without seeing the talon.
+
+    For each contract type and feasible trump suit, builds a trick-0
+    UltiNode from the 10-card hand (as if discards already happened)
+    and queries the value head.  Returns True if any contract that
+    can legally overbid the current bid has a positive expected payoff.
+    """
+    import copy
+
+    from trickster.bidding.registry import CONTRACT_DEFS, BID_TO_CONTRACT
+
+    source = sess.opponent_sources[player - 1]
+    wrappers = _get_wrappers(source)
+    if not wrappers:
+        return False
+
+    hand = sess.state.hands[player]
+    assert len(hand) == 10
+
+    # Which bid ranks can legally overbid?
+    min_rank = auction.current_bid.rank if auction.current_bid else 0
+    legal_ranks = {r for r in BID_TO_CONTRACT if r > min_rank}
+    if not legal_ranks:
+        return False
+
+    game = _get_ulti_game()
+    suits_in_hand = list(set(c.suit for c in hand))
+
+    for contract_key, wrapper in wrappers.items():
+        cdef = CONTRACT_DEFS.get(contract_key)
+        if cdef is None:
+            continue
+
+        # Build candidate (contract_key, trump, is_piros) combos
+        candidates: list[tuple[Suit | None, bool]] = []
+        if cdef.is_betli:
+            candidates = [(None, False), (None, True)]
+        elif cdef.piros_only:
+            candidates = [(Suit.HEARTS, True)]
+        else:
+            for suit in suits_in_hand:
+                candidates.append((suit, suit == Suit.HEARTS))
+
+        for trump, is_piros in candidates:
+            # Check if the corresponding bid rank is a legal overbid
+            bid_rank = _CONTRACT_TO_BID_RANK.get((contract_key, is_piros))
+            if bid_rank is None or bid_rank not in legal_ranks:
+                continue
+
+            # Feasibility checks on the 10-card hand
+            if not cdef.is_betli and trump is None:
+                continue
+            if contract_key == "40-100" and not any(
+                c.suit == trump and c.rank == Rank.KING for c in hand
+            ):
+                continue
+            if contract_key == "40-100" and not any(
+                c.suit == trump and c.rank == Rank.QUEEN for c in hand
+            ):
+                continue
+            if contract_key == "ulti" and Card(trump, Rank.SEVEN) not in hand:
+                continue
+
+            # Build a trick-0 node from the 10-card hand
+            gs2 = copy.deepcopy(sess.state)
+            gs2.soloist = player
+            betli = cdef.is_betli
+            set_contract(gs2, player, trump=trump, betli=betli)
+            if contract_key == "ulti":
+                gs2.has_ulti = True
+
+            # Marriage restriction
+            restrict = None
+            if contract_key == "40-100":
+                restrict = "40"
+            restrict_arg = restrict
+            declare_all_marriages(gs2, soloist_marriage_restrict=restrict_arg)
+
+            # Contract components
+            if betli:
+                comps = frozenset({"betli"})
+            else:
+                comps_set: set[str] = {"parti"}
+                if "ulti" in contract_key:
+                    comps_set.add("ulti")
+                if "40" in contract_key:
+                    comps_set.update({"40", "100"})
+                comps = frozenset(comps_set)
+
+            constraints = build_auction_constraints(gs2, comps)
+            empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+
+            node = UltiNode(
+                gs=gs2,
+                known_voids=empty_voids,
+                bid_rank=bid_rank,
+                is_red=is_piros,
+                contract_components=comps,
+                dealer=sess.dealer,
+                must_have=constraints,
+            )
+
+            feats = game.encode_state(node, player)
+            v = float(wrapper.predict_value(feats))
+            if v > 0.0:
+                return True
+
+    return False
+
+
 def _ai_nn_evaluate(sess: UltiSession, player: int) -> "ContractEval | None":
     """Use the NN value heads to find the best contract for *player*.
 
@@ -961,24 +1076,14 @@ def _advance_ai_auction(sess: UltiSession) -> None:
 
         else:
             # AI has 10 cards — decide whether to pick up the talon.
+            # The AI does NOT see the talon; it evaluates only its
+            # 10-card hand to decide if picking up is worthwhile.
             should_pickup = False
             source = sess.opponent_sources[player - 1]
             wrappers = _get_wrappers(source)
 
             if wrappers and can_pickup(a):
-                # Simulate pickup: evaluate 12-card hand with NN
-                sim_hand = hand + list(a.talon)
-                # Temporarily give player 12 cards for evaluation
-                orig_hand = sess.state.hands[player]
-                sess.state.hands[player] = sim_hand
-                try:
-                    nn_eval = _ai_nn_evaluate(sess, player)
-                    if nn_eval is not None:
-                        # Check if we can actually overbid
-                        result = _nn_eval_to_auction_bid(nn_eval, a)
-                        should_pickup = result is not None
-                finally:
-                    sess.state.hands[player] = orig_hand
+                should_pickup = _ai_should_pickup_nn(sess, player, a)
             elif not wrappers:
                 # No model — use heuristic
                 should_pickup = ai_should_pickup(hand, a)
