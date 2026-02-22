@@ -685,10 +685,12 @@ def train_with_bidding(
         "pool_frac": cfg.pool_frac,
     }
     if cfg.num_workers > 1:
+        import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
         executor = ProcessPoolExecutor(
             max_workers=cfg.num_workers,
+            mp_context=mp.get_context("spawn"),
             initializer=_init_bidding_worker,
             initargs=(net_kwargs, cfg.contract_keys, "cpu",
                       cfg.opponent_pool if cfg.opponent_pool else None),

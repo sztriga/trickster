@@ -246,10 +246,12 @@ def train_ulti_hybrid(
         batch_server = BatchInferenceServer(wrapper, drain_ms=1.0)
         batch_server.start()
     elif cfg.num_workers > 1:
+        import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
 
         executor = ProcessPoolExecutor(
             max_workers=cfg.num_workers,
+            mp_context=mp.get_context("spawn"),
             initializer=_init_worker,
             initargs=(net_kwargs, "cpu"),
         )
