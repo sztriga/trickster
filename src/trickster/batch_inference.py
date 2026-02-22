@@ -25,13 +25,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from trickster.model import OnnxUltiWrapper, UltiNetWrapper
+    from trickster.model import UltiNetWrapper
 
 
 class BatchInferenceServer:
     """Collect per-game NN queries and run them as one GPU batch.
 
-    The server wraps a ``UltiNetWrapper`` (or ``OnnxUltiWrapper``) and
+    The server wraps a ``UltiNetWrapper`` and
     exposes the same public API.  Internally a daemon thread drains a
     queue of pending requests, merges them into a single
     ``predict_both_batch`` call, and distributes sliced results back
@@ -39,7 +39,7 @@ class BatchInferenceServer:
 
     Parameters
     ----------
-    wrapper : UltiNetWrapper | OnnxUltiWrapper
+    wrapper : UltiNetWrapper
         The underlying model wrapper (must already be on the target
         device).
     drain_ms : float
@@ -49,7 +49,7 @@ class BatchInferenceServer:
 
     def __init__(
         self,
-        wrapper: UltiNetWrapper | OnnxUltiWrapper,
+        wrapper: UltiNetWrapper,
         *,
         drain_ms: float = 1.0,
     ) -> None:

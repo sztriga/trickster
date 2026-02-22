@@ -6,8 +6,8 @@ Architecture:
             ├── Value Head  (sol/def)  → unbounded scalar (also used for bidding)
             └── Auction Head (multi-component)
 
-Inference wrappers (``UltiNetWrapper``, ``OnnxUltiWrapper``,
-``make_wrapper``) live in ``trickster.wrappers`` and are re-exported
+Inference wrappers (``UltiNetWrapper``, ``make_wrapper``) live in
+``trickster.wrappers`` and are re-exported
 here for backward compatibility.
 """
 
@@ -321,8 +321,6 @@ class UltiNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 from trickster.wrappers import (  # noqa: F401, E402
-    OnnxUltiWrapper,
     UltiNetWrapper,
-    _ort_available,
     make_wrapper,
 )

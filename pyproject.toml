@@ -8,12 +8,12 @@ version = "0.2.0"
 description = "Hungarian card game framework with AlphaZero MCTS training and React UI."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["fastapi", "uvicorn", "numpy", "onnxruntime"]
+dependencies = ["fastapi", "uvicorn", "numpy"]
 
 [project.optional-dependencies]
 dev = ["pytest==8.3.4"]
 fast = ["cython"]
-train = ["torch", "cython", "onnxruntime"]
+train = ["torch", "cython"]
 
 [project.scripts]
 trickster-gui = "trickster.gui:main"

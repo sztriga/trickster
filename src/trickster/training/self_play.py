@@ -27,7 +27,7 @@ from trickster.games.ulti.game import (
 )
 from trickster.hybrid import HybridPlayer
 from trickster.mcts import MCTSConfig
-from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapper
+from trickster.model import UltiNet, UltiNetWrapper, make_wrapper
 from trickster.bidding.constants import KONTRA_THRESHOLD, REKONTRA_THRESHOLD
 from trickster.train_utils import simple_outcome, solver_value_to_reward
 
@@ -367,7 +367,7 @@ def _play_one_game(
 
 _WORKER_GAME: UltiGame | None = None
 _WORKER_NET: UltiNet | None = None
-_WORKER_WRAPPER: UltiNetWrapper | OnnxUltiWrapper | None = None
+_WORKER_WRAPPER: UltiNetWrapper | None = None
 
 
 def _init_worker(net_kwargs: dict, device: str) -> None:
@@ -382,13 +382,12 @@ def _play_game_in_worker(
     args: tuple,
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]]:
     """Worker entry-point for parallel self-play."""
-    (state_dict, sol_mcts_cfg, def_mcts_cfg,
+    (weights_or_bytes, sol_mcts_cfg, def_mcts_cfg,
      seed, endgame_tricks, pimc_dets, solver_temp,
      training_mode, _enrich_thresh, solver_teacher,
      kontra_enabled, use_neural_discard) = args
-    _WORKER_NET.load_state_dict(state_dict)
-    if isinstance(_WORKER_WRAPPER, OnnxUltiWrapper):
-        _WORKER_WRAPPER.sync_weights(_WORKER_NET)
+
+    _WORKER_NET.load_state_dict(weights_or_bytes)
 
     init_state = None
     if use_neural_discard:

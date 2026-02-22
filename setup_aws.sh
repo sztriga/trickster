@@ -59,7 +59,7 @@ echo "  Done. Using $(python3 --version)"
 # ── Python dependencies ──────────────────────────────
 echo "[3/6] Installing Python packages..."
 pip install -q torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
-pip install -q numpy cython fastapi uvicorn onnxruntime
+pip install -q numpy cython fastapi uvicorn
 pip install -e . -q
 echo "  Done."
 
@@ -74,7 +74,6 @@ FAIL=0
 
 python3 -c "import torch; print(f'  PyTorch {torch.__version__}: OK')" || FAIL=1
 python3 -c "import numpy; print(f'  NumPy {numpy.__version__}: OK')" || FAIL=1
-python3 -c "import onnxruntime as ort; print(f'  ONNX Runtime {ort.__version__}: OK')" || FAIL=1
 python3 -c "from trickster._solver_core import solve_root; print('  Cython solver (Ulti): OK')" || FAIL=1
 python3 -c "from trickster.games.snapszer._fast_minimax import c_alphabeta; print('  Cython solver (Snapszer): OK')" || FAIL=1
 python3 -c "

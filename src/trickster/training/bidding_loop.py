@@ -50,7 +50,7 @@ from trickster.games.ulti.game import (
 )
 from trickster.hybrid import HybridPlayer
 from trickster.mcts import MCTSConfig
-from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapper
+from trickster.model import UltiNet, UltiNetWrapper, make_wrapper
 from trickster.bidding.constants import (
     BID_TEMP_END,
     BID_TEMP_START,
@@ -256,8 +256,8 @@ class BiddingTrainStats:
 
 _BW_GAME: UltiGame | None = None
 _BW_NETS: dict[str, UltiNet] = {}
-_BW_WRAPPERS: dict[str, UltiNetWrapper | OnnxUltiWrapper] = {}
-_BW_POOL_WRAPPERS: list[dict[str, UltiNetWrapper | OnnxUltiWrapper]] = []
+_BW_WRAPPERS: dict[str, UltiNetWrapper] = {}
+_BW_POOL_WRAPPERS: list[dict[str, UltiNetWrapper]] = []
 
 
 def _init_bidding_worker(
@@ -287,14 +287,10 @@ def _play_bidding_game_in_worker(
     args: tuple,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
     """Worker entry-point for parallel bidding self-play."""
-    (all_state_dicts, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, bid_temp) = args
+    (all_weights_or_bytes, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, bid_temp) = args
 
-    # Load latest weights into worker nets
-    for key, sd in all_state_dicts.items():
+    for key, sd in all_weights_or_bytes.items():
         _BW_NETS[key].load_state_dict(sd)
-        w = _BW_WRAPPERS.get(key)
-        if isinstance(w, OnnxUltiWrapper):
-            w.sync_weights(_BW_NETS[key])
 
     # Reconstruct a lightweight cfg from dict
     cfg = BiddingTrainConfig(**cfg_dict)
@@ -757,7 +753,7 @@ def train_with_bidding(
 
             if executor is not None:
                 # --- Parallel self-play ---
-                all_state_dicts = {
+                all_weights = {
                     key: {k: v.cpu() for k, v in slot.net.state_dict().items()}
                     for key, slot in slots.items()
                 }
@@ -765,7 +761,7 @@ def train_with_bidding(
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
                     tasks.append((
-                        all_state_dicts,
+                        all_weights,
                         sol_cfg,
                         def_cfg,
                         game_seed,
@@ -847,8 +843,6 @@ def train_with_bidding(
                 step_model_ploss[key] = avg_p
 
                 slot.net.eval()
-                if isinstance(slot.wrapper, OnnxUltiWrapper):
-                    slot.wrapper.sync_weights(slot.net)
 
             # -- Update stats --
             stats.step = step

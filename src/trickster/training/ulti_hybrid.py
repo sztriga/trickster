@@ -35,7 +35,7 @@ import torch.nn.functional as F
 
 from trickster.games.ulti.adapter import UltiGame
 from trickster.mcts import MCTSConfig
-from trickster.model import OnnxUltiWrapper, UltiNet, make_wrapper
+from trickster.model import UltiNet, make_wrapper
 from trickster.train_utils import ReplayBuffer
 from trickster.training.model_io import auto_device
 from trickster.training.self_play import (
@@ -199,7 +199,6 @@ def train_ulti_hybrid(
             action_dim=game.action_space_size,
         )
     net.to(device)
-    # ONNX Runtime for self-play inference (CPU only, ~10x faster per call)
     wrapper = make_wrapper(net, device=device)
     optimizer = torch.optim.Adam(
         net.parameters(), lr=cfg.lr_start, weight_decay=1e-4,
@@ -258,14 +257,13 @@ def train_ulti_hybrid(
     stats = UltiTrainStats(total_steps=cfg.steps)
     t0 = time.perf_counter()
 
-    _is_onnx = isinstance(wrapper, OnnxUltiWrapper)
-
     # Helpers for building self-play task tuples
     def _build_tasks(step: int):
+        weights = {k: v.cpu() for k, v in net.state_dict().items()}
         tasks = []
         for g in range(cfg.games_per_step):
             tasks.append((
-                {k: v.cpu() for k, v in net.state_dict().items()},
+                weights,
                 sol_cfg, def_cfg,
                 cfg.seed + step * 1000 + g,
                 cfg.endgame_tricks, cfg.pimc_dets, cfg.solver_temp,
@@ -480,10 +478,7 @@ def train_ulti_hybrid(
                 avg_sol_vloss = total_sol_vloss / max(1, sol_count)
                 avg_def_vloss = total_def_vloss / max(1, def_count)
 
-            # Re-export ONNX sessions / sync batch server weights
-            if _is_onnx:
-                wrapper.sync_weights(net)
-            elif batch_server is not None:
+            if batch_server is not None:
                 batch_server.sync_weights(net)
 
             # ---- 3. Update stats ----

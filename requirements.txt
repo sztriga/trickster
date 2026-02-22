@@ -5,7 +5,6 @@ uvicorn
 
 # Training (install torch separately — see setup_aws.sh for CPU-only wheel)
 # torch
-onnxruntime
 
 # Cython extensions (build with: python setup_cython.py build_ext --inplace)
 cython

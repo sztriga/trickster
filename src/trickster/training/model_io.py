@@ -36,7 +36,7 @@ def auto_device(
 ) -> str:
     """Pick training device.
 
-    CPU tiers use ONNX Runtime for fast single-sample inference.
+    CPU tiers use PyTorch for single-sample inference.
     GPU tiers (``gpu_tier=True``) use PyTorch on CUDA with cross-game
     inference batching.
 

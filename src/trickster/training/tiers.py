@@ -69,7 +69,7 @@ class Tier:
     batch_size: int = 64
 
     # GPU flag — when True the training loop uses CUDA + cross-game
-    # inference batching instead of CPU + ONNX.
+    # inference batching instead of CPU.
     gpu: bool = False
 
     @property
