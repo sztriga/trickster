@@ -113,9 +113,8 @@ Models are saved to `models/<contract>/<prefix><tier>/model.pt`.
 All contracts train together. The value heads decide which contract to bid each deal:
 1. Deal 12 cards to the soloist
 2. Each contract model evaluates the hand (value head predicts expected game-point stakes)
-3. Best contract wins the bid (or pass if nothing beats the −2/defender penalty)
-4. 20% of games use random contract selection (exploration)
-5. The winning contract's model trains on the game result
+3. Softmax-temperature sampling picks a contract (annealed from exploratory to greedy)
+4. The chosen contract's model trains on the game result
 6. All models improve on hands they'd actually be bid on — realistic training distribution
 
 Models are saved to `models/e2e/<tier>/`.

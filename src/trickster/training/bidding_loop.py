@@ -35,14 +35,10 @@ import torch
 import torch.nn.functional as F
 
 from trickster.bidding.auction_runner import (
-    AuctionResult,
-    run_auction,
     setup_bid_game,
 )
 from trickster.bidding.evaluator import (
-    ContractEval,
     evaluate_all_contracts,
-    pick_best_bid,
 )
 from trickster.bidding.registry import CONTRACT_DEFS
 from trickster.games.ulti.adapter import UltiGame, UltiNode
@@ -56,10 +52,10 @@ from trickster.hybrid import HybridPlayer
 from trickster.mcts import MCTSConfig
 from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapper
 from trickster.bidding.constants import (
-    EXPLORATION_FRAC,
+    BID_TEMP_END,
+    BID_TEMP_START,
     KONTRA_THRESHOLD,
     MIN_BID_PTS,
-    MIN_BID_PTS_START,
     PASS_PENALTY,
     REKONTRA_THRESHOLD,
 )
@@ -162,9 +158,9 @@ class BiddingTrainConfig:
 
     # -- Bidding --
     min_bid_pts: float = MIN_BID_PTS
-    min_bid_pts_start: float = MIN_BID_PTS_START
     pass_penalty: float = PASS_PENALTY
-    exploration_frac: float = EXPLORATION_FRAC
+    bid_temp_start: float = BID_TEMP_START
+    bid_temp_end: float = BID_TEMP_END
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
@@ -291,7 +287,7 @@ def _play_bidding_game_in_worker(
     args: tuple,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
     """Worker entry-point for parallel bidding self-play."""
-    (all_state_dicts, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, exploration, min_bid_override) = args
+    (all_state_dicts, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, bid_temp) = args
 
     # Load latest weights into worker nets
     for key, sd in all_state_dicts.items():
@@ -310,9 +306,8 @@ def _play_bidding_game_in_worker(
 
     return _play_one_bidding_game(
         _BW_GAME, _BW_WRAPPERS, sol_mcts_cfg, def_mcts_cfg, seed, cfg,
-        exploration=exploration,
+        bid_temp=bid_temp,
         opp_wrappers=opp_w,
-        min_bid_pts_override=min_bid_override,
     )
 
 
@@ -399,17 +394,20 @@ def _play_one_bidding_game(
     def_cfg: MCTSConfig,
     seed: int,
     cfg: BiddingTrainConfig,
-    exploration: bool = False,
+    bid_temp: float = 1.0,
     opp_wrappers: dict[str, UltiNetWrapper] | None = None,
-    min_bid_pts_override: float | None = None,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
-    """Play one game with competitive auction bidding.
+    """Play one game with softmax-temperature contract selection.
 
-    Uses the same :func:`run_auction` as evaluation so that
-    training and eval play exactly the same game.
+    Instead of a binary explore/exploit split, every game uses the
+    same code path: evaluate all contracts, then sample one using
+    softmax over ``stakes_pts`` with the given temperature.
 
     Parameters
     ----------
+    bid_temp : float
+        Softmax temperature for contract selection.  High values
+        (e.g. 2.0) are exploratory; low values (e.g. 0.1) are greedy.
     opp_wrappers : optional
         When provided, defenders use these wrappers for play and kontra
         decisions instead of *wrappers*.  Only soloist samples are
@@ -428,42 +426,27 @@ def _play_one_bidding_game(
     # 1. Deal cards
     gs, talon = deal(seed=seed, dealer=dealer)
 
-    # 2. Run the competitive auction (all seats use training wrappers)
-    if exploration:
-        # Exploration: skip auction, first bidder evaluates all contracts
-        # and picks one at random.
-        soloist = next_player(dealer)
-        gs.hands[soloist].extend(talon)
-        evals = evaluate_all_contracts(
-            gs, soloist, dealer,
-            wrappers=wrappers,
-        )
-        if not evals:
-            return "__pass__", [], 0.0
-        bid = rng.choice(evals)
-        dkey = _display_key(bid.contract_key, bid.is_piros)
-        state = setup_bid_game(
-            game, gs, soloist, dealer, bid,
-            initial_bidder=soloist,  # exploration: soloist is always first bidder
-        )
-    else:
-        effective_min_bid = min_bid_pts_override if min_bid_pts_override is not None else cfg.min_bid_pts
-        seat_wrappers = [wrappers, wrappers, wrappers]
-        result = run_auction(
-            gs, talon, dealer, seat_wrappers,
-            min_bid_pts=effective_min_bid,
-        )
-        soloist = result.soloist
+    # 2. Evaluate all contracts and softmax-sample one
+    soloist = next_player(dealer)
+    gs.hands[soloist].extend(talon)
+    evals = evaluate_all_contracts(gs, soloist, dealer, wrappers=wrappers)
+    if not evals:
+        return "__pass__", [], 0.0
 
-        if result.bid is None:
-            return "__pass__", [], 0.0
+    # Softmax sample over stakes_pts with temperature
+    pts = np.array([ev.stakes_pts for ev in evals])
+    logits = pts / max(bid_temp, 1e-6)
+    logits -= logits.max()  # numerical stability
+    probs = np.exp(logits)
+    probs /= probs.sum()
+    idx = rng.choices(range(len(evals)), weights=probs.tolist(), k=1)[0]
+    bid = evals[idx]
 
-        bid = result.bid
-        dkey = _display_key(bid.contract_key, bid.is_piros)
-        state = setup_bid_game(
-            game, gs, soloist, dealer, bid,
-            initial_bidder=result.initial_bidder,
-        )
+    dkey = _display_key(bid.contract_key, bid.is_piros)
+    state = setup_bid_game(
+        game, gs, soloist, dealer, bid,
+        initial_bidder=soloist,
+    )
 
     # 3. Get wrappers for play
     sol_wrapper = wrappers.get(bid.contract_key)
@@ -691,9 +674,9 @@ def train_with_bidding(
         "body_units": cfg.body_units,
         "body_layers": cfg.body_layers,
         "min_bid_pts": cfg.min_bid_pts,
-        "min_bid_pts_start": cfg.min_bid_pts_start,
         "pass_penalty": cfg.pass_penalty,
-        "exploration_frac": cfg.exploration_frac,
+        "bid_temp_start": cfg.bid_temp_start,
+        "bid_temp_end": cfg.bid_temp_end,
         "kontra_enabled": cfg.kontra_enabled,
         "contract_keys": cfg.contract_keys,
         "num_workers": 1,
@@ -719,8 +702,8 @@ def train_with_bidding(
                 for pg in slot.optimizer.param_groups:
                     pg["lr"] = lr
 
-            # -- Anneal min_bid_pts: high → low (compensates for max-over-evals inflation) --
-            cur_min_bid = _cosine_lr(step, cfg.steps, cfg.min_bid_pts_start, cfg.min_bid_pts)
+            # -- Anneal bid temperature: high (exploratory) → low (greedy) --
+            cur_bid_temp = _cosine_lr(step, cfg.steps, cfg.bid_temp_start, cfg.bid_temp_end)
 
             # -- Self-play --
             step_dk_games: dict[str, int] = {dk: 0 for dk in DISPLAY_ORDER}
@@ -781,15 +764,13 @@ def train_with_bidding(
                 tasks = []
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
-                    exploration = (g / cfg.games_per_step) < cfg.exploration_frac
                     tasks.append((
                         all_state_dicts,
                         sol_cfg,
                         def_cfg,
                         game_seed,
                         cfg_dict,
-                        exploration,
-                        cur_min_bid,
+                        cur_bid_temp,
                     ))
                 for dkey, samples, pred_val in executor.map(
                     _play_bidding_game_in_worker, tasks,
@@ -799,7 +780,6 @@ def train_with_bidding(
                 # --- Sequential self-play ---
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
-                    exploration = (g / cfg.games_per_step) < cfg.exploration_frac
 
                     # Decide whether this game uses a pool opponent
                     opp_w = None
@@ -808,9 +788,8 @@ def train_with_bidding(
 
                     dkey, samples, pred_val = _play_one_bidding_game(
                         game, wrappers, sol_cfg, def_cfg, game_seed, cfg,
-                        exploration=exploration,
+                        bid_temp=cur_bid_temp,
                         opp_wrappers=opp_w,
-                        min_bid_pts_override=cur_min_bid,
                     )
                     _collect_result(dkey, samples, pred_val)
 

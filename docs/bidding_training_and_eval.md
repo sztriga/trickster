@@ -25,9 +25,7 @@ Training uses a **simplified, non-competitive** auction:
 
 2. **Evaluate**: `evaluate_all_contracts()` runs on the soloist's 12-card hand. For each feasible (contract, trump, discard) combo, the value head predicts expected stakes. Returns a sorted list of `ContractEval` by `stakes_pts` descending.
 
-3. **Pick bid**:
-   - With probability `exploration_frac` (default 0.2): pick a **random** feasible contract (exploration).
-   - Otherwise: `pick_best_bid(evals, min_stakes_pts=min_bid_pts)`. Returns the first eval with `stakes_pts >= min_bid_pts`, or `None` if none qualify → treat as pass (no game played).
+3. **Pick bid**: Softmax-sample over `stakes_pts` with an annealed temperature (`bid_temp_start` → `bid_temp_end` via cosine schedule). High temperature early in training explores diverse contracts; low temperature late in training converges to greedy selection. If no feasible contract exists → treat as pass (no game played).
 
 4. **Setup**: Apply the chosen bid (contract, trump, discards) to the game state.
 
@@ -84,10 +82,6 @@ For a single (contract, trump, is_piros):
 ### 4.2 `evaluate_all_contracts()`
 
 Iterates over all contracts × trumps (or piros variants). Returns list sorted by `stakes_pts` descending.
-
-### 4.3 `pick_best_bid()`
-
-Returns the first eval with `stakes_pts >= min_stakes_pts`, or `None`.
 
 ---
 

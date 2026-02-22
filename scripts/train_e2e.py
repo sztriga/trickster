@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from trickster.bidding.constants import EXPLORATION_FRAC, MIN_BID_PTS
+from trickster.bidding.constants import BID_TEMP_END, BID_TEMP_START, MIN_BID_PTS
 from trickster.games.ulti.adapter import UltiGame
 from trickster.hybrid import SOLVER_ENGINE
 from trickster.train_utils import _GAME_PTS_MAX
@@ -122,7 +122,8 @@ def train_tier(tier_name: str, args) -> None:
         buffer_size=tier.buffer_size,
         batch_size=tier.batch_size,
         min_bid_pts=MIN_BID_PTS,
-        exploration_frac=EXPLORATION_FRAC,
+        bid_temp_start=BID_TEMP_START,
+        bid_temp_end=BID_TEMP_END,
         contract_keys=CONTRACT_KEYS,
         num_workers=args.workers,
         seed=args.seed,

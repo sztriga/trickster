@@ -392,28 +392,3 @@ def evaluate_all_contracts(
     # Sort by stakes_pts (best first)
     results.sort(key=lambda e: e.stakes_pts, reverse=True)
     return results
-
-
-def pick_best_bid(
-    evals: list[ContractEval],
-    min_stakes_pts: float = 0.0,
-) -> ContractEval | None:
-    """Pick the contract with the highest expected payoff.
-
-    Compares by ``stakes_pts``, which is the expected per-defender
-    payoff as predicted directly by the value head (including piros
-    and kontra dynamics).  A confident rebetli beats a marginal parti.
-
-    Parameters
-    ----------
-    evals : output of evaluate_all_contracts (sorted by stakes_pts desc)
-    min_stakes_pts : minimum expected payoff to place a bid (vs pass)
-
-    Returns
-    -------
-    Best ContractEval, or None if nothing beats the threshold (→ pass).
-    """
-    for ev in evals:
-        if ev.stakes_pts >= min_stakes_pts:
-            return ev
-    return None

@@ -24,16 +24,15 @@ REKONTRA_THRESHOLD: float = 0.8
 #: Passed as ``min_bid_pts`` to ``run_auction`` and bidding training.
 MIN_BID_PTS: float = 0.0
 
-#: Starting bid threshold (annealed down to MIN_BID_PTS during training).
-MIN_BID_PTS_START: float = 4.0
-
 #: Per-defender penalty (game points) when all three players pass.
 PASS_PENALTY: float = 2.0
 
 # ---------------------------------------------------------------------------
-#  Training exploration
+#  Softmax temperature for contract selection during training
 # ---------------------------------------------------------------------------
 
-#: Fraction of bidding-training games that use a random contract
-#: (instead of the NN's choice) for exploration.
-EXPLORATION_FRAC: float = 0.2
+#: Starting temperature (high → exploratory).
+BID_TEMP_START: float = 2.0
+
+#: Final temperature (low → greedy).
+BID_TEMP_END: float = 0.1
