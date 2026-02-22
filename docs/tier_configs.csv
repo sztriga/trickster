@@ -2,7 +2,7 @@ branch,tier,net,params_approx,steps,gpi,train_steps,buffer,batch,sol_sims,def_si
 capacity,scout,256x4,262144,2000,8,50,50000,64,40,20,2,2,20,6,16000,128x,0.4,0.3,measured (6 workers)
 capacity,knight,256x4,262144,6000,8,50,80000,64,60,24,2,2,20,6,48000,240x,1.5,1.5,measured (6 workers)
 capacity,bishop,384x4,589824,4000,12,50,80000,64,80,30,2,2,20,6,48000,160x,2.0,1.4,measured (6 workers)
-capacity,rook,512x6,1572864,4000,12,50,80000,64,80,30,2,2,40,6,48000,160x,3.0,,heavier net+pimc
+capacity,rook,512x6,1572864,4000,12,50,80000,64,80,30,2,2,40,6,48000,160x,3.0,2.3,measured (6 workers)
 capacity,captain,1024x6,6291456,6000,12,50,120000,64,120,60,2,2,60,6,72000,160x,10,,largest CPU tier
 volume,bronze,256x4,262144,6000,16,50,100000,64,60,24,2,2,20,6,96000,192x,2.5,,2x knight data
 volume,silver,256x4,262144,12000,24,50,200000,64,60,24,2,2,20,6,288000,192x,6,,6x knight data

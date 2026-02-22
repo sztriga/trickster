@@ -119,9 +119,6 @@ class ContractTrainSlot:
     vloss: float = 0.0
     ploss: float = 0.0
 
-    # Loss history for trend detection
-    vloss_history: list = field(default_factory=list)
-    ploss_history: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -872,8 +869,6 @@ def train_with_bidding(
                 avg_p = acc_ploss / n_train
                 slot.vloss = avg_v
                 slot.ploss = avg_p
-                slot.vloss_history.append(avg_v)
-                slot.ploss_history.append(avg_p)
                 step_model_vloss[key] = avg_v
                 step_model_ploss[key] = avg_p
 
