@@ -44,7 +44,6 @@ from trickster.mcts import MCTSConfig
 from trickster.model import UltiNetWrapper
 from trickster.bidding.constants import (
     KONTRA_THRESHOLD,
-    MAX_DISCARDS,
     MIN_BID_PTS,
     PASS_PENALTY,
     REKONTRA_THRESHOLD,
@@ -181,7 +180,6 @@ def _play_one_deal(
     deal_index: int,
     pass_penalty: float,
     min_bid_pts: float,
-    max_discards: int,
 ) -> DealResult:
     rng = random.Random(seed)
     dealer = deal_index % 3
@@ -192,7 +190,6 @@ def _play_one_deal(
     result = run_auction(
         gs, talon, dealer, seat_wrappers,
         min_bid_pts=min_bid_pts,
-        max_discards=max_discards,
     )
     soloist = result.soloist
     bid = result.bid
@@ -284,10 +281,10 @@ def _init_worker(
 
 
 def _worker_fn(args: tuple) -> DealResult:
-    (seed, deal_index, pass_penalty, min_bid_pts, max_discards) = args
+    (seed, deal_index, pass_penalty, min_bid_pts) = args
     return _play_one_deal(
         _EW_GAME, _EW_SEATS, _EW_PRESETS, seed, deal_index,
-        pass_penalty, min_bid_pts, max_discards,
+        pass_penalty, min_bid_pts,
     )
 
 
@@ -435,7 +432,6 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--min-bid-pts", type=float, default=MIN_BID_PTS)
     parser.add_argument("--pass-penalty", type=float, default=PASS_PENALTY)
-    parser.add_argument("--max-discards", type=int, default=MAX_DISCARDS)
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
@@ -509,7 +505,7 @@ def main() -> None:
     deal_seeds = [deal_rng.randint(0, 2**31) for _ in range(args.games)]
 
     work_args = [
-        (deal_seeds[i], i, args.pass_penalty, args.min_bid_pts, args.max_discards)
+        (deal_seeds[i], i, args.pass_penalty, args.min_bid_pts)
         for i in range(args.games)
     ]
 
@@ -544,7 +540,7 @@ def main() -> None:
         for i, wa in enumerate(work_args, 1):
             result = _play_one_deal(
                 game, seats, seat_presets, wa[0], wa[1],
-                args.pass_penalty, args.min_bid_pts, args.max_discards,
+                args.pass_penalty, args.min_bid_pts,
             )
             results.append(result)
             if i % 20 == 0 or i == args.games:

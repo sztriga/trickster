@@ -27,9 +27,6 @@ MIN_BID_PTS: float = 0.0
 #: Starting bid threshold (annealed down to MIN_BID_PTS during training).
 MIN_BID_PTS_START: float = 4.0
 
-#: Maximum discard pairs evaluated per (contract, trump) combination.
-MAX_DISCARDS: int = 15
-
 #: Per-defender penalty (game points) when all three players pass.
 PASS_PENALTY: float = 2.0
 

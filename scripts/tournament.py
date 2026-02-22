@@ -38,7 +38,6 @@ import torch
 from trickster.bidding.auction_runner import run_auction, setup_bid_game
 from trickster.bidding.constants import (
     KONTRA_THRESHOLD,
-    MAX_DISCARDS,
     MIN_BID_PTS,
     PASS_PENALTY,
     REKONTRA_THRESHOLD,
@@ -164,7 +163,6 @@ def _play_one_deal(
     deal_index: int,
     pass_penalty: float,
     min_bid_pts: float,
-    max_discards: int,
 ) -> DealResult:
     rng = random.Random(seed)
     dealer = deal_index % 3
@@ -175,7 +173,6 @@ def _play_one_deal(
     auction_result = run_auction(
         gs, talon, dealer, seat_wrappers,
         min_bid_pts=min_bid_pts,
-        max_discards=max_discards,
     )
     soloist = auction_result.soloist
     bid = auction_result.bid
@@ -274,12 +271,12 @@ def _init_worker(
 
 
 def _worker_fn(args: tuple) -> DealResult:
-    (seat_models, seed, deal_index, pass_penalty, min_bid_pts, max_discards) = args
+    (seat_models, seed, deal_index, pass_penalty, min_bid_pts) = args
     seat_wrappers = [_TW_ALL_WRAPPERS[m] for m in seat_models]
     seat_presets = [_TW_ALL_PRESETS[m] for m in seat_models]
     return _play_one_deal(
         _TW_GAME, seat_wrappers, seat_presets, seat_models,
-        seed, deal_index, pass_penalty, min_bid_pts, max_discards,
+        seed, deal_index, pass_penalty, min_bid_pts,
     )
 
 
@@ -497,7 +494,6 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--min-bid-pts", type=float, default=MIN_BID_PTS)
     parser.add_argument("--pass-penalty", type=float, default=PASS_PENALTY)
-    parser.add_argument("--max-discards", type=int, default=MAX_DISCARDS)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -568,7 +564,7 @@ def main() -> None:
             seed = deal_rng.randint(0, 2**31)
             work_args.append((
                 perm, seed, deal_idx,
-                args.pass_penalty, args.min_bid_pts, args.max_discards,
+                args.pass_penalty, args.min_bid_pts,
             ))
             deal_idx += 1
 
@@ -617,7 +613,7 @@ def main() -> None:
             seat_presets = [model_speeds[m] for m in seat_models]
             result = _play_one_deal(
                 game, seat_wrappers, seat_presets, seat_models,
-                wa[1], wa[2], args.pass_penalty, args.min_bid_pts, args.max_discards,
+                wa[1], wa[2], args.pass_penalty, args.min_bid_pts,
             )
             results.append(result)
             if i % 20 == 0 or i == total_deals:

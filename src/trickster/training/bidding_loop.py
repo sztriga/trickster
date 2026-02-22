@@ -58,7 +58,6 @@ from trickster.model import OnnxUltiWrapper, UltiNet, UltiNetWrapper, make_wrapp
 from trickster.bidding.constants import (
     EXPLORATION_FRAC,
     KONTRA_THRESHOLD,
-    MAX_DISCARDS,
     MIN_BID_PTS,
     MIN_BID_PTS_START,
     PASS_PENALTY,
@@ -162,7 +161,6 @@ class BiddingTrainConfig:
     body_layers: int = 4
 
     # -- Bidding --
-    max_discards: int = MAX_DISCARDS
     min_bid_pts: float = MIN_BID_PTS
     min_bid_pts_start: float = MIN_BID_PTS_START
     pass_penalty: float = PASS_PENALTY
@@ -439,7 +437,6 @@ def _play_one_bidding_game(
         evals = evaluate_all_contracts(
             gs, soloist, dealer,
             wrappers=wrappers,
-            max_discards=cfg.max_discards,
         )
         if not evals:
             return "__pass__", [], 0.0
@@ -455,7 +452,6 @@ def _play_one_bidding_game(
         result = run_auction(
             gs, talon, dealer, seat_wrappers,
             min_bid_pts=effective_min_bid,
-            max_discards=cfg.max_discards,
         )
         soloist = result.soloist
 
@@ -694,7 +690,6 @@ def train_with_bidding(
         "solver_temp": cfg.solver_temp,
         "body_units": cfg.body_units,
         "body_layers": cfg.body_layers,
-        "max_discards": cfg.max_discards,
         "min_bid_pts": cfg.min_bid_pts,
         "min_bid_pts_start": cfg.min_bid_pts_start,
         "pass_penalty": cfg.pass_penalty,

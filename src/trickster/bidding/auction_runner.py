@@ -18,7 +18,6 @@ import numpy as np
 
 from trickster.bidding.evaluator import (
     ContractEval,
-    DiscardChoice,
     _make_eval_state,
     evaluate_all_contracts,
 )
@@ -214,39 +213,6 @@ def _eval_to_auction_bid(
     return bid_obj, list(ev.best_discard.discard)
 
 
-def best_legal_bid(
-    gs: GameState,
-    player: int,
-    dealer: int,
-    wrappers: dict[str, UltiNetWrapper],
-    auction: AuctionState,
-    min_bid_pts: float,
-    max_discards: int,
-) -> tuple[ContractEval, object, list[Card], list[ContractEval]] | None:
-    """Evaluate contracts and return the best *legal* auction bid.
-
-    Returns ``(ContractEval, Bid, discards, all_evals)`` or ``None``
-    if nothing exceeds the profitability threshold.  The full eval
-    list is returned so callers can use the NN-chosen discard even
-    for Passz / forced bids.
-    """
-    evals = evaluate_all_contracts(
-        gs, player, dealer,
-        wrappers=wrappers,
-        max_discards=max_discards,
-    )
-    if not evals:
-        return None
-    for ev in evals:
-        if ev.game_pts < min_bid_pts:
-            break  # sorted desc — rest are worse
-        r = _eval_to_auction_bid(ev, auction)
-        if r is not None:
-            bid_obj, discards = r
-            return ev, bid_obj, discards, evals
-    return None
-
-
 def nn_discard(evals: list[ContractEval]) -> list[Card]:
     """Pick the best NN-evaluated discard from a list of contract evals.
 
@@ -298,62 +264,37 @@ def decide_bid(
     dealer: int,
     wrappers: dict[str, UltiNetWrapper],
     auction: AuctionState,
-    pickup_eval: PickupEval | None,
     min_bid_pts: float,
-    max_discards: int,
 ) -> tuple[object, list[Card], ContractEval | None]:
     """Decide what to bid with a 12-card hand.
 
     Returns ``(Bid, discards, ContractEval | None)``.
     *ContractEval* is ``None`` only for Passz (no real game).
-
-    Parameters
-    ----------
-    pickup_eval
-        The :class:`PickupEval` from the 10-card decision that led
-        to picking up, or ``None`` if this is the first bidder
-        (who gets the talon automatically).
     """
-    # Evaluate all contracts once — used for profitable bid search
-    # AND for NN-chosen Passz discards.
     evals = evaluate_all_contracts(
         gs, player, dealer,
         wrappers=wrappers,
-        max_discards=max_discards,
     ) if wrappers else []
 
-    # 1. Try to find a profitable, legal bid.
+    # 1. First bidder (no current bid) — profitable bid or Passz.
+    if auction.current_bid is None:
+        for ev in evals:
+            if ev.game_pts < min_bid_pts:
+                break  # sorted desc — rest are worse
+            r = _eval_to_auction_bid(ev, auction)
+            if r is not None:
+                bid_obj, discards = r
+                return bid_obj, discards, ev
+        discards = nn_discard(evals) if evals else fallback_discards(gs.hands[player])
+        return BID_PASSZ, discards, None
+
+    # 2. Picked up (must overbid) — best legal overbid from full NN eval.
     for ev in evals:
-        if ev.game_pts < min_bid_pts:
-            break  # sorted desc — rest are worse
         r = _eval_to_auction_bid(ev, auction)
         if r is not None:
             bid_obj, discards = r
             return bid_obj, discards, ev
-
-    # 2. First bidder, nothing profitable → Passz with NN-chosen discard.
-    if auction.current_bid is None:
-        discards = nn_discard(evals) if evals else fallback_discards(gs.hands[player])
-        return BID_PASSZ, discards, None
-
-    # 3. Picked up but can't overbid profitably — bid the contract
-    #    the 10-card eval found positive, discard the talon back.
-    #    No one else can bid while we hold the talon, so the bid
-    #    rank from pickup_eval is always legal.
-    assert pickup_eval is not None, "stuck in bid without pickup_eval"
-    bid_obj = BID_BY_RANK[pickup_eval.bid_rank]
-    discards = list(auction.talon)
-    forced = ContractEval(
-        contract_key=pickup_eval.contract_key,
-        trump=pickup_eval.trump,
-        is_piros=pickup_eval.is_piros,
-        best_discard=DiscardChoice(
-            discard=tuple(discards), value=0.0, game_pts=0.0,
-        ),
-        game_pts=0.0,
-        stakes_pts=0.0,
-    )
-    return bid_obj, discards, forced
+    raise AssertionError("No legal overbid found after pickup")
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +309,6 @@ def run_auction(
     seat_wrappers: list[dict[str, UltiNetWrapper]],
     *,
     min_bid_pts: float = 0.0,
-    max_discards: int = 15,
 ) -> AuctionResult:
     """Run a competitive 3-player auction.
 
@@ -388,8 +328,6 @@ def run_auction(
         For self-play pass the same dict three times.
     min_bid_pts : float
         Minimum expected per-defender stakes to place a bid.
-    max_discards : int
-        Max discard pairs evaluated per (contract, trump) combination.
     """
     first_bidder = next_player(dealer)
 
@@ -398,7 +336,6 @@ def run_auction(
     a = create_auction(first_bidder, talon)
 
     winning_eval: ContractEval | None = None
-    pickup_evals: dict[int, PickupEval] = {}
 
     while not a.done:
         player = a.turn
@@ -415,8 +352,7 @@ def run_auction(
         if a.awaiting_bid:
             bid_obj, discards, winning_eval = decide_bid(
                 gs, player, dealer, seat_wrappers[player], a,
-                pickup_eval=pickup_evals.get(player),
-                min_bid_pts=min_bid_pts, max_discards=max_discards,
+                min_bid_pts=min_bid_pts,
             )
             for c in discards:
                 gs.hands[player].remove(c)
@@ -428,7 +364,6 @@ def run_auction(
                 min_bid_pts=min_bid_pts,
             )
             if pe is not None:
-                pickup_evals[player] = pe
                 gs.hands[player].extend(a.talon)
                 submit_pickup(a, player)
             else:

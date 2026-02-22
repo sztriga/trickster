@@ -7,6 +7,10 @@ stakes for each.
 The soloist value head (value_fc_sol) is trained on all game
 positions including trick-0 pre-game states, predicting the
 expected game-point payoff from the soloist's perspective.
+
+v2: evaluate_contract calls the encoder directly for each discard
+pair instead of deepcopying the full GameState.  This evaluates all
+C(12,2)=66 discard pairs with zero deepcopy overhead.
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ import numpy as np
 
 from trickster.games.ulti.adapter import UltiGame, UltiNode, build_auction_constraints
 from trickster.games.ulti.cards import Card, Rank, Suit
+from trickster.games.ulti.encoder import UltiEncoder
 from trickster.games.ulti.game import (
     GameState,
     NUM_PLAYERS,
@@ -63,6 +68,7 @@ class ContractEval:
 # ---------------------------------------------------------------------------
 
 _GAME = UltiGame()
+_ENCODER = UltiEncoder()
 
 
 def _make_eval_state(
@@ -158,18 +164,19 @@ def evaluate_contract(
     trump: Suit | None,
     is_piros: bool,
     wrapper: UltiNetWrapper,
-    max_discards: int = 20,
 ) -> ContractEval | None:
     """Evaluate a single contract + trump for the soloist's 12-card hand.
 
-    Tries up to *max_discards* discard pairs (heuristically pruned),
-    returns the best one.  Returns None if the contract is infeasible.
+    Evaluates all C(12,2)=66 discard pairs by calling the encoder
+    directly (no per-pair deepcopy).  Returns the best discard.
+    Returns None if the contract is infeasible.
     """
     hand = gs.hands[soloist]
     assert len(hand) == 12, f"Expected 12-card hand, got {len(hand)}"
 
     # ── Feasibility checks ─────────────────────────────────────────
-    if contract_def.is_betli:
+    betli = contract_def.is_betli
+    if betli:
         trump = None
     else:
         if trump is None:
@@ -179,55 +186,109 @@ def evaluate_contract(
         if contract_def.key == "ulti" and not _hand_has_trump7(hand, trump):
             return None
 
-    # ── Generate candidate discards ────────────────────────────────
+    # ── Pre-compute constant parts (shared across all 66 pairs) ───
+    # Marriage restriction for soloist
+    restrict = None
+    if contract_def.key == "40-100":
+        restrict = "40"
+    elif contract_def.key == "20-100":
+        restrict = "20"
+
+    # Defender marriages (constant — independent of soloist's discard)
+    defender_marriages: list[tuple[int, Suit, int]] = []
+    defender_scores = list(gs.scores)  # copy base scores
+    if not betli and trump is not None:
+        for p in range(NUM_PLAYERS):
+            if p == soloist:
+                continue
+            p_hand_set = set(gs.hands[p])
+            for suit in Suit:
+                if Card(suit, Rank.KING) in p_hand_set and Card(suit, Rank.QUEEN) in p_hand_set:
+                    pts = 40 if suit == trump else 20
+                    defender_marriages.append((p, suit, pts))
+                    defender_scores[p] += pts
+
+    # Contract components (constant)
+    if betli:
+        comps_frozen = frozenset({"betli"})
+    else:
+        comps: set[str] = {"parti"}
+        if "ulti" in contract_def.key or contract_def.key == "ulti":
+            comps.add("ulti")
+        if "40" in contract_def.key:
+            comps.update({"40", "100"})
+        if "20" in contract_def.key:
+            comps.update({"20", "100"})
+        comps_frozen = frozenset(comps)
+
+    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+    encoder = _ENCODER
+
+    # ── Batch encode all 66 discard pairs ─────────────────────────
     all_discards = list(combinations(hand, 2))
-
-    if len(all_discards) > max_discards and not contract_def.is_betli:
-        # Heuristic pruning: prefer discarding low-value non-trump cards.
-        # Also rewards discards that create voids (enabling future trumping).
-        # Score each pair: lower is better to discard.
-        hand_nontump_suits = set(c.suit for c in hand if c.suit != trump)
-
-        def _discard_score(pair: tuple[Card, Card]) -> float:
-            score = 0.0
-            for c in pair:
-                # Penalise discarding trump cards
-                if c.suit == trump:
-                    score += 100
-                # Penalise discarding high-value cards (they score for defenders)
-                score -= c.points()
-                # Penalise discarding cards needed for contract
-                if contract_def.key == "40-100":
-                    if c == Card(trump, Rank.KING) or c == Card(trump, Rank.QUEEN):
-                        score += 1000  # never discard these
-                if contract_def.key == "ulti":
-                    if c == Card(trump, Rank.SEVEN):
-                        score += 1000
-            # Reward void creation: discarding both cards of a side suit
-            # lets us trump that suit later — a major strategic advantage.
-            remaining_suits = set(
-                c.suit for c in hand
-                if c not in pair and c.suit != trump
-            )
-            new_voids = hand_nontump_suits - remaining_suits
-            score -= len(new_voids) * 20
-            return score
-
-        all_discards.sort(key=_discard_score)
-        all_discards = all_discards[:max_discards]
-
-    # ── Batch evaluate all discards ────────────────────────────────
-    feats_batch = []
+    feats_batch: list[np.ndarray] = []
     valid_discards: list[tuple[Card, Card]] = []
 
     for pair in all_discards:
-        try:
-            node = _make_eval_state(
-                gs, soloist, trump, pair, contract_def, is_piros, dealer,
-            )
-        except (ValueError, AssertionError):
-            continue
-        feats = _GAME.encode_state(node, soloist)
+        # Skip discards that remove contract-essential cards
+        if not betli and trump is not None:
+            if contract_def.key == "40-100":
+                if Card(trump, Rank.KING) in pair or Card(trump, Rank.QUEEN) in pair:
+                    continue
+            if contract_def.key == "ulti":
+                if Card(trump, Rank.SEVEN) in pair:
+                    continue
+
+        remaining = [c for c in hand if c not in pair]
+
+        # Compute soloist marriages for this discard
+        soloist_marriages: list[tuple[int, Suit, int]] = []
+        soloist_mar_pts = 0
+        if not betli and trump is not None:
+            declared_20 = False
+            for suit in Suit:
+                k = Card(suit, Rank.KING)
+                q = Card(suit, Rank.QUEEN)
+                if k in remaining and q in remaining:
+                    pts = 40 if suit == trump else 20
+                    if restrict == "40" and pts != 40:
+                        continue
+                    if restrict == "20":
+                        if pts == 40:
+                            continue
+                        if declared_20:
+                            continue
+                        declared_20 = True
+                    soloist_marriages.append((soloist, suit, pts))
+                    soloist_mar_pts += pts
+
+        all_marriages = defender_marriages + soloist_marriages
+        scores = list(defender_scores)
+        scores[soloist] += soloist_mar_pts
+
+        feats = encoder.encode_state(
+            hand=remaining,
+            captured=gs.captured,
+            trick_cards=gs.trick_cards,
+            trump=trump,
+            betli=betli,
+            soloist=soloist,
+            player=soloist,
+            trick_no=gs.trick_no,
+            scores=scores,
+            known_voids=empty_voids,
+            marriages=all_marriages,
+            trick_history=gs.trick_history,
+            contract_components=comps_frozen,
+            is_red=is_piros,
+            is_open=False,
+            bid_rank=1,
+            soloist_saw_talon=True,
+            dealer=dealer,
+            component_kontras=None,
+            talon_cards=list(pair),
+            initial_bidder=-1,
+        )
         feats_batch.append(feats)
         valid_discards.append(pair)
 
@@ -268,9 +329,10 @@ def evaluate_all_contracts(
     soloist: int,
     dealer: int,
     wrappers: dict[str, UltiNetWrapper],
-    max_discards: int = 20,
 ) -> list[ContractEval]:
     """Evaluate all feasible contracts for the soloist's 12-card hand.
+
+    Each contract × trump variant evaluates all C(12,2)=66 discard pairs.
 
     Parameters
     ----------
@@ -278,7 +340,6 @@ def evaluate_all_contracts(
     soloist : player index
     dealer : dealer index
     wrappers : contract_key → UltiNetWrapper (one per trained contract)
-    max_discards : max discard pairs to evaluate per (contract, trump)
 
     Returns
     -------
@@ -300,7 +361,7 @@ def evaluate_all_contracts(
                 ev = evaluate_contract(
                     gs, soloist, dealer, cdef,
                     trump=None, is_piros=is_piros,
-                    wrapper=wrapper, max_discards=max_discards,
+                    wrapper=wrapper,
                 )
                 if ev is not None:
                     results.append(ev)
@@ -310,7 +371,7 @@ def evaluate_all_contracts(
             ev = evaluate_contract(
                 gs, soloist, dealer, cdef,
                 trump=Suit.HEARTS, is_piros=True,
-                wrapper=wrapper, max_discards=max_discards,
+                wrapper=wrapper,
             )
             if ev is not None:
                 results.append(ev)
@@ -323,7 +384,7 @@ def evaluate_all_contracts(
                 ev = evaluate_contract(
                     gs, soloist, dealer, cdef,
                     trump=suit, is_piros=is_piros,
-                    wrapper=wrapper, max_discards=max_discards,
+                    wrapper=wrapper,
                 )
                 if ev is not None:
                     results.append(ev)

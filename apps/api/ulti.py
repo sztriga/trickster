@@ -60,7 +60,6 @@ STRENGTH_PRESETS: dict[str, StrengthPreset] = {
 DEFAULT_STRENGTH = "normal"
 from trickster.bidding.constants import (
     KONTRA_THRESHOLD,
-    MAX_DISCARDS,
     MIN_BID_PTS,
     REKONTRA_THRESHOLD,
 )
@@ -844,7 +843,6 @@ def _advance_ai_auction(sess: UltiSession) -> None:
     the same decision functions used in training and evaluation.
     """
     from trickster.bidding.auction_runner import (
-        PickupEval,
         decide_bid,
         decide_pickup,
     )
@@ -852,8 +850,6 @@ def _advance_ai_auction(sess: UltiSession) -> None:
     a = sess.auction
     if a is None:
         return
-
-    pickup_evals: dict[int, PickupEval] = {}
 
     while not a.done:
         # Auto-pass everyone when no overbid is possible
@@ -871,8 +867,7 @@ def _advance_ai_auction(sess: UltiSession) -> None:
         if a.awaiting_bid:
             bid_obj, discards, ev = decide_bid(
                 sess.state, player, sess.dealer, wrappers, a,
-                pickup_eval=pickup_evals.get(player),
-                min_bid_pts=MIN_BID_PTS, max_discards=MAX_DISCARDS,
+                min_bid_pts=MIN_BID_PTS,
             )
             if ev is not None:
                 sess.nn_chosen_trump = ev.trump
@@ -891,7 +886,6 @@ def _advance_ai_auction(sess: UltiSession) -> None:
                 min_bid_pts=MIN_BID_PTS,
             )
             if pe is not None:
-                pickup_evals[player] = pe
                 hand.extend(a.talon)
                 submit_pickup(a, player)
             else:
@@ -1688,7 +1682,6 @@ def _analyze_bid(
         evals = evaluate_all_contracts(
             sess.state, HUMAN, sess.dealer,
             wrappers=wrappers,
-            max_discards=MAX_DISCARDS,
         )
     finally:
         if restore_hand is not None:
