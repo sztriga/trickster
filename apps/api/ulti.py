@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import random
 import uuid
-from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -65,8 +64,9 @@ from trickster.bidding.constants import (
     MIN_BID_PTS,
     REKONTRA_THRESHOLD,
 )
-from trickster.bidding.evaluator import evaluate_all_contracts, pick_best_bid
-from trickster.bidding.registry import BID_TO_CONTRACT, MAX_SUPPORTED_RANK
+from trickster.bidding.evaluator import evaluate_all_contracts
+from trickster.bidding.auction_runner import CONTRACT_TO_BID_RANK as _CONTRACT_TO_BID_RANK
+from trickster.bidding.registry import MAX_SUPPORTED_RANK
 from trickster.games.ulti.auction import (
     ALL_BIDS,
     AuctionState,
@@ -81,9 +81,6 @@ from trickster.games.ulti.auction import (
     COMP_PARTI,
     COMP_ULTI,
     SUIT_NAMES,
-    ai_bid_after_pickup,
-    ai_initial_bid,
-    ai_should_pickup,
     can_pickup,
     component_value_map,
     contract_loss_value,
@@ -133,17 +130,6 @@ _ulti_game: UltiGame | None = None
 
 # Cache: source name → {contract_key → UltiNetWrapper}
 _wrapper_cache: dict[str, dict[str, UltiNetWrapper]] = {}
-
-# Reverse mapping: (contract_key, is_piros) → bid rank
-_CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
-    v: k for k, v in BID_TO_CONTRACT.items()
-}
-
-# Minimum expected pts/defender for the NN to bid.
-# Matches the pass penalty (-2/defender) so the AI bids whenever it
-# expects to do better than passing.  The value head should learn
-# over training that marginal hands get kontrad and punished.
-
 
 def _get_ulti_game() -> UltiGame:
     global _ulti_game
@@ -838,169 +824,6 @@ def _compute_final_settlement(
 # ---------------------------------------------------------------------------
 
 
-def _ai_should_pickup_nn(
-    sess: UltiSession,
-    player: int,
-    auction: "AuctionState",
-) -> bool:
-    """Blind pickup decision: evaluate the 10-card hand without seeing the talon.
-
-    For each contract type and feasible trump suit, builds a trick-0
-    UltiNode from the 10-card hand (as if discards already happened)
-    and queries the value head.  Returns True if any contract that
-    can legally overbid the current bid has a positive expected payoff.
-    """
-    import copy
-
-    from trickster.bidding.registry import CONTRACT_DEFS, BID_TO_CONTRACT
-
-    source = sess.opponent_sources[player - 1]
-    wrappers = _get_wrappers(source)
-    if not wrappers:
-        return False
-
-    hand = sess.state.hands[player]
-    assert len(hand) == 10
-
-    # Which bid ranks can legally overbid?
-    min_rank = auction.current_bid.rank if auction.current_bid else 0
-    legal_ranks = {r for r in BID_TO_CONTRACT if r > min_rank}
-    if not legal_ranks:
-        return False
-
-    game = _get_ulti_game()
-    suits_in_hand = list(set(c.suit for c in hand))
-
-    for contract_key, wrapper in wrappers.items():
-        cdef = CONTRACT_DEFS.get(contract_key)
-        if cdef is None:
-            continue
-
-        # Build candidate (contract_key, trump, is_piros) combos
-        candidates: list[tuple[Suit | None, bool]] = []
-        if cdef.is_betli:
-            candidates = [(None, False), (None, True)]
-        elif cdef.piros_only:
-            candidates = [(Suit.HEARTS, True)]
-        else:
-            for suit in suits_in_hand:
-                candidates.append((suit, suit == Suit.HEARTS))
-
-        for trump, is_piros in candidates:
-            # Check if the corresponding bid rank is a legal overbid
-            bid_rank = _CONTRACT_TO_BID_RANK.get((contract_key, is_piros))
-            if bid_rank is None or bid_rank not in legal_ranks:
-                continue
-
-            # Feasibility checks on the 10-card hand
-            if not cdef.is_betli and trump is None:
-                continue
-            if contract_key == "40-100" and not any(
-                c.suit == trump and c.rank == Rank.KING for c in hand
-            ):
-                continue
-            if contract_key == "40-100" and not any(
-                c.suit == trump and c.rank == Rank.QUEEN for c in hand
-            ):
-                continue
-            if contract_key == "ulti" and Card(trump, Rank.SEVEN) not in hand:
-                continue
-
-            # Build a trick-0 node from the 10-card hand
-            gs2 = copy.deepcopy(sess.state)
-            gs2.soloist = player
-            betli = cdef.is_betli
-            set_contract(gs2, player, trump=trump, betli=betli)
-            if contract_key == "ulti":
-                gs2.has_ulti = True
-
-            # Marriage restriction
-            restrict = None
-            if contract_key == "40-100":
-                restrict = "40"
-            restrict_arg = restrict
-            declare_all_marriages(gs2, soloist_marriage_restrict=restrict_arg)
-
-            # Contract components
-            if betli:
-                comps = frozenset({"betli"})
-            else:
-                comps_set: set[str] = {"parti"}
-                if "ulti" in contract_key:
-                    comps_set.add("ulti")
-                if "40" in contract_key:
-                    comps_set.update({"40", "100"})
-                comps = frozenset(comps_set)
-
-            constraints = build_auction_constraints(gs2, comps)
-            empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
-
-            node = UltiNode(
-                gs=gs2,
-                known_voids=empty_voids,
-                bid_rank=bid_rank,
-                is_red=is_piros,
-                contract_components=comps,
-                dealer=sess.dealer,
-                must_have=constraints,
-            )
-
-            feats = game.encode_state(node, player)
-            v = float(wrapper.predict_value(feats))
-            if v > 0.0:
-                return True
-
-    return False
-
-
-def _ai_nn_evaluate(sess: UltiSession, player: int) -> "ContractEval | None":
-    """Use the NN value heads to find the best contract for *player*.
-
-    The player must have 12 cards.  Returns the best ContractEval
-    (with discard + trump) or None if nothing beats the bid threshold.
-    """
-    from trickster.bidding.evaluator import ContractEval  # noqa: F811
-
-    source = sess.opponent_sources[player - 1]
-    wrappers = _get_wrappers(source)
-    if not wrappers:
-        return None
-
-    evals = evaluate_all_contracts(
-        sess.state, player, sess.dealer,
-        wrappers=wrappers,
-        max_discards=MAX_DISCARDS,
-    )
-    if not evals:
-        return None
-
-    return pick_best_bid(evals, min_stakes_pts=MIN_BID_PTS)
-
-
-def _nn_eval_to_auction_bid(
-    ev: "ContractEval",
-    auction: AuctionState,
-) -> tuple[Bid, list[Card]] | None:
-    """Convert a ContractEval to an auction Bid + discards.
-
-    Returns None if the corresponding auction Bid is not legal
-    (e.g. too low to overbid the current holder).
-    """
-    bid_rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
-    if bid_rank is None:
-        return None
-
-    bid_obj = BID_BY_RANK.get(bid_rank)
-    if bid_obj is None:
-        return None
-
-    legal = legal_bids(auction)
-    if bid_obj not in legal:
-        return None
-
-    return bid_obj, list(ev.best_discard.discard)
-
-
 def _auction_no_overbid_possible(a: AuctionState) -> bool:
     """True when the current bid is at or above the max supported rank.
 
@@ -1017,25 +840,25 @@ def _auction_no_overbid_possible(a: AuctionState) -> bool:
 def _advance_ai_auction(sess: UltiSession) -> None:
     """Auto-play AI turns in the auction until it's the human's turn or done.
 
-    Uses the NN value heads to decide bidding (which contract, discards,
-    trump) and whether to pick up the talon.  Falls back to heuristics
-    when no model is loaded for a seat.
-
-    When the highest supported bid has been reached, all remaining
-    players (including the human) auto-pass.
+    Uses ``decide_pickup`` and ``decide_bid`` from auction_runner —
+    the same decision functions used in training and evaluation.
     """
+    from trickster.bidding.auction_runner import (
+        PickupEval,
+        decide_bid,
+        decide_pickup,
+    )
+
     a = sess.auction
     if a is None:
         return
 
+    pickup_evals: dict[int, PickupEval] = {}
+
     while not a.done:
         # Auto-pass everyone when no overbid is possible
         if _auction_no_overbid_possible(a):
-            if a.turn == a.holder:
-                # Holder "stands" — auction ends
-                submit_pass(a, a.turn)
-            else:
-                submit_pass(a, a.turn)
+            submit_pass(a, a.turn)
             continue
 
         if a.turn == HUMAN:
@@ -1043,52 +866,32 @@ def _advance_ai_auction(sess: UltiSession) -> None:
 
         player = a.turn
         hand = sess.state.hands[player]
+        wrappers = _get_wrappers(sess.opponent_sources[player - 1])
 
         if a.awaiting_bid:
-            # AI has 12 cards — must discard 2 and bid.
-            nn_eval = _ai_nn_evaluate(sess, player)
-
-            if nn_eval is not None:
-                result = _nn_eval_to_auction_bid(nn_eval, a)
-            else:
-                result = None
-
-            if result is not None:
-                bid, discards = result
-                # Store trump for _resolve_auction
-                sess.nn_chosen_trump = nn_eval.trump
-                # Add bubble for non-Passz bids
-                if bid.rank > BID_PASSZ.rank:
-                    sess.bubbles.append({
-                        "player": player,
-                        "text": bid.label(),
-                    })
-            else:
-                # NN says pass (or no model) — fall back to heuristic Passz
-                if a.current_bid is None:
-                    bid, discards = ai_initial_bid(hand)
-                else:
-                    bid, discards = ai_bid_after_pickup(hand, a)
-
+            bid_obj, discards, ev = decide_bid(
+                sess.state, player, sess.dealer, wrappers, a,
+                pickup_eval=pickup_evals.get(player),
+                min_bid_pts=MIN_BID_PTS, max_discards=MAX_DISCARDS,
+            )
+            if ev is not None:
+                sess.nn_chosen_trump = ev.trump
             for c in discards:
                 hand.remove(c)
-            submit_bid(a, player, bid, discards)
+            submit_bid(a, player, bid_obj, discards)
+            if bid_obj.rank > BID_PASSZ.rank:
+                sess.bubbles.append({
+                    "player": player,
+                    "text": bid_obj.label(),
+                })
 
         else:
-            # AI has 10 cards — decide whether to pick up the talon.
-            # The AI does NOT see the talon; it evaluates only its
-            # 10-card hand to decide if picking up is worthwhile.
-            should_pickup = False
-            source = sess.opponent_sources[player - 1]
-            wrappers = _get_wrappers(source)
-
-            if wrappers and can_pickup(a):
-                should_pickup = _ai_should_pickup_nn(sess, player, a)
-            elif not wrappers:
-                # No model — use heuristic
-                should_pickup = ai_should_pickup(hand, a)
-
-            if should_pickup:
+            pe = decide_pickup(
+                sess.state, player, sess.dealer, wrappers, a,
+                min_bid_pts=MIN_BID_PTS,
+            )
+            if pe is not None:
+                pickup_evals[player] = pe
                 hand.extend(a.talon)
                 submit_pickup(a, player)
             else:
@@ -1154,22 +957,11 @@ def _resolve_auction(sess: UltiSession) -> None:
         if winner == HUMAN:
             sess.phase = "trump_select"
         else:
-            # Use NN-chosen trump if available, otherwise heuristic.
-            if sess.nn_chosen_trump is not None:
-                trump = sess.nn_chosen_trump
-            else:
-                trump = _ai_choose_trump(sess, winner)
-            _setup_contract(sess, bid, trump=trump)
+            assert sess.nn_chosen_trump is not None, (
+                "AI won non-red adu but nn_chosen_trump not set"
+            )
+            _setup_contract(sess, bid, trump=sess.nn_chosen_trump)
             _start_play_phase(sess)
-
-
-def _ai_choose_trump(sess: UltiSession, player: int) -> Suit:
-    """AI picks trump = most common non-Hearts suit in hand."""
-    hand = sess.state.hands[player]
-    counts = Counter(c.suit for c in hand)
-    non_hearts = [(cnt, suit) for suit, cnt in counts.items() if suit != Suit.HEARTS]
-    non_hearts.sort(reverse=True)
-    return non_hearts[0][1] if non_hearts else Suit.ACORNS
 
 
 def _setup_contract(sess: UltiSession, bid: Bid, trump: Suit | None) -> None:
