@@ -188,6 +188,8 @@ def _ort_available() -> bool:
 def _export_role_onnx(net: UltiNet, role: str) -> bytes:
     """Export backbone + one role's heads to an in-memory ONNX model."""
     import io
+    import logging
+    import warnings
 
     class _RoleGraph(nn.Module):
         def __init__(self, backbone, policy_head, value_fc):
@@ -214,21 +216,27 @@ def _export_role_onnx(net: UltiNet, role: str) -> bytes:
     dummy_m = torch.ones(1, net.action_dim, dtype=torch.bool)
 
     buf = io.BytesIO()
-    torch.onnx.export(
-        graph, (dummy_x, dummy_m), buf,
-        input_names=["x", "mask"],
-        output_names=["log_probs", "value"],
-        dynamic_axes={
-            "x": {0: "B"}, "mask": {0: "B"},
-            "log_probs": {0: "B"}, "value": {0: "B"},
-        },
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        logging.disable(logging.WARNING)
+        torch.onnx.export(
+            graph, (dummy_x, dummy_m), buf,
+            input_names=["x", "mask"],
+            output_names=["log_probs", "value"],
+            dynamic_axes={
+                "x": {0: "B"}, "mask": {0: "B"},
+                "log_probs": {0: "B"}, "value": {0: "B"},
+            },
+        )
+        logging.disable(logging.NOTSET)
     return buf.getvalue()
 
 
 def _export_value_onnx(net: UltiNet) -> bytes:
     """Export backbone + soloist value head for batch_value()."""
     import io
+    import logging
+    import warnings
 
     class _ValueGraph(nn.Module):
         def __init__(self, backbone, value_fc):
@@ -244,11 +252,15 @@ def _export_value_onnx(net: UltiNet) -> bytes:
     graph.eval()
 
     buf = io.BytesIO()
-    torch.onnx.export(
-        graph, torch.randn(1, net.input_dim), buf,
-        input_names=["x"], output_names=["value"],
-        dynamic_axes={"x": {0: "B"}, "value": {0: "B"}},
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        logging.disable(logging.WARNING)
+        torch.onnx.export(
+            graph, torch.randn(1, net.input_dim), buf,
+            input_names=["x"], output_names=["value"],
+            dynamic_axes={"x": {0: "B"}, "value": {0: "B"}},
+        )
+        logging.disable(logging.NOTSET)
     return buf.getvalue()
 
 
