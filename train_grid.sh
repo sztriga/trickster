@@ -13,6 +13,9 @@ if [ -d "$VENV_DIR" ]; then
     source "$VENV_DIR/bin/activate"
 fi
 
+export ONNX_LOG_LEVEL=ERROR
+export PYTHONWARNINGS=ignore::UserWarning
+
 WORKERS=$(python3 -c "import os; print(max(1, os.cpu_count() - 1))")
 echo "=== Train grid: $WORKERS workers ==="
 
