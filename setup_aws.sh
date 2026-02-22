@@ -59,7 +59,7 @@ echo "  Done. Using $(python3 --version)"
 # ── Python dependencies ──────────────────────────────
 echo "[3/6] Installing Python packages..."
 pip install -q torch --index-url https://download.pytorch.org/whl/cpu
-pip install -q numpy cython fastapi uvicorn onnxruntime
+pip install -q numpy cython fastapi uvicorn onnxruntime onnxscript
 pip install -e . -q
 echo "  Done."
 
