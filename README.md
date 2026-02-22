@@ -130,7 +130,7 @@ Each tier defines the full training budget — network size, MCTS search depth, 
 | Bishop | 384×4 | 24k | 24k | 80 / 30 |
 | Rook | 512×6 | 24k | 24k | 80 / 30 |
 
-Additional tiers (bronze, silver, gold, hawk, eagle, falcon, oracle) explore volume and search depth dimensions.
+Additional tiers (bronze, silver, gold, hawk, eagle, falcon, trinity, morpheus) explore volume, search depth, and hybrid dimensions.
 
 ### Model Naming
 

@@ -169,12 +169,21 @@ TIERS: dict[str, Tier] = {
         pimc_dets=120, endgame_tricks=8,
         lr_start=1e-3, lr_end=5e-5,
     ),
-    "oracle": Tier(
-        label="Oracle",
-        description="Oracle — max search (256×4, 7k deals)",
-        steps=900, games_per_step=8, train_steps=50, buffer_size=50_000,
-        sol_sims=1000, def_sims=400, sol_dets=16, def_dets=12,
-        pimc_dets=200, endgame_tricks=8,
+    # ── Hybrid branch: big nets × high data volume ──
+    "trinity": Tier(
+        label="Trinity",
+        description="Trinity — bishop net + bronze data (384×4, 96k deals)",
+        steps=6000, games_per_step=16, train_steps=50, buffer_size=100_000,
+        sol_sims=80, def_sims=30,
+        body_units=384, body_layers=4,
+        lr_start=1e-3, lr_end=1e-4,
+    ),
+    "morpheus": Tier(
+        label="Morpheus",
+        description="Morpheus — rook net + silver data (512×6, 288k deals)",
+        steps=12000, games_per_step=24, train_steps=50, buffer_size=200_000,
+        sol_sims=80, def_sims=30, pimc_dets=40,
+        body_units=512, body_layers=6,
         lr_start=1e-3, lr_end=5e-5,
     ),
     # ── GPU branch: large model, requires CUDA ──
