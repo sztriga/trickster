@@ -23,31 +23,21 @@ from trickster.games.ulti.rewards import (  # noqa: F401
 
 
 class ReplayBuffer:
-    """Fixed-capacity replay buffer with reservoir sampling and outcome-balanced batching.
+    """Fixed-capacity replay buffer with reservoir sampling.
 
     Uses **reservoir sampling** (Algorithm R, Vitter 1985) instead of
     FIFO eviction.  Every sample ever pushed has an equal probability
     of being retained, preserving diversity across training history.
     This is what the NFSP paper recommends for the average strategy
     memory (Lanctot et al. 2017).
-
-    Sampling strategy (prevents self-play collapse):
-      1. Soloist experiences are sampled ``soloist_weight`` times more
-         frequently than defender experiences.
-      2. Each mini-batch guarantees at least ``min_positive_frac`` of
-         its samples come from *winning* soloist outcomes (reward > 0).
     """
 
     def __init__(
         self,
         capacity: int = 50_000,
-        soloist_weight: float = 3.0,
-        min_positive_frac: float = 0.15,
         seed: int | None = None,
     ) -> None:
         self.capacity = capacity
-        self.soloist_weight = soloist_weight
-        self.min_positive_frac = min_positive_frac
 
         self._size = 0
         self._total_seen = 0
@@ -132,11 +122,7 @@ class ReplayBuffer:
     def sample(
         self, batch_size: int, rng: np.random.Generator,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Outcome-balanced mini-batch sampling.
-
-        Guarantees a minimum fraction of soloist-win samples in each
-        batch to prevent self-play collapse.  Falls back to pure
-        weighted sampling when there aren't enough winning samples.
+        """Uniform random mini-batch sampling.
 
         Returns
         -------
@@ -149,40 +135,7 @@ class ReplayBuffer:
         """
         n = self._size
         B = min(batch_size, n)
-
-        sol = self._is_soloist[:n]
-        rew = self._rewards[:n]
-
-        # Identify soloist-win indices (the scarce, valuable samples)
-        sol_win_mask = sol & (rew > 0)
-        sol_win_idx = np.where(sol_win_mask)[0]
-        other_idx = np.where(~sol_win_mask)[0]
-
-        # Guarantee a minimum number of soloist-win samples per batch
-        min_sol_win = max(1, int(B * self.min_positive_frac))
-
-        if len(sol_win_idx) >= min_sol_win and len(other_idx) >= (B - min_sol_win):
-            # Stratified draw: reserve min_sol_win slots for soloist wins
-            sw_chosen = rng.choice(
-                sol_win_idx, size=min_sol_win, replace=False,
-            )
-
-            # Fill remaining slots from other samples with role weighting
-            remaining = B - min_sol_win
-            other_weights = np.where(
-                self._is_soloist[other_idx], self.soloist_weight, 1.0,
-            )
-            other_weights /= other_weights.sum()
-            ot_chosen = rng.choice(
-                other_idx, size=remaining, replace=False, p=other_weights,
-            )
-
-            indices = np.concatenate([sw_chosen, ot_chosen])
-        else:
-            # Not enough soloist-win samples — fall back to weighted sampling
-            weights = np.where(sol, self.soloist_weight, 1.0)
-            weights /= weights.sum()
-            indices = rng.choice(n, size=B, replace=False, p=weights)
+        indices = rng.choice(n, size=B, replace=False)
 
         return (
             self._states[indices].copy(),
