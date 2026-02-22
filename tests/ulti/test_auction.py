@@ -350,7 +350,7 @@ class TestComponentValueMap:
     def test_40_100(self):
         bid = BID_BY_RANK[3]
         vm = component_value_map(bid)
-        assert vm == {"40-100": (4, 8)}
+        assert vm == {"40-100": (4, 4)}
 
     def test_betli(self):
         bid = BID_BY_RANK[5]

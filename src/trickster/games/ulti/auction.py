@@ -533,9 +533,9 @@ def component_value_map(bid: Bid) -> dict[str, tuple[int, int]]:
 
     # Base game
     if COMP_100 in comps and COMP_20 in comps:
-        result["20-100"] = (8 * M, 16 * M)
+        result["20-100"] = (8 * M, 8 * M)
     elif COMP_100 in comps and COMP_40 in comps:
-        result["40-100"] = (4 * M, 8 * M)
+        result["40-100"] = (4 * M, 4 * M)
     elif COMP_PARTI in comps and COMP_DURCHMARS not in comps:
         if COMP_ULTI in comps:
             # Compound: parti win=loss=1 (loss penalty comes from the other components)

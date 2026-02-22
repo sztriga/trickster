@@ -73,10 +73,10 @@ def simple_outcome(state: UltiNode, player: int) -> float:
         sol_won_100 = soloist_points(gs) >= 100
         if "20" in comps:
             m = _kontra_mult("20-100")
-            sol_pts += (4.0 if sol_won_100 else -8.0) * m
+            sol_pts += (8.0 if sol_won_100 else -8.0) * m
         else:
             m = _kontra_mult("40-100")
-            sol_pts += (2.0 if sol_won_100 else -4.0) * m
+            sol_pts += (4.0 if sol_won_100 else -4.0) * m
     else:
         parti_won = soloist_won_simple(gs)
         m_parti = _kontra_mult("parti")

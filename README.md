@@ -39,10 +39,10 @@ Playable contracts in ascending bid strength:
 | Contract | Rules | Win / Loss (per defender) |
 |---|---|---|
 | **Piros Parti** | Hearts trump, soloist scores more card points than defenders | +2 / −2 |
-| **40-100** | Soloist has trump K+Q, must reach 100+ card points | +2 / −4 |
+| **40-100** | Soloist has trump K+Q, must reach 100+ card points | +4 / −4 |
 | **Ulti** | Parti + soloist must win last trick with trump 7 | +5 / −9 (combined) |
 | **Betli** | No trump, soloist must take zero tricks | +5 / −5 |
-| **Piros 40-100** | 40-100 with Hearts trump (2x stakes) | +4 / −8 |
+| **Piros 40-100** | 40-100 with Hearts trump (2x stakes) | +8 / −8 |
 | **Piros Ulti** | Ulti with Hearts trump (2x stakes) | +10 / −18 |
 | **Piros Betli** | Betli with 2x stakes (Rebetli) | +10 / −10 |
 
