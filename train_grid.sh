@@ -25,11 +25,5 @@ for tier in "${TIERS[@]}"; do
     python3 scripts/train_e2e.py "$tier" --workers "$WORKERS"
 done
 
-# ── Commit & push ──
 echo ""
-echo "=== Committing models ==="
-git add models/
-git commit -m "Grid search: ${TIERS[*]} ($(date +%Y-%m-%d))"
-git push
-
 echo "=== Done ==="
