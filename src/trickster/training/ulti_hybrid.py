@@ -251,7 +251,7 @@ def train_ulti_hybrid(
 
         executor = ProcessPoolExecutor(
             max_workers=cfg.num_workers,
-            mp_context=mp.get_context("spawn"),
+            mp_context=mp.get_context("forkserver"),
             initializer=_init_worker,
             initargs=(net_kwargs, "cpu"),
         )
