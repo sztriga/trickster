@@ -181,8 +181,8 @@ class BatchInferenceServer:
 
     # ── pass-through (called rarely, no batching needed) ──────────
 
-    def batch_value(self, states: np.ndarray) -> np.ndarray:
-        return self._wrapper.batch_value(states)
+    def batch_bid_value(self, states: np.ndarray) -> np.ndarray:
+        return self._wrapper.batch_bid_value(states)
 
     def predict_auction(self, state_feats: np.ndarray) -> np.ndarray:
         return self._wrapper.predict_auction(state_feats)

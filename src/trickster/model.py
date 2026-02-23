@@ -3,7 +3,8 @@
 Architecture:
     Input → Shared Backbone (L × U + LayerNorm + ReLU)
             ├── Policy Head (sol/def)  → LogSoftmax
-            ├── Value Head  (sol/def)  → unbounded scalar (also used for bidding)
+            ├── Value Head  (sol/def)  → unbounded scalar (trick play)
+            ├── Bid Value Head         → unbounded scalar (trick-0 evaluation)
             └── Auction Head (multi-component)
 
 Inference wrappers (``UltiNetWrapper``, ``make_wrapper``) live in
@@ -81,24 +82,21 @@ def legacy_to_auction_targets(
 class UltiNet(nn.Module):
     """Shared-backbone AlphaZero network for Ulti play + auction.
 
-    Architecture (dual-head with stop-gradient):
+    Architecture:
 
         Input → Shared Backbone (4×256)
                   │
-                  ├─ [detach] → Soloist Policy Head (256→32) + Soloist Value Head (256→1)
-                  ├─ [detach] → Defender Policy Head (256→32) + Defender Value Head (256→1)
-                  │
-                  └─ [grad] → Shared Policy Head (256→32) + Shared Value Head (256→1)
-                               (backbone training signal only)
+                  ├── Soloist Policy Head (256→32) + Soloist Value Head (256→1)
+                  ├── Defender Policy Head (256→32) + Defender Value Head (256→1)
+                  ├── Bid Value Head (256→1)  — trick-0 only
+                  └── Auction Head (multi-component)
 
     During **inference** (MCTS), the correct role head is selected
     based on the ``is_soloist`` flag in the state features.
 
     During **training**, ``forward_dual()`` routes each sample through
-    its role-specific head with ``detach()`` on the backbone output
-    (stop-gradient), so heads never push conflicting gradients to the
-    backbone.  The backbone learns from a shared head that sees all
-    samples with full gradients — purely perceptual features.
+    its role-specific head.  The bid value head is trained separately
+    on trick-0 states via ``forward_bid_value()``.
 
     Parameters
     ----------
@@ -140,15 +138,14 @@ class UltiNet(nn.Module):
             in_dim = body_units
         self.backbone = nn.Sequential(*layers)
 
-        # --- Shared heads (backbone training signal) ---
-        self.policy_head = nn.Linear(body_units, action_dim)
-        self.value_fc = nn.Linear(body_units, 1)
-
-        # --- Role-specific heads (stop-gradient from backbone) ---
+        # --- Role-specific heads ---
         self.policy_head_sol = nn.Linear(body_units, action_dim)
         self.policy_head_def = nn.Linear(body_units, action_dim)
         self.value_fc_sol = nn.Linear(body_units, 1)
         self.value_fc_def = nn.Linear(body_units, 1)
+
+        # --- Bid evaluation head (trick-0 → game outcome) ---
+        self.bid_value_fc = nn.Linear(body_units, 1)
 
         # --- Auction head: shared hidden layer ---
         self.auction_shared = nn.Sequential(
@@ -161,9 +158,9 @@ class UltiNet(nn.Module):
         self.auction_flags = nn.Linear(hidden, NUM_FLAGS)
 
         # Xavier init for all heads
-        for fc in [self.policy_head, self.value_fc,
-                   self.policy_head_sol, self.policy_head_def,
+        for fc in [self.policy_head_sol, self.policy_head_def,
                    self.value_fc_sol, self.value_fc_def,
+                   self.bid_value_fc,
                    self.auction_trump, self.auction_flags]:
             nn.init.xavier_uniform_(fc.weight)
             nn.init.zeros_(fc.bias)
@@ -171,25 +168,6 @@ class UltiNet(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Legacy forward — uses shared heads (backward compat).
-
-        Returns (log_probs, value).
-        """
-        body = self.backbone(x)
-
-        logits = self.policy_head(body)
-        if mask is not None:
-            logits = logits.masked_fill(~mask, -1e9)
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        value = self.value_fc(body).squeeze(-1)
-        return log_probs, value
 
     def forward_role(
         self,
@@ -310,10 +288,10 @@ class UltiNet(nn.Module):
         logits5 = torch.cat([suit_lp, betli_lp], dim=-1)
         return F.log_softmax(logits5, dim=-1)
 
-    def forward_value_only(self, x: torch.Tensor) -> torch.Tensor:
-        """Value head only — used for neural discard evaluation."""
+    def forward_bid_value(self, x: torch.Tensor) -> torch.Tensor:
+        """Bid evaluation head — trained on trick-0 states only."""
         body = self.backbone(x)
-        return self.value_fc(body).squeeze(-1)
+        return self.bid_value_fc(body).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------

@@ -48,7 +48,7 @@ from trickster.games.ulti.game import GameState, deal, next_player, pickup_talon
 def _make_mock_wrapper(value: float = 0.5) -> MagicMock:
     """Create a mock UltiNetWrapper that returns a constant value."""
     w = MagicMock()
-    w.batch_value = lambda states: np.full(len(states), value)
+    w.batch_bid_value = lambda states: np.full(len(states), value)
     w.predict_value = lambda feats: value
     return w
 
@@ -133,7 +133,7 @@ class TestEvaluateContract:
 
         # Use a MagicMock with side_effect so we can inspect calls
         wrapper = MagicMock()
-        wrapper.batch_value = MagicMock(
+        wrapper.batch_bid_value = MagicMock(
             side_effect=lambda states: np.full(len(states), 0.3)
         )
         cdef = CONTRACT_DEFS["parti"]
@@ -145,8 +145,8 @@ class TestEvaluateContract:
         )
 
         assert result is not None
-        # The wrapper was called with batch_value — check shape
-        call_args = wrapper.batch_value.call_args
+        # The wrapper was called with batch_bid_value — check shape
+        call_args = wrapper.batch_bid_value.call_args
         states = call_args[0][0]
         # Should have evaluated all 66 discard pairs
         assert states.shape[0] == 66
@@ -285,7 +285,7 @@ class TestDecideBid:
         wrappers = {}
         for key in ("parti", "betli", "ulti", "40-100"):
             w = MagicMock()
-            w.batch_value = _varied_batch_value
+            w.batch_bid_value = _varied_batch_value
             wrappers[key] = w
 
         bid_obj, discards, ev = decide_bid(
@@ -479,12 +479,12 @@ class TestDirectEncoderMatchesDeepCopy:
         recorded_states = []
         recorded_discards = []
 
-        def _capture_batch_value(states):
+        def _capture_batch_bid_value(states):
             recorded_states.append(states.copy())
             return np.full(len(states), 0.5)
 
         wrapper = MagicMock()
-        wrapper.batch_value = _capture_batch_value
+        wrapper.batch_bid_value = _capture_batch_bid_value
 
         evaluate_contract(
             gs, fb, 0, cdef,
@@ -495,7 +495,7 @@ class TestDirectEncoderMatchesDeepCopy:
         # The new code may skip infeasible discards (contract-essential cards),
         # while the old code would still produce features for them.
         # Build a map from the new path's features.
-        assert len(recorded_states) == 1, "batch_value should be called once"
+        assert len(recorded_states) == 1, "batch_bid_value should be called once"
         new_batch = recorded_states[0]
 
         # Get valid discards from the new path — compare using the wrapper's

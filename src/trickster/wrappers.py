@@ -32,7 +32,7 @@ class UltiNetWrapper:
     Auction phase:
       - ``predict_auction(state_feats) → np.ndarray`` (legacy 5 probs)
       - ``predict_auction_components(state_feats) → (trump_probs, flag_probs)``
-      - ``batch_value(state_batch) → np.ndarray``
+      - ``batch_bid_value(state_batch) → np.ndarray``
     """
 
     # Index of the is_soloist flag in encoded state features
@@ -119,22 +119,12 @@ class UltiNetWrapper:
             probs = log_probs.exp()
         return values.cpu().numpy(), probs.cpu().numpy()
 
-    def batch_value(self, states: np.ndarray) -> np.ndarray:
-        """Evaluate soloist value head on a batch of states.
-
-        Uses the role-specific soloist head (``value_fc_sol``) which is
-        trained by ``forward_dual`` during self-play.  This replaces the
-        old shared ``value_fc`` path which was never updated by the
-        bidding training loop.
-
-        Callers (bidding evaluator, neural discard) always evaluate from
-        the soloist's perspective, so the soloist head is correct here.
-        """
+    def batch_bid_value(self, states: np.ndarray) -> np.ndarray:
+        """Evaluate the dedicated bid value head on a batch of states."""
         self.net.eval()
         with torch.inference_mode():
             x = torch.from_numpy(states).float().to(self.device)
-            body = self.net.backbone(x)
-            values = self.net.value_fc_sol(body).squeeze(-1)
+            values = self.net.forward_bid_value(x)
         return values.cpu().numpy()
 
     def predict_auction(self, state_feats: np.ndarray) -> np.ndarray:

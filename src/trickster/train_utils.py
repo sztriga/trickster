@@ -22,6 +22,45 @@ from trickster.games.ulti.rewards import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
+class BidBuffer:
+    """Ring buffer for (features, reward) pairs from trick-0 bid evaluations.
+
+    Stores only the soloist's trick-0 encoded state and the final game
+    outcome — no masks or policies needed.  Used to train the dedicated
+    ``bid_value_fc`` head.
+    """
+
+    def __init__(
+        self,
+        capacity: int = 10_000,
+        state_dim: int = 293,
+        seed: int = 0,
+    ) -> None:
+        self.capacity = capacity
+        self._states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self._rewards = np.zeros(capacity, dtype=np.float32)
+        self._size = 0
+        self._pos = 0
+        self._rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        return self._size
+
+    def push(self, feats: np.ndarray, reward: float) -> None:
+        self._states[self._pos] = feats
+        self._rewards[self._pos] = reward
+        self._pos = (self._pos + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def sample(
+        self, batch_size: int, rng: np.random.Generator,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n = self._size
+        B = min(batch_size, n)
+        indices = rng.choice(n, size=B, replace=False)
+        return self._states[indices].copy(), self._rewards[indices].copy()
+
+
 class ReplayBuffer:
     """Fixed-capacity replay buffer with reservoir sampling.
 

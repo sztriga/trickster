@@ -59,10 +59,16 @@ from trickster.bidding.constants import (
     PASS_PENALTY,
     REKONTRA_THRESHOLD,
 )
-from trickster.train_utils import ReplayBuffer, simple_outcome, _GAME_PTS_MAX
+from trickster.train_utils import BidBuffer, ReplayBuffer, simple_outcome, _GAME_PTS_MAX
 
 from .model_io import auto_device, estimate_params
-from .ulti_hybrid import _cosine_lr
+
+
+def _cosine_lr(step: int, total_steps: int, lr_start: float, lr_end: float) -> float:
+    if total_steps <= 1:
+        return lr_start
+    frac = step / total_steps
+    return lr_end + 0.5 * (lr_start - lr_end) * (1 + math.cos(math.pi * frac))
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +167,7 @@ class BiddingTrainConfig:
     pass_penalty: float = PASS_PENALTY
     bid_temp_start: float = BID_TEMP_START
     bid_temp_end: float = BID_TEMP_END
+    c_explore: float = 2.0    # UCB exploration constant for contract selection
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
@@ -285,9 +292,10 @@ def _init_bidding_worker(
 
 def _play_bidding_game_in_worker(
     args: tuple,
-) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
+) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], np.ndarray | None, float]:
     """Worker entry-point for parallel bidding self-play."""
-    (all_weights_or_bytes, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict, bid_temp) = args
+    (all_weights_or_bytes, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict,
+     bid_temp, dk_game_counts) = args
 
     for key, sd in all_weights_or_bytes.items():
         _BW_NETS[key].load_state_dict(sd)
@@ -304,6 +312,7 @@ def _play_bidding_game_in_worker(
         _BW_GAME, _BW_WRAPPERS, sol_mcts_cfg, def_mcts_cfg, seed, cfg,
         bid_temp=bid_temp,
         opp_wrappers=opp_w,
+        dk_game_counts=dk_game_counts,
     )
 
 
@@ -392,28 +401,39 @@ def _play_one_bidding_game(
     cfg: BiddingTrainConfig,
     bid_temp: float = 1.0,
     opp_wrappers: dict[str, UltiNetWrapper] | None = None,
-) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
-    """Play one game with softmax-temperature contract selection.
+    dk_game_counts: dict[str, int] | None = None,
+) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], np.ndarray | None, float]:
+    """Play one game with UCB contract selection.
 
-    Instead of a binary explore/exploit split, every game uses the
-    same code path: evaluate all contracts, then sample one using
-    softmax over ``stakes_pts`` with the given temperature.
+    Contract selection uses UCB (Upper Confidence Bound) scoring:
+    each candidate contract gets an exploration bonus inversely
+    proportional to how often it has been played.  This ensures
+    rare contracts (e.g. P.Ulti) get enough training games to
+    escape death spirals where poor play → bad bid head → no games.
+
+    The formula follows the same principle as PUCT in MCTS::
+
+        score = stakes_pts + c * sqrt(ln(total + 1) / (n_dk + 1))
 
     Parameters
     ----------
     bid_temp : float
-        Softmax temperature for contract selection.  High values
-        (e.g. 2.0) are exploratory; low values (e.g. 0.1) are greedy.
+        Softmax temperature applied after UCB scoring.  High values
+        (e.g. 2.0) add randomness; low values (e.g. 0.1) are greedy.
     opp_wrappers : optional
         When provided, defenders use these wrappers for play and kontra
         decisions instead of *wrappers*.  Only soloist samples are
         collected (defender policy is off-policy for the training model).
+    dk_game_counts : optional
+        Per-display-key cumulative game counts for UCB exploration bonus.
+        When None, falls back to flat softmax (no exploration bonus).
 
-    Returns (display_key, samples, predicted_value) where
+    Returns (display_key, samples, trick0_feats, predicted_value) where
     display_key encodes both the contract and whether it's piros
-    (e.g. "p.parti", "ulti").  predicted_value is the value head's
-    bid-time estimate (game_pts) for calibration tracking.
-    Returns ("__pass__", [], 0.0) when everyone passes.
+    (e.g. "p.parti", "ulti").  trick0_feats is the soloist's encoded
+    state at trick 0 (for bid head training).  predicted_value is the
+    value head's bid-time estimate (game_pts) for calibration tracking.
+    Returns ("__pass__", [], None, 0.0) when everyone passes.
     """
     rng = random.Random(seed)
     dealer = seed % 3
@@ -422,16 +442,30 @@ def _play_one_bidding_game(
     # 1. Deal cards
     gs, talon = deal(seed=seed, dealer=dealer)
 
-    # 2. Evaluate all contracts and softmax-sample one
+    # 2. Evaluate all contracts and UCB-sample one
     soloist = next_player(dealer)
     gs.hands[soloist].extend(talon)
     evals = evaluate_all_contracts(gs, soloist, dealer, wrappers=wrappers)
     if not evals:
-        return "__pass__", [], 0.0
+        return "__pass__", [], None, 0.0
 
-    # Softmax sample over stakes_pts with temperature
+    # UCB scoring: exploitation (stakes_pts) + exploration bonus
     pts = np.array([ev.stakes_pts for ev in evals])
-    logits = pts / max(bid_temp, 1e-6)
+
+    if dk_game_counts is not None and cfg.c_explore > 0:
+        total_games = sum(dk_game_counts.values()) + 1  # +1 to avoid ln(0)
+        ln_total = math.log(total_games)
+        bonus = np.array([
+            cfg.c_explore * math.sqrt(ln_total / (dk_game_counts.get(
+                _display_key(ev.contract_key, ev.is_piros), 0) + 1))
+            for ev in evals
+        ])
+        scores = pts + bonus
+    else:
+        scores = pts
+
+    # Softmax sample with temperature
+    logits = scores / max(bid_temp, 1e-6)
     logits -= logits.max()  # numerical stability
     probs = np.exp(logits)
     probs /= probs.sum()
@@ -443,6 +477,9 @@ def _play_one_bidding_game(
         game, gs, soloist, dealer, bid,
         initial_bidder=soloist,
     )
+
+    # Capture trick-0 features for bid value head training
+    trick0_feats = game.encode_state(state, soloist).copy()
 
     # 3. Get wrappers for play
     sol_wrapper = wrappers.get(bid.contract_key)
@@ -530,7 +567,7 @@ def _play_one_bidding_game(
 
     # Predicted bid value for calibration (game_pts from value head at bid time).
     predicted_value = bid.game_pts if bid is not None else 0.0
-    return dkey, samples, predicted_value
+    return dkey, samples, trick0_feats, predicted_value
 
 
 # ---------------------------------------------------------------------------
@@ -583,6 +620,12 @@ def train_with_bidding(
             key=key, net=net, wrapper=wrapper,
             optimizer=optimizer, buffer=buf,
         )
+
+    # Per-contract bid buffers for the bid_value_fc head
+    bid_buffers: dict[str, BidBuffer] = {
+        key: BidBuffer(capacity=10_000, seed=cfg.seed + hash(key) % 10000 + 1)
+        for key in cfg.contract_keys
+    }
 
     # Collect wrappers for bidding (main process, sequential fallback).
     # Sequential self-play uses CPU wrappers; we swap device around SGD.
@@ -673,6 +716,7 @@ def train_with_bidding(
         "pass_penalty": cfg.pass_penalty,
         "bid_temp_start": cfg.bid_temp_start,
         "bid_temp_end": cfg.bid_temp_end,
+        "c_explore": cfg.c_explore,
         "kontra_enabled": cfg.kontra_enabled,
         "contract_keys": cfg.contract_keys,
         "num_workers": 1,
@@ -710,6 +754,7 @@ def train_with_bidding(
             def _collect_result(
                 dkey: str,
                 samples: list,
+                trick0_feats: np.ndarray | None = None,
                 predicted_value: float = 0.0,
             ) -> None:
                 """Route one game's results to the correct slot."""
@@ -727,6 +772,12 @@ def train_with_bidding(
                     slot.buffer.push(s, m, p, r, is_soloist=is_sol, on_policy=on_pol)
                 slot.samples += len(samples)
                 slot.games += 1
+
+                # Push trick-0 sample into bid buffer
+                if trick0_feats is not None:
+                    sol_r = [r for _, _, _, r, is_sol, _ in samples if is_sol]
+                    if sol_r:
+                        bid_buffers[mkey].push(trick0_feats, sol_r[0])
 
                 # Track by display key
                 step_dk_games[dkey] = step_dk_games.get(dkey, 0) + 1
@@ -757,6 +808,8 @@ def train_with_bidding(
                     key: {k: v.cpu() for k, v in slot.net.state_dict().items()}
                     for key, slot in slots.items()
                 }
+                # Snapshot game counts for UCB (shared across all games this step)
+                dk_counts_snapshot = dict(cum_dk_games)
                 tasks = []
                 for g in range(cfg.games_per_step):
                     game_seed = cfg.seed + step * 1000 + g
@@ -767,11 +820,12 @@ def train_with_bidding(
                         game_seed,
                         cfg_dict,
                         cur_bid_temp,
+                        dk_counts_snapshot,
                     ))
-                for dkey, samples, pred_val in executor.map(
+                for dkey, samples, t0_feats, pred_val in executor.map(
                     _play_bidding_game_in_worker, tasks,
                 ):
-                    _collect_result(dkey, samples, pred_val)
+                    _collect_result(dkey, samples, t0_feats, pred_val)
             else:
                 # --- Sequential self-play ---
                 for g in range(cfg.games_per_step):
@@ -782,12 +836,13 @@ def train_with_bidding(
                     if pool_wrappers_list and pool_rng.random() < cfg.pool_frac:
                         opp_w = pool_rng.choice(pool_wrappers_list)
 
-                    dkey, samples, pred_val = _play_one_bidding_game(
+                    dkey, samples, t0_feats, pred_val = _play_one_bidding_game(
                         game, wrappers, sol_cfg, def_cfg, game_seed, cfg,
                         bid_temp=cur_bid_temp,
                         opp_wrappers=opp_w,
+                        dk_game_counts=cum_dk_games,
                     )
-                    _collect_result(dkey, samples, pred_val)
+                    _collect_result(dkey, samples, t0_feats, pred_val)
 
             # -- SGD for each contract that has enough data --
             step_model_vloss: dict[str, float] = {}
@@ -842,6 +897,26 @@ def train_with_bidding(
                 step_model_vloss[key] = avg_v
                 step_model_ploss[key] = avg_p
 
+                slot.net.eval()
+
+            # -- Bid head SGD for each contract --
+            for key, slot in slots.items():
+                bb = bid_buffers[key]
+                if len(bb) < 16:
+                    continue
+                slot.net.train()
+                bid_feats, bid_rewards = bb.sample(
+                    min(cfg.batch_size, len(bb)), np_rng,
+                )
+                bid_pred = slot.net.forward_bid_value(
+                    torch.from_numpy(bid_feats).float().to(device),
+                )
+                bid_target = torch.from_numpy(bid_rewards).float().to(device)
+                bid_loss = F.huber_loss(bid_pred, bid_target, delta=1.0)
+                slot.optimizer.zero_grad()
+                bid_loss.backward()
+                torch.nn.utils.clip_grad_norm_(slot.net.parameters(), 5.0)
+                slot.optimizer.step()
                 slot.net.eval()
 
             # -- Update stats --

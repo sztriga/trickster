@@ -32,11 +32,12 @@ from trickster.training.bidding_loop import (
     DISPLAY_ORDER,
     train_with_bidding,
 )
-from trickster.model import _ort_available
 from trickster.training.model_io import (
     DK_LABELS,
     auto_device,
     estimate_params,
+    load_net,
+    resolve_paths,
 )
 from trickster.training.progress import (
     bidding_progress_bar,
@@ -62,10 +63,7 @@ def train_tier(tier_name: str, args) -> None:
     params = estimate_params(tier.body_units, tier.body_layers)
 
     # Inference/solver backend strings
-    if resolved_device == "cpu":
-        inf_str = "ONNX (CPU)" if _ort_available() else "PyTorch (CPU)"
-    else:
-        inf_str = f"PyTorch ({resolved_device.upper()})"
+    inf_str = f"PyTorch ({resolved_device.upper()})" if resolved_device != "cpu" else "PyTorch (CPU)"
     solver_str = SOLVER_ENGINE
 
     # Warn if GPU tier falls back to CPU (no CUDA)
@@ -98,8 +96,22 @@ def train_tier(tier_name: str, args) -> None:
         print(f"  Self-play: sequential")
     print()
 
-    # ── Training ──
-    print("  Starting from random weights")
+    # ── Load initial weights (warm-start) ──
+    initial_nets = {}
+    if args.from_model:
+        paths = resolve_paths(args.from_model)
+        for key, path in paths.items():
+            net = load_net(path, device="cpu")
+            if net is not None:
+                initial_nets[key] = net
+        if initial_nets:
+            print(f"  Warm-starting from '{args.from_model}' "
+                  f"({len(initial_nets)} contracts loaded)")
+        else:
+            print(f"  WARNING: --from {args.from_model} specified but no models found — "
+                  f"starting from random weights")
+    else:
+        print("  Starting from random weights")
     print()
 
     pool_sources = args.opponent_pool or []
@@ -148,7 +160,7 @@ def train_tier(tier_name: str, args) -> None:
     progress_fn = (bidding_progress_verbose if args.verbose else bidding_progress_bar)(cfg)
     slots, final_stats = train_with_bidding(
         cfg,
-        initial_nets={},
+        initial_nets=initial_nets,
         on_progress=progress_fn,
     )
 
@@ -214,6 +226,9 @@ def main() -> None:
         metavar="TIER",
         help=f"Tier(s) to train: {', '.join(TIERS.keys())}",
     )
+    parser.add_argument("--from", dest="from_model", type=str, default=None,
+                        help="Warm-start from a trained model source "
+                             "(e.g. --from scout)")
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--steps", type=int, default=None,

@@ -6,7 +6,7 @@ import from this module so that the bidding/game-setup code is identical.
 Key design decision — **blind pickup**: in real Ulti the talon is
 face-down.  A player must commit to picking up *before* seeing the
 cards.  The pickup decision uses per-contract value heads: encode
-the 10-card hand with each contract's info → batch_value → pick up
+the 10-card hand with each contract's info → batch_bid_value → pick up
 if the best prediction exceeds the threshold.
 """
 from __future__ import annotations
@@ -179,7 +179,7 @@ def evaluate_pickup(
 
         if feats_list:
             states = np.stack(feats_list)
-            vals = wrapper.batch_value(states)
+            vals = wrapper.batch_bid_value(states)
             idx = int(np.argmax(vals))
             val = float(vals[idx])
             if best is None or val > best.value:
