@@ -11,7 +11,7 @@ Two rule sets depending on contract:
 
 **Betli:**
   - Must follow the led suit.
-  - No must-beat obligation.
+  - Must beat the highest same-suit card (using Betli strength ordering).
   - No trump.
 """
 
@@ -57,19 +57,16 @@ def legal_response(
     led_suit : suit of the first card played this trick
     played_cards : cards already on the table (1 or 2)
     trump : trump suit (None for Betli)
-    betli : if True, no must-beat and no trump obligations
+    betli : if True, must-beat uses Betli strength ordering, no trump obligations
     """
     same_suit = [c for c in hand if c.suit == led_suit]
 
     if same_suit:
-        if betli:
-            return same_suit  # must follow, no must-beat
-
         # Must beat: find highest same-suit card already played
         led_played = [c for c in played_cards if c.suit == led_suit]
         if led_played:
-            max_str = max(c.strength() for c in led_played)
-            higher = [c for c in same_suit if c.strength() > max_str]
+            max_str = max(c.strength(betli=betli) for c in led_played)
+            higher = [c for c in same_suit if c.strength(betli=betli) > max_str]
             if higher:
                 return higher
         return same_suit

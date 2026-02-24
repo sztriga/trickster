@@ -245,7 +245,6 @@ class UltiGame:
             soloist_wins = not soloist_lost_betli(gs)
         else:
             soloist_wins = soloist_won_simple(gs)
-
         is_red = state.is_red
         stake = 2 if is_red else 1  # per-defender stake
 

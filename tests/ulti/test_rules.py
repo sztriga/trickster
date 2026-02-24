@@ -110,14 +110,23 @@ class TestBetli:
         result = legal_response(hand, led_suit, played, trump=None, betli=True)
         assert all(c.suit == H for c in result)
 
-    def test_no_must_beat_in_betli(self):
-        """In Betli, you can play any card of the led suit — no obligation to beat."""
+    def test_must_beat_in_betli(self):
+        """In Betli, must-beat applies (with betli card ordering)."""
         hand = [C(H, Rank.SEVEN), C(H, Rank.ACE), C(B, Rank.KING)]
         led_suit = H
         played = [C(H, Rank.NINE)]
         result = legal_response(hand, led_suit, played, trump=None, betli=True)
-        # Both H7 and HA are legal (no must-beat)
-        assert set(result) == {C(H, Rank.SEVEN), C(H, Rank.ACE)}
+        # Must beat H9: only HA qualifies (H7 is lower)
+        assert set(result) == {C(H, Rank.ACE)}
+
+    def test_must_beat_betli_ten_ordering(self):
+        """In Betli, 10 ranks between 9 and J for must-beat."""
+        hand = [C(H, Rank.SEVEN), C(H, Rank.TEN), C(H, Rank.KING)]
+        led_suit = H
+        played = [C(H, Rank.NINE)]
+        result = legal_response(hand, led_suit, played, trump=None, betli=True)
+        # Must beat H9: H10 and HK qualify (betli: 7<8<9<10<J<Q<K<A)
+        assert set(result) == {C(H, Rank.TEN), C(H, Rank.KING)}
 
     def test_no_trump_obligation_in_betli(self):
         hand = [C(B, Rank.SEVEN), C(A, Rank.KING)]

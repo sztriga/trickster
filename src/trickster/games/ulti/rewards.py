@@ -51,7 +51,7 @@ def simple_outcome(state: UltiNode, player: int) -> float:
     kontras = state.component_kontras
     piros_mult = 2.0 if state.is_red else 1.0
 
-    # ── Betli: standalone, no silent bonuses ───────────────────────
+    # ── Betli: binary win/loss (0 tricks = win) ────────────────────
     if gs.betli:
         soloist_wins = not soloist_lost_betli(gs)
         k = kontras.get("betli", 0)

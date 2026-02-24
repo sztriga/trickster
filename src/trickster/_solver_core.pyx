@@ -322,9 +322,32 @@ cdef void _legal(CState* s, Moves* m) noexcept nogil:
 
         if sc:
             if s.betli:
-                tmp = sc
-                while tmp:
-                    c = _ctz(tmp); m.c[n] = c; n += 1; tmp &= tmp - 1
+                # Must-beat with betli strength ordering
+                ps = 0
+                for i in range(s.tc_n):
+                    if _suit(s.tc_c[i]) == led:
+                        ps |= _bit(s.tc_c[i])
+                if ps:
+                    mx = _max_str(ps, 1)
+                    hi = 0
+                    tmp = sc
+                    while tmp:
+                        c = _ctz(tmp)
+                        if _str_b(c) > mx:
+                            hi |= _bit(c)
+                        tmp &= tmp - 1
+                    if hi:
+                        tmp = hi
+                        while tmp:
+                            c = _ctz(tmp); m.c[n] = c; n += 1; tmp &= tmp - 1
+                    else:
+                        tmp = sc
+                        while tmp:
+                            c = _ctz(tmp); m.c[n] = c; n += 1; tmp &= tmp - 1
+                else:
+                    tmp = sc
+                    while tmp:
+                        c = _ctz(tmp); m.c[n] = c; n += 1; tmp &= tmp - 1
             else:
                 ps = 0
                 for i in range(s.tc_n):
