@@ -449,8 +449,10 @@ def _play_one_bidding_game(
     if not evals:
         return "__pass__", [], None, 0.0
 
-    # UCB scoring: exploitation (stakes_pts) + exploration bonus
-    pts = np.array([ev.stakes_pts for ev in evals])
+    # UCB scoring: exploitation (normalised value) + exploration bonus
+    # Use normalised [-1, 1] values so all contracts compete on the same
+    # scale regardless of reward magnitude (Betli ±10 vs Parti ±0.5).
+    pts = np.array([ev.game_pts / (_GAME_PTS_MAX / 2) for ev in evals])
 
     if dk_game_counts is not None and cfg.c_explore > 0:
         total_games = sum(dk_game_counts.values()) + 1  # +1 to avoid ln(0)
@@ -777,7 +779,7 @@ def train_with_bidding(
                 if trick0_feats is not None:
                     sol_r = [r for _, _, _, r, is_sol, _ in samples if is_sol]
                     if sol_r:
-                        bid_buffers[mkey].push(trick0_feats, sol_r[0])
+                        bid_buffers[mkey].push(trick0_feats, sol_r[0] / 2.0)
 
                 # Track by display key
                 step_dk_games[dkey] = step_dk_games.get(dkey, 0) + 1
