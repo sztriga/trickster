@@ -297,7 +297,7 @@ def evaluate_contract(
 
     # Batch soloist-value-head inference
     states_np = np.stack(feats_batch)
-    values = wrapper.batch_bid_value(states_np)  # (N,) normalised values
+    values = wrapper.batch_value_soloist(states_np)  # (N,) normalised values
 
     # Best discard (max) — used for actual card selection
     best_idx = int(np.argmax(values))

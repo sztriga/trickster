@@ -127,6 +127,24 @@ class UltiNetWrapper:
             values = self.net.forward_bid_value(x)
         return values.cpu().numpy()
 
+    def batch_value_soloist(self, states: np.ndarray) -> np.ndarray:
+        """Evaluate the soloist value head on a batch of states."""
+        self.net.eval()
+        with torch.inference_mode():
+            x = torch.from_numpy(states).float().to(self.device)
+            body = self.net.backbone(x)
+            values = self.net.value_fc_sol(body).squeeze(-1)
+        return values.cpu().numpy()
+
+    def batch_value_defender(self, states: np.ndarray) -> np.ndarray:
+        """Evaluate the defender value head on a batch of states."""
+        self.net.eval()
+        with torch.inference_mode():
+            x = torch.from_numpy(states).float().to(self.device)
+            body = self.net.backbone(x)
+            values = self.net.value_fc_def(body).squeeze(-1)
+        return values.cpu().numpy()
+
     def predict_auction(self, state_feats: np.ndarray) -> np.ndarray:
         """Legacy 5-class auction probabilities."""
         self.net.eval()

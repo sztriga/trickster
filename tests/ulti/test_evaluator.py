@@ -49,6 +49,8 @@ def _make_mock_wrapper(value: float = 0.5) -> MagicMock:
     """Create a mock UltiNetWrapper that returns a constant value."""
     w = MagicMock()
     w.batch_bid_value = lambda states: np.full(len(states), value)
+    w.batch_value_soloist = lambda states: np.full(len(states), value)
+    w.batch_value_defender = lambda states: np.full(len(states), value)
     w.predict_value = lambda feats: value
     return w
 
@@ -133,7 +135,7 @@ class TestEvaluateContract:
 
         # Use a MagicMock with side_effect so we can inspect calls
         wrapper = MagicMock()
-        wrapper.batch_bid_value = MagicMock(
+        wrapper.batch_value_soloist = MagicMock(
             side_effect=lambda states: np.full(len(states), 0.3)
         )
         cdef = CONTRACT_DEFS["parti"]
@@ -145,8 +147,8 @@ class TestEvaluateContract:
         )
 
         assert result is not None
-        # The wrapper was called with batch_bid_value — check shape
-        call_args = wrapper.batch_bid_value.call_args
+        # The wrapper was called with batch_value_soloist — check shape
+        call_args = wrapper.batch_value_soloist.call_args
         states = call_args[0][0]
         # Should have evaluated all 66 discard pairs
         assert states.shape[0] == 66
@@ -207,12 +209,20 @@ class TestDecidePickup:
         a = create_auction(fb, talon)
         submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
 
-        wrappers = _make_wrappers(value=0.8)  # positive
+        # Soloist value high, defender value low → picks up
+        wrappers = {}
+        for key in ("parti", "betli", "ulti", "40-100"):
+            w = MagicMock()
+            w.batch_value_soloist = lambda states: np.full(len(states), 0.8)
+            w.batch_value_defender = lambda states: np.full(len(states), 0.2)
+            w.predict_value = lambda feats: 0.8
+            wrappers[key] = w
 
         result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0)
         assert result is not None
         assert isinstance(result, PickupEval)
         assert result.value > 0.0
+        assert result.value > result.def_value
 
     def test_negative_eval_passes(self):
         gs, talon, fb = _deal_12(seed=42)
@@ -221,7 +231,27 @@ class TestDecidePickup:
         a = create_auction(fb, talon)
         submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
 
-        wrappers = _make_wrappers(value=-0.5)  # negative
+        wrappers = _make_wrappers(value=-0.5)  # negative soloist value
+
+        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0)
+        assert result is None
+
+    def test_defender_value_higher_passes(self):
+        """When defender value > soloist value, player should pass."""
+        gs, talon, fb = _deal_12(seed=42)
+        player = 2
+
+        a = create_auction(fb, talon)
+        submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
+
+        # Soloist value positive but defender value even higher → pass
+        wrappers = {}
+        for key in ("parti", "betli", "ulti", "40-100"):
+            w = MagicMock()
+            w.batch_value_soloist = lambda states: np.full(len(states), 0.3)
+            w.batch_value_defender = lambda states: np.full(len(states), 0.5)
+            w.predict_value = lambda feats: 0.3
+            wrappers[key] = w
 
         result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0)
         assert result is None
@@ -285,7 +315,7 @@ class TestDecideBid:
         wrappers = {}
         for key in ("parti", "betli", "ulti", "40-100"):
             w = MagicMock()
-            w.batch_bid_value = _varied_batch_value
+            w.batch_value_soloist = _varied_batch_value
             wrappers[key] = w
 
         bid_obj, discards, ev = decide_bid(
@@ -479,12 +509,12 @@ class TestDirectEncoderMatchesDeepCopy:
         recorded_states = []
         recorded_discards = []
 
-        def _capture_batch_bid_value(states):
+        def _capture_batch_value_soloist(states):
             recorded_states.append(states.copy())
             return np.full(len(states), 0.5)
 
         wrapper = MagicMock()
-        wrapper.batch_bid_value = _capture_batch_bid_value
+        wrapper.batch_value_soloist = _capture_batch_value_soloist
 
         evaluate_contract(
             gs, fb, 0, cdef,
@@ -495,7 +525,7 @@ class TestDirectEncoderMatchesDeepCopy:
         # The new code may skip infeasible discards (contract-essential cards),
         # while the old code would still produce features for them.
         # Build a map from the new path's features.
-        assert len(recorded_states) == 1, "batch_bid_value should be called once"
+        assert len(recorded_states) == 1, "batch_value_soloist should be called once"
         new_batch = recorded_states[0]
 
         # Get valid discards from the new path — compare using the wrapper's

@@ -85,11 +85,12 @@ _PICKUP_GAME = UltiGame()
 @dataclass
 class PickupEval:
     """Result of 10-card pickup evaluation."""
-    value: float          # best normalised value across eligible contracts
+    value: float          # best normalised soloist value across eligible contracts
     bid_rank: int         # bid rank of the best contract
     contract_key: str     # contract key of the best contract
     is_piros: bool        # whether the best contract is piros
     trump: Suit | None    # trump suit of the best contract
+    def_value: float = 0.0  # conservative defender value (min over trump suits)
 
 
 def evaluate_pickup(
@@ -179,7 +180,7 @@ def evaluate_pickup(
 
         if feats_list:
             states = np.stack(feats_list)
-            vals = wrapper.batch_bid_value(states)
+            vals = wrapper.batch_value_soloist(states)
             idx = int(np.argmax(vals))
             val = float(vals[idx])
             if best is None or val > best.value:
@@ -188,6 +189,67 @@ def evaluate_pickup(
                     value=val, bid_rank=rank,
                     contract_key=ck, is_piros=ip, trump=tr,
                 )
+
+    if best is None:
+        return None
+
+    # ── Defender evaluation ───────────────────────────────────────
+    # Encode the player as a defender of the current contract (from
+    # bid_rank) and evaluate with the defender value head. Try each
+    # trump suit and take the minimum (conservative: assume the
+    # soloist picked the strongest trump for themselves).
+    current_contract = BID_TO_CONTRACT.get(bid_rank)
+    if current_contract is not None:
+        cur_ck, cur_piros = current_contract
+        cur_cdef = CONTRACT_DEFS[cur_ck]
+        cur_wrapper = seat_wrappers.get(cur_ck)
+        if cur_wrapper is not None:
+            def_feats_list: list[np.ndarray] = []
+
+            if cur_cdef.is_betli:
+                # Betli: no trump, single eval
+                trump_variants = [None]
+            else:
+                # Try each possible trump suit
+                trump_variants = list(Suit)
+
+            for def_trump in trump_variants:
+                gs_d = _copy.deepcopy(gs)
+                # Encode player as defender (someone else is soloist)
+                dummy_soloist = (player + 1) % 3
+                gs_d.soloist = dummy_soloist
+                set_contract(gs_d, dummy_soloist, trump=def_trump, betli=cur_cdef.is_betli)
+                gs_d.training_mode = cur_cdef.training_mode
+
+                if cur_cdef.is_betli:
+                    def_comps = frozenset({"betli"})
+                else:
+                    def_comps_set: set[str] = {"parti"}
+                    if cur_ck == "ulti":
+                        def_comps_set.add("ulti")
+                    if "40" in cur_ck:
+                        def_comps_set.update({"40", "100"})
+                    def_comps = frozenset(def_comps_set)
+
+                declare_all_marriages(gs_d)
+                constraints = build_auction_constraints(gs_d, def_comps)
+
+                node_d = UltiNode(
+                    gs=gs_d,
+                    known_voids=empty_voids,
+                    bid_rank=bid_rank,
+                    is_red=cur_piros,
+                    contract_components=def_comps,
+                    dealer=dealer,
+                    must_have=constraints,
+                )
+                feats_d = _PICKUP_GAME.encode_state(node_d, player)
+                def_feats_list.append(feats_d)
+
+            if def_feats_list:
+                def_states = np.stack(def_feats_list)
+                def_vals = cur_wrapper.batch_value_defender(def_states)
+                best.def_value = float(np.min(def_vals))
 
     return best
 
@@ -253,7 +315,7 @@ def decide_pickup(
     current_rank = auction.current_bid.rank if auction.current_bid else 0
     threshold = min_bid_pts * 2 / _GAME_PTS_MAX
     result = evaluate_pickup(gs, player, dealer, wrappers, bid_rank=current_rank)
-    if result is not None and result.value > threshold:
+    if result is not None and result.value > threshold and result.value > result.def_value:
         return result
     return None
 
