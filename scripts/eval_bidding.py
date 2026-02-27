@@ -49,9 +49,9 @@ from trickster.bidding.constants import (
     REKONTRA_THRESHOLD,
 )
 from trickster.train_utils import simple_outcome, _GAME_PTS_MAX
+from trickster.bidding.constants import _display_key
 from trickster.training.bidding_loop import (
     DISPLAY_ORDER,
-    _display_key,
     _kontrable_units,
 )
 from trickster.training.model_io import (

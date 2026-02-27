@@ -35,19 +35,11 @@ import torch
 import torch.nn.functional as F
 
 from trickster.bidding.auction_runner import (
+    run_auction,
     setup_bid_game,
 )
-from trickster.bidding.evaluator import (
-    evaluate_all_contracts,
-)
-from trickster.bidding.registry import CONTRACT_DEFS
 from trickster.games.ulti.adapter import UltiGame, UltiNode
-from trickster.games.ulti.cards import Card
-from trickster.games.ulti.game import (
-    deal,
-    next_player,
-    Suit,
-)
+from trickster.games.ulti.game import deal
 from trickster.hybrid import HybridPlayer
 from trickster.mcts import MCTSConfig
 from trickster.model import UltiNet, UltiNetWrapper, make_wrapper
@@ -58,10 +50,12 @@ from trickster.bidding.constants import (
     MIN_BID_PTS,
     PASS_PENALTY,
     REKONTRA_THRESHOLD,
+    _display_key,
+    _model_key,
 )
 from trickster.train_utils import ReplayBuffer, simple_outcome, _GAME_PTS_MAX
 
-from .model_io import auto_device, estimate_params
+from .model_io import auto_device
 
 
 def _cosine_lr(step: int, total_steps: int, lr_start: float, lr_end: float) -> float:
@@ -69,20 +63,6 @@ def _cosine_lr(step: int, total_steps: int, lr_start: float, lr_end: float) -> f
         return lr_start
     frac = step / total_steps
     return lr_end + 0.5 * (lr_start - lr_end) * (1 + math.cos(math.pi * frac))
-
-
-# ---------------------------------------------------------------------------
-#  Display key helpers
-# ---------------------------------------------------------------------------
-
-def _display_key(contract_key: str, is_piros: bool) -> str:
-    """Create a display key that distinguishes red from non-red."""
-    return f"p.{contract_key}" if is_piros else contract_key
-
-
-def _model_key(display_key: str) -> str:
-    """Strip the piros prefix to get the model/buffer key."""
-    return display_key.removeprefix("p.")
 
 
 # Ordered display keys (ascending bid rank).
@@ -168,6 +148,7 @@ class BiddingTrainConfig:
     bid_temp_start: float = BID_TEMP_START
     bid_temp_end: float = BID_TEMP_END
     c_explore: float = 2.0    # UCB exploration constant for contract selection
+    pickup_explore: float = 0.15  # epsilon-greedy pickup exploration probability
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
@@ -403,23 +384,17 @@ def _play_one_bidding_game(
     opp_wrappers: dict[str, UltiNetWrapper] | None = None,
     dk_game_counts: dict[str, int] | None = None,
 ) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
-    """Play one game with UCB contract selection.
+    """Play one game using the full competitive auction.
 
-    Contract selection uses UCB (Upper Confidence Bound) scoring:
-    each candidate contract gets an exploration bonus inversely
-    proportional to how often it has been played.  This ensures
-    rare contracts (e.g. P.Ulti) get enough training games to
-    escape death spirals where poor play → bad bid head → no games.
-
-    The formula follows the same principle as PUCT in MCTS::
-
-        score = stakes_pts + c * sqrt(ln(total + 1) / (n_dk + 1))
+    Runs ``run_auction()`` with exploration parameters (UCB+softmax
+    for first-bidder contract selection, epsilon-greedy pickup)
+    so training exercises the same auction path as evaluation.
 
     Parameters
     ----------
     bid_temp : float
-        Softmax temperature applied after UCB scoring.  High values
-        (e.g. 2.0) add randomness; low values (e.g. 0.1) are greedy.
+        Softmax temperature for first-bidder contract selection.
+        High values (e.g. 2.0) → exploratory; low (e.g. 0.1) → greedy.
     opp_wrappers : optional
         When provided, defenders use these wrappers for play and kontra
         decisions instead of *wrappers*.  Only soloist samples are
@@ -441,42 +416,34 @@ def _play_one_bidding_game(
     # 1. Deal cards
     gs, talon = deal(seed=seed, dealer=dealer)
 
-    # 2. Evaluate all contracts and UCB-sample one
-    soloist = next_player(dealer)
-    gs.hands[soloist].extend(talon)
-    evals = evaluate_all_contracts(gs, soloist, dealer, wrappers=wrappers)
-    if not evals:
+    # 2. Run a full competitive auction (same as eval)
+    # In pool games the soloist (first bidder) uses the training model;
+    # defenders use the pool model for both bidding and play.
+    if pool_game:
+        seat_w = [opp_wrappers, opp_wrappers, opp_wrappers]
+        fb = (dealer + 1) % 3
+        seat_w[fb] = wrappers
+    else:
+        seat_w = [wrappers, wrappers, wrappers]
+    result = run_auction(
+        gs, talon, dealer, seat_w,
+        min_bid_pts=cfg.min_bid_pts,
+        bid_temp=bid_temp,
+        c_explore=cfg.c_explore,
+        dk_game_counts=dk_game_counts,
+        pickup_explore=cfg.pickup_explore,
+        rng=rng,
+    )
+
+    if result.bid is None:
         return "__pass__", [], 0.0
 
-    # UCB scoring: exploitation (normalised value) + exploration bonus
-    # Use normalised [-1, 1] values so all contracts compete on the same
-    # scale regardless of reward magnitude (Betli ±10 vs Parti ±0.5).
-    pts = np.array([ev.game_pts / (_GAME_PTS_MAX / 2) for ev in evals])
-
-    if dk_game_counts is not None and cfg.c_explore > 0:
-        total_games = sum(dk_game_counts.values()) + 1  # +1 to avoid ln(0)
-        ln_total = math.log(total_games)
-        bonus = np.array([
-            cfg.c_explore * math.sqrt(ln_total / (dk_game_counts.get(
-                _display_key(ev.contract_key, ev.is_piros), 0) + 1))
-            for ev in evals
-        ])
-        scores = pts + bonus
-    else:
-        scores = pts
-
-    # Softmax sample with temperature
-    logits = scores / max(bid_temp, 1e-6)
-    logits -= logits.max()  # numerical stability
-    probs = np.exp(logits)
-    probs /= probs.sum()
-    idx = rng.choices(range(len(evals)), weights=probs.tolist(), k=1)[0]
-    bid = evals[idx]
-
+    bid = result.bid
+    soloist = result.soloist
     dkey = _display_key(bid.contract_key, bid.is_piros)
     state = setup_bid_game(
         game, gs, soloist, dealer, bid,
-        initial_bidder=soloist,
+        initial_bidder=result.initial_bidder,
     )
 
     # 3. Get wrappers for play
@@ -709,6 +676,7 @@ def train_with_bidding(
         "bid_temp_start": cfg.bid_temp_start,
         "bid_temp_end": cfg.bid_temp_end,
         "c_explore": cfg.c_explore,
+        "pickup_explore": cfg.pickup_explore,
         "kontra_enabled": cfg.kontra_enabled,
         "contract_keys": cfg.contract_keys,
         "num_workers": 1,

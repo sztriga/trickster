@@ -266,6 +266,43 @@ class TestDecidePickup:
         result = decide_pickup(gs, player, 0, {}, a)
         assert result is None
 
+    def test_pickup_explore_sometimes_picks_up(self):
+        """With pickup_explore > 0, should sometimes pick up despite defender advantage."""
+        import random
+
+        picked_up_count = 0
+        for s in range(100):
+            gs, talon = deal(seed=42, dealer=0)
+            fb = next_player(0)
+            pickup_talon(gs, fb, talon)
+            player = 2
+
+            a = create_auction(fb, talon)
+            submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
+
+            # Soloist value positive but defender value higher → normally pass
+            wrappers = {}
+            for key in ("parti", "betli", "ulti", "40-100"):
+                w = MagicMock()
+                w.batch_value_soloist = lambda states: np.full(len(states), 0.3)
+                w.batch_value_defender = lambda states: np.full(len(states), 0.5)
+                w.predict_value = lambda feats: 0.3
+                wrappers[key] = w
+
+            rng = random.Random(s)
+            result = decide_pickup(
+                gs, player, 0, wrappers, a,
+                min_bid_pts=0.0,
+                pickup_explore=0.5,
+                rng=rng,
+            )
+            if result is not None:
+                picked_up_count += 1
+
+        # With 50% explore, should pick up a significant fraction
+        assert picked_up_count > 10, f"Only picked up {picked_up_count}/100 times"
+        assert picked_up_count < 90, f"Picked up {picked_up_count}/100 times (too many)"
+
 
 # ---------------------------------------------------------------------------
 #  decide_bid
@@ -366,6 +403,32 @@ class TestDecideBid:
         assert bid_obj == BID_PASSZ
         assert len(discards) == 2
         assert ev is None
+
+    def test_exploratory_bid_temp_varies_selection(self):
+        """With bid_temp > 0, different seeds should sometimes pick different contracts."""
+        import random
+
+        gs_base, talon, fb = _deal_12(seed=42)
+        wrappers = _make_wrappers(value=0.5)
+
+        chosen_keys = set()
+        for s in range(50):
+            gs, _ = deal(seed=42, dealer=0)
+            pickup_talon(gs, fb, talon)
+            a = create_auction(fb, talon)
+            rng = random.Random(s)
+            bid_obj, discards, ev = decide_bid(
+                gs, fb, 0, wrappers, a,
+                min_bid_pts=0.0,
+                bid_temp=2.0,
+                c_explore=2.0,
+                dk_game_counts={"p.parti": 10, "ulti": 1, "betli": 1},
+                rng=rng,
+            )
+            if ev is not None:
+                chosen_keys.add(ev.contract_key)
+        # With enough seeds and high temperature, should pick more than one contract
+        assert len(chosen_keys) > 1, f"Only picked {chosen_keys}"
 
 
 # ---------------------------------------------------------------------------

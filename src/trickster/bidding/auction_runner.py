@@ -12,10 +12,13 @@ if the best prediction exceeds the threshold.
 from __future__ import annotations
 
 import copy as _copy
+import math
+import random
 from dataclasses import dataclass
 
 import numpy as np
 
+from trickster.bidding.constants import _display_key
 from trickster.bidding.evaluator import (
     ContractEval,
     _make_eval_state,
@@ -290,6 +293,44 @@ def fallback_discards(hand: list[Card]) -> list[Card]:
 
 
 # ---------------------------------------------------------------------------
+#  UCB+softmax contract sampling (for exploratory bidding)
+# ---------------------------------------------------------------------------
+
+
+def _ucb_sample(
+    evals: list[ContractEval],
+    bid_temp: float,
+    c_explore: float,
+    dk_game_counts: dict[str, int] | None,
+    rng: random.Random,
+) -> ContractEval:
+    """Sample a contract from *evals* using UCB scoring + softmax.
+
+    Same logic previously inlined in ``_play_one_bidding_game``.
+    """
+    pts = np.array([ev.game_pts / (_GAME_PTS_MAX / 2) for ev in evals])
+
+    if dk_game_counts is not None and c_explore > 0:
+        total_games = sum(dk_game_counts.values()) + 1
+        ln_total = math.log(total_games)
+        bonus = np.array([
+            c_explore * math.sqrt(ln_total / (dk_game_counts.get(
+                _display_key(ev.contract_key, ev.is_piros), 0) + 1))
+            for ev in evals
+        ])
+        scores = pts + bonus
+    else:
+        scores = pts
+
+    logits = scores / max(bid_temp, 1e-6)
+    logits -= logits.max()
+    probs = np.exp(logits)
+    probs /= probs.sum()
+    idx = rng.choices(range(len(evals)), weights=probs.tolist(), k=1)[0]
+    return evals[idx]
+
+
+# ---------------------------------------------------------------------------
 #  High-level per-turn decision functions
 #
 #  Both ``run_auction`` (training/eval) and the live API call these
@@ -304,18 +345,29 @@ def decide_pickup(
     wrappers: dict[str, UltiNetWrapper],
     auction: AuctionState,
     min_bid_pts: float = 0.0,
+    *,
+    pickup_explore: float = 0.0,
+    rng: random.Random | None = None,
 ) -> PickupEval | None:
     """Decide whether to pick up the talon (10-card hand).
 
     Returns a :class:`PickupEval` (with the intended bid rank and trump)
     if the player should pick up, or ``None`` to pass.
+
+    When *pickup_explore* > 0, with that probability the player picks up
+    even when ``sol_value <= def_value`` (epsilon-greedy exploration).
     """
     if not can_pickup(auction) or not wrappers:
         return None
     current_rank = auction.current_bid.rank if auction.current_bid else 0
     threshold = min_bid_pts * 2 / _GAME_PTS_MAX
     result = evaluate_pickup(gs, player, dealer, wrappers, bid_rank=current_rank)
-    if result is not None and result.value > threshold and result.value > result.def_value:
+    if result is None or result.value <= threshold:
+        return None
+    if result.value > result.def_value:
+        return result
+    # Epsilon-greedy: pick up despite defender advantage
+    if pickup_explore > 0 and rng is not None and rng.random() < pickup_explore:
         return result
     return None
 
@@ -327,19 +379,38 @@ def decide_bid(
     wrappers: dict[str, UltiNetWrapper],
     auction: AuctionState,
     min_bid_pts: float,
+    *,
+    bid_temp: float = 0.0,
+    c_explore: float = 0.0,
+    dk_game_counts: dict[str, int] | None = None,
+    rng: random.Random | None = None,
 ) -> tuple[object, list[Card], ContractEval | None]:
     """Decide what to bid with a 12-card hand.
 
     Returns ``(Bid, discards, ContractEval | None)``.
     *ContractEval* is ``None`` only for Passz (no real game).
+
+    When *bid_temp* > 0, UCB+softmax sampling is used instead of
+    greedy selection — both for first bids and overbids.
     """
     evals = evaluate_all_contracts(
         gs, player, dealer,
         wrappers=wrappers,
     ) if wrappers else []
 
-    # 1. First bidder (no current bid) — profitable bid or Passz.
+    # Exploratory: UCB+softmax sample from all legal contracts.
+    if bid_temp > 0 and rng is not None and evals:
+        legal_evals = [ev for ev in evals if _eval_to_auction_bid(ev, auction) is not None]
+        if legal_evals:
+            ev = _ucb_sample(legal_evals, bid_temp, c_explore, dk_game_counts, rng)
+            r = _eval_to_auction_bid(ev, auction)
+            if r is not None:
+                bid_obj, discards = r
+                return bid_obj, discards, ev
+
+    # Greedy fallback.
     if auction.current_bid is None:
+        # First bidder — profitable bid or Passz.
         for ev in evals:
             if ev.game_pts < min_bid_pts:
                 break  # sorted desc — rest are worse
@@ -350,7 +421,7 @@ def decide_bid(
         discards = nn_discard(evals) if evals else fallback_discards(gs.hands[player])
         return BID_PASSZ, discards, None
 
-    # 2. Picked up (must overbid) — best legal overbid from full NN eval.
+    # Picked up (must overbid) — best legal overbid.
     for ev in evals:
         r = _eval_to_auction_bid(ev, auction)
         if r is not None:
@@ -371,6 +442,11 @@ def run_auction(
     seat_wrappers: list[dict[str, UltiNetWrapper]],
     *,
     min_bid_pts: float = 0.0,
+    bid_temp: float = 0.0,
+    c_explore: float = 0.0,
+    dk_game_counts: dict[str, int] | None = None,
+    pickup_explore: float = 0.0,
+    rng: random.Random | None = None,
 ) -> AuctionResult:
     """Run a competitive 3-player auction.
 
@@ -390,6 +466,18 @@ def run_auction(
         For self-play pass the same dict three times.
     min_bid_pts : float
         Minimum expected per-defender stakes to place a bid.
+    bid_temp : float
+        Softmax temperature for first-bidder contract selection.
+        0 = greedy (eval default), >0 = exploratory (training).
+    c_explore : float
+        UCB exploration constant.  Only used when *bid_temp* > 0.
+    dk_game_counts : dict
+        Per-display-key cumulative game counts for UCB bonus.
+    pickup_explore : float
+        Epsilon-greedy pickup exploration probability.
+    rng : random.Random
+        RNG for stochastic decisions.  Required when any exploration
+        parameter is non-zero.
     """
     first_bidder = next_player(dealer)
 
@@ -415,15 +503,25 @@ def run_auction(
             bid_obj, discards, winning_eval = decide_bid(
                 gs, player, dealer, seat_wrappers[player], a,
                 min_bid_pts=min_bid_pts,
+                bid_temp=bid_temp,
+                c_explore=c_explore,
+                dk_game_counts=dk_game_counts,
+                rng=rng,
             )
             for c in discards:
                 gs.hands[player].remove(c)
             submit_bid(a, player, bid_obj, discards)
 
+        elif player == a.holder:
+            # Holder's turn came back — nobody challenged.  Stand.
+            submit_pass(a, player)
+
         else:
             pe = decide_pickup(
                 gs, player, dealer, seat_wrappers[player], a,
                 min_bid_pts=min_bid_pts,
+                pickup_explore=pickup_explore,
+                rng=rng,
             )
             if pe is not None:
                 gs.hands[player].extend(a.talon)

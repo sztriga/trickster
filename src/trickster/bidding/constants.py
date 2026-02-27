@@ -20,12 +20,13 @@ REKONTRA_THRESHOLD: float = 0.8
 #  Bid / pickup evaluation
 # ---------------------------------------------------------------------------
 
-#: Minimum expected per-defender game points to place a bid.
-#: Passed as ``min_bid_pts`` to ``run_auction`` and bidding training.
-MIN_BID_PTS: float = 0.0
-
 #: Per-defender penalty (game points) when all three players pass.
 PASS_PENALTY: float = 2.0
+
+#: Minimum expected per-defender game points to place a bid.
+#: Set to -PASS_PENALTY so the first bidder bids whenever the expected
+#: outcome is better than the guaranteed pass penalty.
+MIN_BID_PTS: float = -PASS_PENALTY
 
 # ---------------------------------------------------------------------------
 #  Softmax temperature for contract selection during training
@@ -36,3 +37,17 @@ BID_TEMP_START: float = 2.0
 
 #: Final temperature (low → greedy).
 BID_TEMP_END: float = 0.1
+
+
+# ---------------------------------------------------------------------------
+#  Display key helpers
+# ---------------------------------------------------------------------------
+
+def _display_key(contract_key: str, is_piros: bool) -> str:
+    """Create a display key that distinguishes red from non-red."""
+    return f"p.{contract_key}" if is_piros else contract_key
+
+
+def _model_key(display_key: str) -> str:
+    """Strip the piros prefix to get the model/buffer key."""
+    return display_key.removeprefix("p.")
