@@ -75,6 +75,7 @@ class AuctionResult:
     bid: ContractEval | None   # None ⇒ all-pass (Passz penalty)
     auction: AuctionState
     initial_bidder: int = -1   # first player to pick up the talon
+    bid_train_data: list[tuple[str, np.ndarray, float]] | None = None  # [(contract_key, feats, game_pts)]
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,62 @@ class AuctionResult:
 
 
 _PICKUP_GAME = UltiGame()
+
+
+def encode_bid_features(
+    gs: GameState,
+    hand: list[Card],
+    contract_key: str,
+    trump: Suit | None,
+    is_piros: bool,
+    dealer: int,
+    player: int,
+    bid_rank: int = 0,
+) -> np.ndarray:
+    """Encode a 10-card hand for bid value head evaluation.
+
+    Builds a game state with the contract's settings and encodes it.
+    The bid value head is trained on 10-card pre-pickup states.
+    """
+    cdef = CONTRACT_DEFS[contract_key]
+    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+
+    gs2 = _copy.deepcopy(gs)
+    gs2.soloist = player
+    set_contract(gs2, player, trump=trump, betli=cdef.is_betli)
+
+    if cdef.key == "ulti":
+        gs2.has_ulti = True
+    gs2.training_mode = cdef.training_mode
+
+    restrict = None
+    if cdef.key == "40-100":
+        restrict = "40"
+    declare_all_marriages(gs2, soloist_marriage_restrict=restrict)
+
+    if cdef.is_betli:
+        comps_frozen = frozenset({"betli"})
+    else:
+        comps: set[str] = {"parti"}
+        if cdef.key == "ulti":
+            comps.add("ulti")
+        if "40" in cdef.key:
+            comps.update({"40", "100"})
+        comps_frozen = frozenset(comps)
+
+    constraints = build_auction_constraints(gs2, comps_frozen)
+
+    node = UltiNode(
+        gs=gs2,
+        known_voids=empty_voids,
+        bid_rank=bid_rank,
+        is_red=is_piros,
+        contract_components=comps_frozen,
+        dealer=dealer,
+        must_have=constraints,
+    )
+    feats = _PICKUP_GAME.encode_state(node, player)
+    return feats
 
 
 @dataclass
@@ -183,7 +240,7 @@ def evaluate_pickup(
 
         if feats_list:
             states = np.stack(feats_list)
-            vals = wrapper.batch_value_soloist(states)
+            vals = wrapper.batch_bid_value(states)
             idx = int(np.argmax(vals))
             val = float(vals[idx])
             if best is None or val > best.value:
@@ -292,6 +349,21 @@ def fallback_discards(hand: list[Card]) -> list[Card]:
     return sorted(hand, key=lambda c: (c.points(), c.strength()))[:2]
 
 
+def extract_player_bid_ranks(auction: AuctionState) -> tuple[int, int, int]:
+    """Extract per-player highest bid rank from auction history.
+
+    Returns a 3-tuple indexed by absolute player index.
+    0 means the player never placed a bid (passed on pickup or Passz).
+    """
+    ranks = [0, 0, 0]
+    for player, action, bid in auction.history:
+        if action == "bid" and bid is not None:
+            # Passz (rank 1) is treated as 0 — it signals weakness, not strength
+            if bid.rank > 1:
+                ranks[player] = max(ranks[player], bid.rank)
+    return (ranks[0], ranks[1], ranks[2])
+
+
 # ---------------------------------------------------------------------------
 #  UCB+softmax contract sampling (for exploratory bidding)
 # ---------------------------------------------------------------------------
@@ -384,11 +456,13 @@ def decide_bid(
     c_explore: float = 0.0,
     dk_game_counts: dict[str, int] | None = None,
     rng: random.Random | None = None,
-) -> tuple[object, list[Card], ContractEval | None]:
+) -> tuple[object, list[Card], ContractEval | None, list[ContractEval]]:
     """Decide what to bid with a 12-card hand.
 
-    Returns ``(Bid, discards, ContractEval | None)``.
+    Returns ``(Bid, discards, ContractEval | None, all_evals)``.
     *ContractEval* is ``None`` only for Passz (no real game).
+    *all_evals* contains all evaluated contracts (empty for Passz
+    without wrappers).
 
     When *bid_temp* > 0, UCB+softmax sampling is used instead of
     greedy selection — both for first bids and overbids.
@@ -406,7 +480,7 @@ def decide_bid(
             r = _eval_to_auction_bid(ev, auction)
             if r is not None:
                 bid_obj, discards = r
-                return bid_obj, discards, ev
+                return bid_obj, discards, ev, evals
 
     # Greedy fallback.
     if auction.current_bid is None:
@@ -417,16 +491,16 @@ def decide_bid(
             r = _eval_to_auction_bid(ev, auction)
             if r is not None:
                 bid_obj, discards = r
-                return bid_obj, discards, ev
+                return bid_obj, discards, ev, evals
         discards = nn_discard(evals) if evals else fallback_discards(gs.hands[player])
-        return BID_PASSZ, discards, None
+        return BID_PASSZ, discards, None, evals
 
     # Picked up (must overbid) — best legal overbid.
     for ev in evals:
         r = _eval_to_auction_bid(ev, auction)
         if r is not None:
             bid_obj, discards = r
-            return bid_obj, discards, ev
+            return bid_obj, discards, ev, evals
     raise AssertionError("No legal overbid found after pickup")
 
 
@@ -486,6 +560,10 @@ def run_auction(
     a = create_auction(first_bidder, talon)
 
     winning_eval: ContractEval | None = None
+    all_evals: list[ContractEval] = []
+    # Track 10-card hand of pickup player (not first bidder) for bid training
+    pickup_player: int = -1
+    pickup_hand_10: list[Card] | None = None
 
     while not a.done:
         player = a.turn
@@ -500,7 +578,7 @@ def run_auction(
             continue
 
         if a.awaiting_bid:
-            bid_obj, discards, winning_eval = decide_bid(
+            bid_obj, discards, winning_eval, all_evals = decide_bid(
                 gs, player, dealer, seat_wrappers[player], a,
                 min_bid_pts=min_bid_pts,
                 bid_temp=bid_temp,
@@ -524,6 +602,9 @@ def run_auction(
                 rng=rng,
             )
             if pe is not None:
+                # Save 10-card hand before extending with talon
+                pickup_player = player
+                pickup_hand_10 = list(gs.hands[player])
                 gs.hands[player].extend(a.talon)
                 submit_pickup(a, player)
             else:
@@ -538,9 +619,28 @@ def run_auction(
             initial_bidder=first_bidder,
         )
 
+    # ── Build bid training data from pickup player's 10-card hand ─────
+    bid_train_data: list[tuple[str, np.ndarray, float]] | None = None
+    if pickup_hand_10 is not None and all_evals:
+        bid_train_data = []
+        # Build a temporary GameState with the 10-card hand for encoding
+        gs_10 = _copy.deepcopy(gs)
+        gs_10.hands[pickup_player] = list(pickup_hand_10)
+        for ev in all_evals:
+            feats = encode_bid_features(
+                gs_10, pickup_hand_10,
+                contract_key=ev.contract_key,
+                trump=ev.trump,
+                is_piros=ev.is_piros,
+                dealer=dealer,
+                player=pickup_player,
+            )
+            bid_train_data.append((ev.contract_key, feats, ev.game_pts))
+
     return AuctionResult(
         soloist=soloist, bid=winning_eval, auction=a,
         initial_bidder=first_bidder,
+        bid_train_data=bid_train_data,
     )
 
 
@@ -556,6 +656,7 @@ def setup_bid_game(
     dealer: int,
     bid: ContractEval,
     initial_bidder: int = -1,
+    player_bid_ranks: tuple[int, int, int] = (0, 0, 0),
 ) -> UltiNode:
     """Build a ready-to-play :class:`UltiNode` from an auction result.
 
@@ -577,6 +678,7 @@ def setup_bid_game(
             gs, soloist, bid.trump, discard_cards,
             cdef, bid.is_piros, dealer,
             initial_bidder=initial_bidder,
+            player_bid_ranks=player_bid_ranks,
         )
     finally:
         if need_restore:

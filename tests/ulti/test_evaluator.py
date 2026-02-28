@@ -213,7 +213,7 @@ class TestDecidePickup:
         wrappers = {}
         for key in ("parti", "betli", "ulti", "40-100"):
             w = MagicMock()
-            w.batch_value_soloist = lambda states: np.full(len(states), 0.8)
+            w.batch_bid_value = lambda states: np.full(len(states), 0.8)
             w.batch_value_defender = lambda states: np.full(len(states), 0.2)
             w.predict_value = lambda feats: 0.8
             wrappers[key] = w
@@ -248,7 +248,7 @@ class TestDecidePickup:
         wrappers = {}
         for key in ("parti", "betli", "ulti", "40-100"):
             w = MagicMock()
-            w.batch_value_soloist = lambda states: np.full(len(states), 0.3)
+            w.batch_bid_value = lambda states: np.full(len(states), 0.3)
             w.batch_value_defender = lambda states: np.full(len(states), 0.5)
             w.predict_value = lambda feats: 0.3
             wrappers[key] = w
@@ -284,7 +284,7 @@ class TestDecidePickup:
             wrappers = {}
             for key in ("parti", "betli", "ulti", "40-100"):
                 w = MagicMock()
-                w.batch_value_soloist = lambda states: np.full(len(states), 0.3)
+                w.batch_bid_value = lambda states: np.full(len(states), 0.3)
                 w.batch_value_defender = lambda states: np.full(len(states), 0.5)
                 w.predict_value = lambda feats: 0.3
                 wrappers[key] = w
@@ -316,7 +316,7 @@ class TestDecideBid:
         a = create_auction(fb, talon)
         wrappers = _make_wrappers(value=0.8)
 
-        bid_obj, discards, ev = decide_bid(
+        bid_obj, discards, ev, _ = decide_bid(
             gs, fb, 0, wrappers, a,
             min_bid_pts=0.0,
         )
@@ -331,7 +331,7 @@ class TestDecideBid:
         a = create_auction(fb, talon)
         wrappers = _make_wrappers(value=-0.5)  # everything negative
 
-        bid_obj, discards, ev = decide_bid(
+        bid_obj, discards, ev, _ = decide_bid(
             gs, fb, 0, wrappers, a,
             min_bid_pts=0.0,
         )
@@ -355,7 +355,7 @@ class TestDecideBid:
             w.batch_value_soloist = _varied_batch_value
             wrappers[key] = w
 
-        bid_obj, discards, ev = decide_bid(
+        bid_obj, discards, ev, _ = decide_bid(
             gs, fb, 0, wrappers, a,
             min_bid_pts=0.0,
         )
@@ -380,7 +380,7 @@ class TestDecideBid:
         # Wrappers with positive value — NN will find a legal overbid
         wrappers = _make_wrappers(value=0.5)
 
-        bid_obj, discards, ev = decide_bid(
+        bid_obj, discards, ev, _ = decide_bid(
             gs, player, 0, wrappers, a,
             min_bid_pts=0.0,
         )
@@ -396,7 +396,7 @@ class TestDecideBid:
         gs, talon, fb = _deal_12(seed=42)
         a = create_auction(fb, talon)
 
-        bid_obj, discards, ev = decide_bid(
+        bid_obj, discards, ev, _ = decide_bid(
             gs, fb, 0, {}, a,
             min_bid_pts=0.0,
         )
@@ -417,7 +417,7 @@ class TestDecideBid:
             pickup_talon(gs, fb, talon)
             a = create_auction(fb, talon)
             rng = random.Random(s)
-            bid_obj, discards, ev = decide_bid(
+            bid_obj, discards, ev, _ = decide_bid(
                 gs, fb, 0, wrappers, a,
                 min_bid_pts=0.0,
                 bid_temp=2.0,

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from trickster.bidding.auction_runner import run_auction, setup_bid_game
+from trickster.bidding.auction_runner import extract_player_bid_ranks, run_auction, setup_bid_game
 from trickster.bidding.constants import (
     KONTRA_THRESHOLD,
     MIN_BID_PTS,
@@ -201,6 +201,7 @@ def _play_one_deal(
     state = setup_bid_game(
         game, gs, soloist, dealer, bid,
         initial_bidder=auction_result.initial_bidder,
+        player_bid_ranks=extract_player_bid_ranks(auction_result.auction),
     )
 
     players: list[HybridPlayer | None] = [None, None, None]

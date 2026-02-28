@@ -80,6 +80,7 @@ def _make_eval_state(
     is_piros: bool,
     dealer: int,
     initial_bidder: int = -1,
+    player_bid_ranks: tuple[int, int, int] = (0, 0, 0),
 ) -> UltiNode:
     """Build a UltiNode ready for value-head evaluation.
 
@@ -136,6 +137,7 @@ def _make_eval_state(
         dealer=dealer,
         initial_bidder=initial_bidder,
         must_have=constraints,
+        player_bid_ranks=player_bid_ranks,
     )
 
 

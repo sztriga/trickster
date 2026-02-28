@@ -865,7 +865,7 @@ def _advance_ai_auction(sess: UltiSession) -> None:
         wrappers = _get_wrappers(sess.opponent_sources[player - 1])
 
         if a.awaiting_bid:
-            bid_obj, discards, ev = decide_bid(
+            bid_obj, discards, ev, _ = decide_bid(
                 sess.state, player, sess.dealer, wrappers, a,
                 min_bid_pts=MIN_BID_PTS,
             )

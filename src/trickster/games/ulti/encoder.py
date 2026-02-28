@@ -32,9 +32,10 @@ v2 upgrades ("detective model"):
   Trick momentum (winners)        10       233
   Auction context                 12       243
   Marriage memory                  6       255
-  Talon cards (soloist only)      32       261
+  Opponent bid ranks               2       261
+  Talon cards (soloist only)      32       263
   ───────────────────────────────────────────────
-  Total                          293
+  Total                          295
 
 Cards are indexed as ``suit_idx * 8 + rank_idx`` (0 .. 31).
 
@@ -96,8 +97,9 @@ _WIN_HIST_OFF = _LEAD_HIST_OFF + TRICKS_PER_GAME  # 10  trick winners
 _AUCTION_OFF = _WIN_HIST_OFF + TRICKS_PER_GAME    # 12  auction context
 _AUCTION_DIM = 12
 _MAR_MEM_OFF = _AUCTION_OFF + _AUCTION_DIM    #  6  marriage memory
-_TALON_OFF = _MAR_MEM_OFF + 6                 # 32  talon cards (soloist only)
-STATE_DIM = _TALON_OFF + NUM_CARDS            # 293
+_OPP_BID_OFF = _MAR_MEM_OFF + 6              #  2  opponent bid ranks
+_TALON_OFF = _OPP_BID_OFF + 2                # 32  talon cards (soloist only)
+STATE_DIM = _TALON_OFF + NUM_CARDS            # 295
 
 # Relative position encoding values
 _REL_ME = 0.33
@@ -161,6 +163,7 @@ class UltiEncoder:
         component_kontras: dict[str, int] | None = None,
         talon_cards: Sequence[Card] | None = None,
         initial_bidder: int = -1,
+        player_bid_ranks: tuple[int, int, int] = (0, 0, 0),
     ) -> np.ndarray:
         """Encode observable state into a 1-D float64 array (259 dims)."""
         x = np.zeros(STATE_DIM, dtype=np.float64)
@@ -297,7 +300,16 @@ class UltiEncoder:
                 x[_MAR_MEM_OFF + p] = pts / 100.0
                 x[_MAR_MEM_OFF + 3 + p] = 1.0 if pts > 0 else 0.0
 
-        # ── Section 15: Talon cards — soloist only (32 binary) ────
+        # ── Section 15: Opponent bid ranks (2) ─────────────────────
+        # Highest bid rank placed by each opponent (relative: left, right).
+        # Normalised by max rank (38).  0 = never bid (passed or no chance).
+        opps_rel = [(player + 1) % NUM_PLAYERS, (player + 2) % NUM_PLAYERS]
+        for oi, opp in enumerate(opps_rel):
+            r = player_bid_ranks[opp]
+            if r > 0:
+                x[_OPP_BID_OFF + oi] = r / max_rank
+
+        # ── Section 16: Talon cards — soloist only (32 binary) ────
         # The soloist knows which 2 cards went to the talon (they
         # discarded them or saw them dealt).  Defenders see zeros.
         if talon_cards and player == soloist:

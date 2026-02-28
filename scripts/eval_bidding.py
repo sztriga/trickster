@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import torch
 
-from trickster.bidding.auction_runner import run_auction, setup_bid_game
+from trickster.bidding.auction_runner import extract_player_bid_ranks, run_auction, setup_bid_game
 from trickster.games.ulti.adapter import UltiGame, UltiNode
 from trickster.games.ulti.game import deal
 from trickster.hybrid import HybridPlayer, SOLVER_ENGINE
@@ -214,6 +214,7 @@ def _play_one_deal(
     state = setup_bid_game(
         game, gs, soloist, dealer, bid,
         initial_bidder=result.initial_bidder,
+        player_bid_ranks=extract_player_bid_ranks(result.auction),
     )
 
     # Build per-seat players (each with their own search config)
@@ -302,47 +303,64 @@ def _pts(raw: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _ci95(values: list[float]) -> tuple[float, float, float]:
+    """Mean, std-error, and 95% CI half-width."""
+    import math
+    n = len(values)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    mean = sum(values) / n
+    if n < 2:
+        return mean, 0.0, 0.0
+    var = sum((v - mean) ** 2 for v in values) / (n - 1)
+    se = math.sqrt(var / n)
+    hw = 1.96 * se
+    return mean, se, hw
+
+
 def _print_results(
     results: list[DealResult],
     seat_labels: list[str],
     elapsed: float,
 ) -> None:
-    import math
-
     N = len(results)
-    seat_col = max(10, *(len(l) + 1 for l in seat_labels))
-    w = 30 + seat_col * 3
 
     print()
-    print("  ┌─ RESULTS " + "─" * (w - 11))
-    print("  │")
+    print("=" * 72)
+    print("  RESULTS")
+    print("=" * 72)
 
-    # ── Overall totals ──────────────────────────────────────────
-    hdr = f"  │  {'':<12}"
+    # ── Overall totals per seat ────────────────────────────────
+    col = max(16, *(len(l) + 2 for l in seat_labels))
+    seat_col = max(10, *(len(l) + 1 for l in seat_labels))
+
+    print()
+    hdr = f"  {'':<12}"
     for sl in seat_labels:
         hdr += f" {sl:>{seat_col}}"
     print(hdr)
-    sep = f"  │  {'─'*12}"
+    sep = f"  {'─'*12}"
     for _ in seat_labels:
         sep += f" {'─'*seat_col}"
     print(sep)
 
     totals = [sum(_pts(r.seat_raw[s]) for r in results) for s in range(3)]
     avgs = [t / N for t in totals]
-    row_tot = f"  │  {'Total pts':<12}"
+    row_tot = f"  {'Total pts':<12}"
     for s in range(3):
         row_tot += f" {totals[s]:>+{seat_col}.1f}"
     print(row_tot)
-    row_avg = f"  │  {'Avg/deal':<12}"
+    row_avg = f"  {'Avg/deal':<12}"
     for s in range(3):
         row_avg += f" {avgs[s]:>+{seat_col}.3f}"
     print(row_avg)
-    print("  │")
 
-    # ── Soloist performance (primary metric) ───────────────────
-    print(f"  │  SOLOIST STRENGTH (avg game-pts when soloist, including pass penalty)")
-    print(f"  │  {'Seat':<12} {'Avg pts':>14} {'Bid%':>5} {'Deals':>5}")
-    print(f"  │  {'─'*12} {'─'*14} {'─'*5} {'─'*5}")
+    print()
+    print("  SOLOIST PERFORMANCE (avg game-points when soloist)")
+    print()
+    print(f"  {'Seat':<{col}} {'Avg sol pts':>18} {'Bid%':>6} {'Sol deals':>10}")
+    print(f"  {'─'*col} {'─'*18} {'─'*6} {'─'*10}")
+
     for seat in range(3):
         sol_all = [r for r in results if r.soloist == seat]
         sol_bid = [r for r in sol_all if r.contract_dkey != "__pass__"]
@@ -351,35 +369,24 @@ def _print_results(
             continue
 
         pts_list = [_pts(r.seat_raw[seat]) for r in sol_all]
-        avg_pts = sum(pts_list) / n_sol
-        std_pts = math.sqrt(sum((p - avg_pts) ** 2 for p in pts_list) / n_sol)
-        se_pts = std_pts / math.sqrt(n_sol)
+        avg, _, hw = _ci95(pts_list)
         bid_pct = len(sol_bid) / n_sol * 100
 
-        print(f"  │  {seat_labels[seat]:<12} {avg_pts:>+6.2f} ± {se_pts:<5.2f} "
-              f"{bid_pct:>4.0f}% {n_sol:>5}")
+        print(f"  {seat_labels[seat]:<{col}} {avg:>+6.3f} ± {hw:.3f} "
+              f"{bid_pct:>5.0f}% {n_sol:>10}")
 
-    # ── Per-contract breakdown ─────────────────────────────────
-    print("  │")
-    print(f"  │  PER-CONTRACT RESULTS (avg pts/deal per seat)")
-    hdr = f"  │  {'Contract':<10} {'Deals':>5}"
-    sep = f"  │  {'─'*10} {'─'*5}"
-    for sl in seat_labels:
-        hdr += f" {sl:>{seat_col}}"
-        sep += f" {'─'*seat_col}"
-    hdr += f"  {'K%':>4}"
-    sep += f"  {'─'*4}"
-    print(hdr)
-    print(sep)
+    # ── Contract distribution ──────────────────────────────────
+    played = [r for r in results if r.contract_dkey != "__pass__"]
+    n_pass = N - len(played)
 
-    n_pass = sum(1 for r in results if r.contract_dkey == "__pass__")
+    print()
+    print("  CONTRACT DISTRIBUTION")
+    print()
+    print(f"  {'Contract':<12} {'Deals':>6} {'%':>5}  {'Avg sol pts':>14} {'K%':>5}")
+    print(f"  {'─'*12} {'─'*6} {'─'*5}  {'─'*14} {'─'*5}")
+
     if n_pass > 0:
-        pass_results = [r for r in results if r.contract_dkey == "__pass__"]
-        row = f"  │  {'Pass':<10} {n_pass:>5}"
-        for seat in range(3):
-            avg = sum(_pts(r.seat_raw[seat]) for r in pass_results) / n_pass
-            row += f" {avg:>+{seat_col}.2f}"
-        print(row)
+        print(f"  {'Pass':<12} {n_pass:>6} {n_pass/N*100:>4.0f}%")
 
     for dk in DISPLAY_ORDER:
         dk_results = [r for r in results if r.contract_dkey == dk]
@@ -387,25 +394,22 @@ def _print_results(
         if n_dk == 0:
             continue
         label = DK_LABELS.get(dk, dk)
-        row = f"  │  {label:<10} {n_dk:>5}"
-        for seat in range(3):
-            avg = sum(_pts(r.seat_raw[seat]) for r in dk_results) / n_dk
-            row += f" {avg:>+{seat_col}.2f}"
+        sol_pts_list = [_pts(r.seat_raw[r.soloist]) for r in dk_results]
+        avg_sol, _, hw_sol = _ci95(sol_pts_list)
         n_kontra = sum(1 for r in dk_results if r.kontrad)
-        row += f"  {n_kontra/n_dk*100:>3.0f}%"
-        print(row)
+        print(f"  {label:<12} {n_dk:>6} {n_dk/N*100:>4.0f}%  "
+              f"{avg_sol:>+6.2f} ± {hw_sol:<5.2f} {n_kontra/n_dk*100:>4.0f}%")
 
-    # ── Summary line ───────────────────────────────────────────
-    played = [r for r in results if r.contract_dkey != "__pass__"]
+    # ── Kontra summary ─────────────────────────────────────────
     if played:
         n_kontra = sum(1 for r in played if r.kontrad)
         n_rekontra = sum(1 for r in played if r.rekontrad)
-        print("  │")
-        print(f"  │  Kontra: {n_kontra}/{len(played)} ({n_kontra/len(played)*100:.0f}%)  "
+        print()
+        print(f"  Kontra: {n_kontra}/{len(played)} ({n_kontra/len(played)*100:.0f}%)  "
               f"Rekontra: {n_rekontra}/{len(played)} ({n_rekontra/len(played)*100:.0f}%)")
 
-    print(f"  │  {N} deals in {elapsed:.0f}s ({N/elapsed:.1f} deals/s)")
-    print("  └" + "─" * w)
+    print(f"  {N} deals in {elapsed:.0f}s ({N/elapsed:.1f} deals/s)")
+    print("=" * 72)
     print()
 
 

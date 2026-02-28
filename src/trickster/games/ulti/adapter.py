@@ -96,6 +96,9 @@ class UltiNode:
     initial_bidder: int = -1
     component_kontras: dict[str, int] = field(default_factory=dict)
     must_have: dict[int, frozenset[Card]] = field(default_factory=dict)
+    # Per-player highest bid rank placed during auction (absolute indices).
+    # 0 means the player never bid (passed on pickup or never had a chance).
+    player_bid_ranks: tuple[int, int, int] = (0, 0, 0)
 
     def clone(self) -> UltiNode:
         return UltiNode(
@@ -109,6 +112,7 @@ class UltiNode:
             initial_bidder=self.initial_bidder,
             component_kontras=dict(self.component_kontras),
             must_have=dict(self.must_have),
+            player_bid_ranks=self.player_bid_ranks,
         )
 
 
@@ -217,6 +221,7 @@ class UltiGame:
             initial_bidder=state.initial_bidder,
             component_kontras=state.component_kontras,
             must_have=state.must_have,
+            player_bid_ranks=state.player_bid_ranks,
         )
 
     def is_terminal(self, state: UltiNode) -> bool:
@@ -379,6 +384,7 @@ class UltiGame:
             initial_bidder=state.initial_bidder,
             component_kontras=state.component_kontras,
             must_have=state.must_have,
+            player_bid_ranks=state.player_bid_ranks,
         )
 
     # -- neural-network encoding (v2 — 259-dim) ----------------------------
@@ -411,6 +417,7 @@ class UltiGame:
             dealer=state.dealer,
             component_kontras=state.component_kontras if state.component_kontras else None,
             initial_bidder=state.initial_bidder,
+            player_bid_ranks=state.player_bid_ranks,
             # v3: soloist sees talon cards
             talon_cards=gs.talon_discards,
         )

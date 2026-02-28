@@ -66,7 +66,7 @@ class TestCardIndex:
 
 class TestEncoder:
     def test_state_dim(self):
-        assert STATE_DIM == 293
+        assert STATE_DIM == 295
 
     def test_encode_state_shape(self):
         state = _make_play_state(seed=1)

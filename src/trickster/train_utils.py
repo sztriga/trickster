@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from trickster.games.ulti.encoder import STATE_DIM
+
 # Re-export reward functions (canonical home: games.ulti.rewards)
 from trickster.games.ulti.rewards import (  # noqa: F401
     _GAME_PTS_MAX,
@@ -33,7 +35,7 @@ class BidBuffer:
     def __init__(
         self,
         capacity: int = 10_000,
-        state_dim: int = 293,
+        state_dim: int = STATE_DIM,
         seed: int = 0,
     ) -> None:
         self.capacity = capacity

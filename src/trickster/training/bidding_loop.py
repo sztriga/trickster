@@ -35,6 +35,7 @@ import torch
 import torch.nn.functional as F
 
 from trickster.bidding.auction_runner import (
+    extract_player_bid_ranks,
     run_auction,
     setup_bid_game,
 )
@@ -53,7 +54,7 @@ from trickster.bidding.constants import (
     _display_key,
     _model_key,
 )
-from trickster.train_utils import ReplayBuffer, simple_outcome, _GAME_PTS_MAX
+from trickster.train_utils import BidBuffer, ReplayBuffer, simple_outcome, _GAME_PTS_MAX
 
 from .model_io import auto_device
 
@@ -148,7 +149,8 @@ class BiddingTrainConfig:
     bid_temp_start: float = BID_TEMP_START
     bid_temp_end: float = BID_TEMP_END
     c_explore: float = 2.0    # UCB exploration constant for contract selection
-    pickup_explore: float = 0.15  # epsilon-greedy pickup exploration probability
+    pickup_explore_start: float = 0.5  # epsilon-greedy pickup exploration (start, high)
+    pickup_explore_end: float = 0.15   # epsilon-greedy pickup exploration (end, low)
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
@@ -273,10 +275,10 @@ def _init_bidding_worker(
 
 def _play_bidding_game_in_worker(
     args: tuple,
-) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
+) -> tuple[str, list, float, list[tuple[str, np.ndarray, float]] | None]:
     """Worker entry-point for parallel bidding self-play."""
     (all_weights_or_bytes, sol_mcts_cfg, def_mcts_cfg, seed, cfg_dict,
-     bid_temp, dk_game_counts) = args
+     bid_temp, pickup_explore, dk_game_counts) = args
 
     for key, sd in all_weights_or_bytes.items():
         _BW_NETS[key].load_state_dict(sd)
@@ -292,6 +294,7 @@ def _play_bidding_game_in_worker(
     return _play_one_bidding_game(
         _BW_GAME, _BW_WRAPPERS, sol_mcts_cfg, def_mcts_cfg, seed, cfg,
         bid_temp=bid_temp,
+        pickup_explore=pickup_explore,
         opp_wrappers=opp_w,
         dk_game_counts=dk_game_counts,
     )
@@ -381,9 +384,10 @@ def _play_one_bidding_game(
     seed: int,
     cfg: BiddingTrainConfig,
     bid_temp: float = 1.0,
+    pickup_explore: float = 0.15,
     opp_wrappers: dict[str, UltiNetWrapper] | None = None,
     dk_game_counts: dict[str, int] | None = None,
-) -> tuple[str, list[tuple[np.ndarray, np.ndarray, np.ndarray, float, bool]], float]:
+) -> tuple[str, list, float, list[tuple[str, np.ndarray, float]] | None]:
     """Play one game using the full competitive auction.
 
     Runs ``run_auction()`` with exploration parameters (UCB+softmax
@@ -395,6 +399,8 @@ def _play_one_bidding_game(
     bid_temp : float
         Softmax temperature for first-bidder contract selection.
         High values (e.g. 2.0) → exploratory; low (e.g. 0.1) → greedy.
+    pickup_explore : float
+        Epsilon-greedy pickup exploration probability.
     opp_wrappers : optional
         When provided, defenders use these wrappers for play and kontra
         decisions instead of *wrappers*.  Only soloist samples are
@@ -431,19 +437,21 @@ def _play_one_bidding_game(
         bid_temp=bid_temp,
         c_explore=cfg.c_explore,
         dk_game_counts=dk_game_counts,
-        pickup_explore=cfg.pickup_explore,
+        pickup_explore=pickup_explore,
         rng=rng,
     )
 
     if result.bid is None:
-        return "__pass__", [], 0.0
+        return "__pass__", [], 0.0, None
 
     bid = result.bid
     soloist = result.soloist
     dkey = _display_key(bid.contract_key, bid.is_piros)
+    pbr = extract_player_bid_ranks(result.auction)
     state = setup_bid_game(
         game, gs, soloist, dealer, bid,
         initial_bidder=result.initial_bidder,
+        player_bid_ranks=pbr,
     )
 
     # 3. Get wrappers for play
@@ -532,7 +540,7 @@ def _play_one_bidding_game(
 
     # Predicted bid value for calibration (game_pts from value head at bid time).
     predicted_value = bid.game_pts if bid is not None else 0.0
-    return dkey, samples, predicted_value
+    return dkey, samples, predicted_value, result.bid_train_data
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +652,12 @@ def train_with_bidding(
     cum_dk_wins: dict[str, int] = {dk: 0 for dk in DISPLAY_ORDER}
     calibration: dict[str, CalibrationRecord] = {}
 
+    # -- Bid value buffers (one per contract key) --
+    bid_buffers: dict[str, BidBuffer] = {
+        key: BidBuffer(capacity=10_000, seed=cfg.seed + hash(key) % 10000)
+        for key in cfg.contract_keys
+    }
+
     # -- Parallel pool --
     executor = None
     net_kwargs = {
@@ -676,7 +690,8 @@ def train_with_bidding(
         "bid_temp_start": cfg.bid_temp_start,
         "bid_temp_end": cfg.bid_temp_end,
         "c_explore": cfg.c_explore,
-        "pickup_explore": cfg.pickup_explore,
+        "pickup_explore_start": cfg.pickup_explore_start,
+        "pickup_explore_end": cfg.pickup_explore_end,
         "kontra_enabled": cfg.kontra_enabled,
         "contract_keys": cfg.contract_keys,
         "num_workers": 1,
@@ -704,6 +719,7 @@ def train_with_bidding(
 
             # -- Anneal bid temperature: high (exploratory) → low (greedy) --
             cur_bid_temp = _cosine_lr(step, cfg.steps, cfg.bid_temp_start, cfg.bid_temp_end)
+            cur_pickup_explore = _cosine_lr(step, cfg.steps, cfg.pickup_explore_start, cfg.pickup_explore_end)
 
             # -- Self-play --
             step_dk_games: dict[str, int] = {dk: 0 for dk in DISPLAY_ORDER}
@@ -715,6 +731,7 @@ def train_with_bidding(
                 dkey: str,
                 samples: list,
                 predicted_value: float = 0.0,
+                bid_train_data: list[tuple[str, np.ndarray, float]] | None = None,
             ) -> None:
                 """Route one game's results to the correct slot."""
                 nonlocal step_passes
@@ -731,6 +748,14 @@ def train_with_bidding(
                     slot.buffer.push(s, m, p, r, is_soloist=is_sol, on_policy=on_pol)
                 slot.samples += len(samples)
                 slot.games += 1
+
+                # Push bid training data to per-contract BidBuffers
+                if bid_train_data is not None:
+                    for contract_key, feats, game_pts in bid_train_data:
+                        if contract_key in bid_buffers:
+                            # Normalise game_pts to match value head scale
+                            reward = game_pts / (_GAME_PTS_MAX / 2)
+                            bid_buffers[contract_key].push(feats, reward)
 
                 # Track by display key
                 step_dk_games[dkey] = step_dk_games.get(dkey, 0) + 1
@@ -773,12 +798,13 @@ def train_with_bidding(
                         game_seed,
                         cfg_dict,
                         cur_bid_temp,
+                        cur_pickup_explore,
                         dk_counts_snapshot,
                     ))
-                for dkey, samples, pred_val in executor.map(
+                for dkey, samples, pred_val, btd in executor.map(
                     _play_bidding_game_in_worker, tasks,
                 ):
-                    _collect_result(dkey, samples, pred_val)
+                    _collect_result(dkey, samples, pred_val, btd)
             else:
                 # --- Sequential self-play ---
                 for g in range(cfg.games_per_step):
@@ -789,13 +815,14 @@ def train_with_bidding(
                     if pool_wrappers_list and pool_rng.random() < cfg.pool_frac:
                         opp_w = pool_rng.choice(pool_wrappers_list)
 
-                    dkey, samples, pred_val = _play_one_bidding_game(
+                    dkey, samples, pred_val, btd = _play_one_bidding_game(
                         game, wrappers, sol_cfg, def_cfg, game_seed, cfg,
                         bid_temp=cur_bid_temp,
+                        pickup_explore=cur_pickup_explore,
                         opp_wrappers=opp_w,
                         dk_game_counts=cum_dk_games,
                     )
-                    _collect_result(dkey, samples, pred_val)
+                    _collect_result(dkey, samples, pred_val, btd)
 
             # -- SGD for each contract that has enough data --
             step_model_vloss: dict[str, float] = {}
@@ -850,6 +877,24 @@ def train_with_bidding(
                 step_model_vloss[key] = avg_v
                 step_model_ploss[key] = avg_p
 
+                slot.net.eval()
+
+            # -- SGD for bid_value_fc (per-contract) --
+            for key, slot in slots.items():
+                bb = bid_buffers[key]
+                if len(bb) < 16:
+                    continue
+                slot.net.train()
+                bid_feats, bid_rewards = bb.sample(min(cfg.batch_size, len(bb)), np_rng)
+                bid_pred = slot.net.forward_bid_value(
+                    torch.from_numpy(bid_feats).float().to(device),
+                )
+                bid_target = torch.from_numpy(bid_rewards).float().to(device)
+                bid_loss = F.huber_loss(bid_pred, bid_target, delta=1.0)
+                slot.optimizer.zero_grad()
+                bid_loss.backward()
+                torch.nn.utils.clip_grad_norm_(slot.net.parameters(), 5.0)
+                slot.optimizer.step()
                 slot.net.eval()
 
             # -- Update stats --
