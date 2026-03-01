@@ -57,6 +57,10 @@ from trickster.games.ulti.game import (
 
 _ALL_CARDS: frozenset[Card] = frozenset(make_deck())
 
+EMPTY_VOIDS: tuple[frozenset[Suit], frozenset[Suit], frozenset[Suit]] = (
+    frozenset[Suit](), frozenset[Suit](), frozenset[Suit]()
+)
+
 _IDX_TO_CARD: dict[int, Card] = {idx: card for card, idx in _CARD_IDX.items()}
 
 # Maximum game-point outcome (piros Parti soloist win: 2 stake × 2 defenders)
@@ -552,10 +556,9 @@ class UltiGame:
         # Detect red (Hearts trump) — doubled stakes in real Ulti
         is_red = (gs.trump is not None and gs.trump == Suit.HEARTS)
 
-        empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
         return UltiNode(
             gs=gs,
-            known_voids=empty_voids,
+            known_voids=EMPTY_VOIDS,
             bid_rank=1,  # Passz rank as default for training
             is_red=is_red,
             contract_components=comps,

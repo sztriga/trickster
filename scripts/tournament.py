@@ -40,6 +40,7 @@ from trickster.bidding.constants import (
     KONTRA_THRESHOLD,
     MIN_BID_PTS,
     PASS_PENALTY,
+    PICKUP_QUANTILE_OVERRIDES,
     REKONTRA_THRESHOLD,
 )
 from trickster.games.ulti.adapter import UltiGame, UltiNode
@@ -173,6 +174,7 @@ def _play_one_deal(
     auction_result = run_auction(
         gs, talon, dealer, seat_wrappers,
         min_bid_pts=min_bid_pts,
+        quantile_overrides=PICKUP_QUANTILE_OVERRIDES,
     )
     soloist = auction_result.soloist
     bid = auction_result.bid

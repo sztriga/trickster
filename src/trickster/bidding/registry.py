@@ -22,6 +22,29 @@ class ContractDef:
     is_betli: bool = False  # betli has special rules (no trump, pick up talon)
     piros_only: bool = False  # can only be played as piros (Hearts trump)
 
+    @property
+    def components(self) -> frozenset[str]:
+        """Win-condition component set for this contract."""
+        if self.is_betli:
+            return frozenset({"betli"})
+        comps: set[str] = {"parti"}
+        if self.key == "ulti":
+            comps.add("ulti")
+        if "40" in self.key:
+            comps.update({"40", "100"})
+        if "20" in self.key:
+            comps.update({"20", "100"})
+        return frozenset(comps)
+
+    @property
+    def marriage_restriction(self) -> str | None:
+        """Soloist marriage restriction: ``"40"`` / ``"20"`` / ``None``."""
+        if self.key == "40-100":
+            return "40"
+        elif self.key == "20-100":
+            return "20"
+        return None
+
 
 # ---------------------------------------------------------------------------
 #  All supported contracts
@@ -77,6 +100,11 @@ BID_TO_CONTRACT: dict[int, tuple[str, bool]] = {
     8:  ("40-100", True),    # Piros 40-100
     10: ("ulti",   True),    # Piros ulti
     11: ("betli",  True),    # Piros betli / Rebetli (10/10 pts)
+}
+
+# Reverse mapping: (contract_key, is_piros) → bid rank
+CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
+    v: k for k, v in BID_TO_CONTRACT.items()
 }
 
 # Sorted bid ranks we can play (ascending by strength)

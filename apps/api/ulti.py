@@ -61,10 +61,11 @@ DEFAULT_STRENGTH = "normal"
 from trickster.bidding.constants import (
     KONTRA_THRESHOLD,
     MIN_BID_PTS,
+    PICKUP_QUANTILE_OVERRIDES,
     REKONTRA_THRESHOLD,
 )
 from trickster.bidding.evaluator import evaluate_all_contracts
-from trickster.bidding.auction_runner import CONTRACT_TO_BID_RANK as _CONTRACT_TO_BID_RANK
+from trickster.bidding.registry import CONTRACT_TO_BID_RANK as _CONTRACT_TO_BID_RANK
 from trickster.bidding.registry import MAX_SUPPORTED_RANK
 from trickster.games.ulti.auction import (
     ALL_BIDS,
@@ -80,6 +81,7 @@ from trickster.games.ulti.auction import (
     COMP_PARTI,
     COMP_ULTI,
     SUIT_NAMES,
+    SUPPORTED_BID_RANKS,
     can_pickup,
     component_value_map,
     contract_loss_value,
@@ -385,7 +387,6 @@ def _public_state(sess: UltiSession) -> dict[str, Any]:
         if a.turn == HUMAN and not a.done:
             if a.awaiting_bid:
                 # Human must bid — show legal bids
-                from trickster.games.ulti.auction import SUPPORTED_BID_RANKS
                 legal_bid_list = [
                     _bid_json(b) for b in legal_bids(a)
                     if b.rank in SUPPORTED_BID_RANKS
@@ -884,6 +885,7 @@ def _advance_ai_auction(sess: UltiSession) -> None:
             pe = decide_pickup(
                 sess.state, player, sess.dealer, wrappers, a,
                 min_bid_pts=MIN_BID_PTS,
+                quantile_overrides=PICKUP_QUANTILE_OVERRIDES,
             )
             if pe is not None:
                 hand.extend(a.talon)
@@ -1678,28 +1680,18 @@ def _analyze_bid(
     else:
         return {"contracts": [], "recommendation": "Várakozás…"}
 
+    min_rank = a.current_bid.rank if a.current_bid else 0
     try:
         evals = evaluate_all_contracts(
             sess.state, HUMAN, sess.dealer,
             wrappers=wrappers,
+            min_bid_rank=min_rank,
         )
     finally:
         if restore_hand is not None:
             sess.state.hands[HUMAN] = restore_hand
 
-    # Filter to only legal overbids (rank must beat current bid)
-    min_rank = a.current_bid.rank if a.current_bid else 0
-    from trickster.games.ulti.auction import SUPPORTED_BID_RANKS
-
-    def _is_legal_eval(ev) -> bool:
-        rank = _CONTRACT_TO_BID_RANK.get((ev.contract_key, ev.is_piros))
-        if rank is None:
-            return False
-        if rank not in SUPPORTED_BID_RANKS:
-            return False
-        return rank > min_rank
-
-    legal_evals = [ev for ev in evals if _is_legal_eval(ev)]
+    legal_evals = evals
 
     contracts = []
     for ev in legal_evals[:8]:  # top 8 legal options

@@ -1,24 +1,22 @@
 """Shared auction logic for training and evaluation.
 
-Both ``bidding_loop.py`` (training) and ``eval_bidding.py`` (evaluation)
-import from this module so that the bidding/game-setup code is identical.
-
 Key design decision — **blind pickup**: in real Ulti the talon is
 face-down.  A player must commit to picking up *before* seeing the
-cards.  The pickup decision uses per-contract value heads: encode
-the 10-card hand with each contract's info → batch_bid_value → pick up
-if the best prediction exceeds the threshold.
+cards.  The pickup decision uses *Kermit-style talon enumeration*:
+sample random talon contents, evaluate each as a 12-card hand using
+the already-trained soloist value head, and average the results.
 """
 from __future__ import annotations
 
-import copy as _copy
+import copy
+import itertools
 import math
 import random
 from dataclasses import dataclass
 
 import numpy as np
 
-from trickster.bidding.constants import _display_key
+from trickster.bidding.constants import PASS_PENALTY, PICKUP_QUANTILE_OVERRIDES, _display_key
 from trickster.bidding.evaluator import (
     ContractEval,
     _make_eval_state,
@@ -27,10 +25,11 @@ from trickster.bidding.evaluator import (
 from trickster.bidding.registry import (
     BID_TO_CONTRACT,
     CONTRACT_DEFS,
+    CONTRACT_TO_BID_RANK,
     MAX_SUPPORTED_RANK,
     SUPPORTED_BID_RANKS,
 )
-from trickster.games.ulti.adapter import UltiGame, UltiNode, build_auction_constraints
+from trickster.games.ulti.adapter import EMPTY_VOIDS, UltiGame, UltiNode, build_auction_constraints
 from trickster.games.ulti.auction import (
     AuctionState,
     BID_BY_RANK,
@@ -42,7 +41,7 @@ from trickster.games.ulti.auction import (
     submit_pass,
     submit_pickup,
 )
-from trickster.games.ulti.cards import Card, Suit
+from trickster.games.ulti.cards import Card, Suit, make_deck
 from trickster.games.ulti.game import (
     GameState,
     declare_all_marriages,
@@ -51,15 +50,6 @@ from trickster.games.ulti.game import (
 )
 from trickster.model import UltiNetWrapper
 from trickster.train_utils import _GAME_PTS_MAX
-
-
-# ---------------------------------------------------------------------------
-#  Reverse mapping: (contract_key, is_piros) → bid rank
-# ---------------------------------------------------------------------------
-
-CONTRACT_TO_BID_RANK: dict[tuple[str, bool], int] = {
-    v: k for k, v in BID_TO_CONTRACT.items()
-}
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +92,9 @@ def encode_bid_features(
     The bid value head is trained on 10-card pre-pickup states.
     """
     cdef = CONTRACT_DEFS[contract_key]
-    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+    empty_voids = EMPTY_VOIDS
 
-    gs2 = _copy.deepcopy(gs)
+    gs2 = copy.deepcopy(gs)
     gs2.soloist = player
     set_contract(gs2, player, trump=trump, betli=cdef.is_betli)
 
@@ -112,20 +102,9 @@ def encode_bid_features(
         gs2.has_ulti = True
     gs2.training_mode = cdef.training_mode
 
-    restrict = None
-    if cdef.key == "40-100":
-        restrict = "40"
-    declare_all_marriages(gs2, soloist_marriage_restrict=restrict)
+    declare_all_marriages(gs2, soloist_marriage_restrict=cdef.marriage_restriction)
 
-    if cdef.is_betli:
-        comps_frozen = frozenset({"betli"})
-    else:
-        comps: set[str] = {"parti"}
-        if cdef.key == "ulti":
-            comps.add("ulti")
-        if "40" in cdef.key:
-            comps.update({"40", "100"})
-        comps_frozen = frozenset(comps)
+    comps_frozen = cdef.components
 
     constraints = build_auction_constraints(gs2, comps_frozen)
 
@@ -153,111 +132,139 @@ class PickupEval:
     def_value: float = 0.0  # conservative defender value (min over trump suits)
 
 
+_ALL_CARDS_SET = frozenset(make_deck())
+
+
 def evaluate_pickup(
     gs: GameState,
     player: int,
     dealer: int,
     seat_wrappers: dict[str, UltiNetWrapper],
     bid_rank: int = 0,
+    n_talon_samples: int = 20,
+    rng: random.Random | None = None,
+    pickup_quantile: float = 0.5,
+    quantile_overrides: dict[str, float] | None = None,
 ) -> PickupEval | None:
-    """Evaluate a 10-card hand for pickup using per-contract value heads.
+    """Evaluate a 10-card hand for pickup using Kermit-style talon enumeration.
 
-    Builds a proper game state for each eligible contract (with trump,
-    marriages, constraints — same as the 12-card evaluator, just without
-    discards).  Only considers contracts that can legally overbid the
-    current bid.  Returns the best evaluation, or None if no contract
-    is eligible.
+    Samples random 2-card talons from the unknown cards, extends the hand
+    to 12 cards, and evaluates each via ``evaluate_all_contracts`` using
+    the already-trained soloist value head.
+
+    Each contract is evaluated independently across all talon samples.
+    The *pickup_quantile* (default 0.5 = median) is computed per-contract
+    on that contract's own game_pts distribution.  The contract with the
+    highest quantile value wins.
+
+    Per-contract quantile overrides (via *quantile_overrides*) let you
+    set a stricter gate for specific contracts (e.g. betli).
     """
     hand = gs.hands[player]
-
-    # Count suits for trump selection
-    suit_counts: dict[Suit, int] = {}
-    for c in hand:
-        suit_counts[c.suit] = suit_counts.get(c.suit, 0) + 1
-    sorted_suits = sorted(suit_counts, key=lambda s: suit_counts[s], reverse=True)
-
-    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
-    best: PickupEval | None = None
-
-    for contract_key, wrapper in seat_wrappers.items():
-        cdef = CONTRACT_DEFS[contract_key]
-
-        if cdef.is_betli:
-            variants = [(None, False), (None, True)]  # betli, P.betli
-        elif cdef.piros_only:
-            variants = [(Suit.HEARTS, True)]
-        else:
-            variants = []
-            for suit in sorted_suits[:2]:
-                variants.append((suit, suit == Suit.HEARTS))
-            if Suit.HEARTS not in sorted_suits[:2] and Suit.HEARTS in suit_counts:
-                variants.append((Suit.HEARTS, True))
-
-        feats_list: list[np.ndarray] = []
-        variant_info: list[tuple[int, str, bool, Suit | None]] = []
-        for trump, is_piros in variants:
-            overbid_rank = CONTRACT_TO_BID_RANK.get((contract_key, is_piros))
-            if overbid_rank is None or overbid_rank <= bid_rank:
-                continue
-
-            gs2 = _copy.deepcopy(gs)
-            gs2.soloist = player
-            set_contract(gs2, player, trump=trump, betli=cdef.is_betli)
-
-            if cdef.key == "ulti":
-                gs2.has_ulti = True
-            gs2.training_mode = cdef.training_mode
-
-            restrict = None
-            if cdef.key == "40-100":
-                restrict = "40"
-            declare_all_marriages(gs2, soloist_marriage_restrict=restrict)
-
-            if cdef.is_betli:
-                comps_frozen = frozenset({"betli"})
-            else:
-                comps: set[str] = {"parti"}
-                if cdef.key == "ulti":
-                    comps.add("ulti")
-                if "40" in cdef.key:
-                    comps.update({"40", "100"})
-                comps_frozen = frozenset(comps)
-
-            constraints = build_auction_constraints(gs2, comps_frozen)
-
-            node = UltiNode(
-                gs=gs2,
-                known_voids=empty_voids,
-                bid_rank=overbid_rank,
-                is_red=is_piros,
-                contract_components=comps_frozen,
-                dealer=dealer,
-                must_have=constraints,
-            )
-            feats = _PICKUP_GAME.encode_state(node, player)
-            feats_list.append(feats)
-            variant_info.append((overbid_rank, contract_key, is_piros, trump))
-
-        if feats_list:
-            states = np.stack(feats_list)
-            vals = wrapper.batch_bid_value(states)
-            idx = int(np.argmax(vals))
-            val = float(vals[idx])
-            if best is None or val > best.value:
-                rank, ck, ip, tr = variant_info[idx]
-                best = PickupEval(
-                    value=val, bid_rank=rank,
-                    contract_key=ck, is_piros=ip, trump=tr,
-                )
-
-    if best is None:
+    if len(hand) != 10:
         return None
 
-    # ── Defender evaluation ───────────────────────────────────────
+    rng = rng or random.Random()
+
+    # Cards the player cannot see: full deck minus their hand
+    unknown = list(_ALL_CARDS_SET - set(hand))
+    n_unknown = len(unknown)
+    if n_unknown < 2:
+        return None
+
+    # Total possible talons; sample min(K, total) without replacement
+    total_combos = n_unknown * (n_unknown - 1) // 2
+    k = min(n_talon_samples, total_combos)
+
+    if k >= total_combos:
+        # Enumerate all
+        talon_samples = list(itertools.combinations(unknown, 2))
+    else:
+        # Random sample of k unique 2-card combos
+        talon_samples = []
+        seen: set[tuple[int, int]] = set()
+        while len(talon_samples) < k:
+            pair = tuple(sorted(rng.sample(range(n_unknown), 2)))
+            if pair not in seen:
+                seen.add(pair)
+                talon_samples.append((unknown[pair[0]], unknown[pair[1]]))
+
+    # ── Evaluate each sampled talon ───────────────────────────────
+    # Collect game_pts per contract across all talon samples.
+    contract_pts: dict[tuple[str, bool], list[float]] = {}
+
+    for talon_pair in talon_samples:
+        gs_copy = copy.deepcopy(gs)
+        gs_copy.hands[player] = list(hand) + list(talon_pair)
+
+        evals = evaluate_all_contracts(
+            gs_copy, player, dealer, wrappers=seat_wrappers,
+            min_bid_rank=bid_rank,
+        )
+        if not evals:
+            continue
+
+        for ev in evals:
+            ck_key = (ev.contract_key, ev.is_piros)
+            if ck_key not in contract_pts:
+                contract_pts[ck_key] = []
+            contract_pts[ck_key].append(ev.game_pts)
+
+    if not contract_pts:
+        return None
+
+    # ── Per-contract quantile selection ────────────────────────────
+    # Compute the quantile value for each contract independently,
+    # using the override quantile if one exists for that contract.
+    best_ck: tuple[str, bool] | None = None
+    best_qval = -float("inf")
+
+    for ck_key, pts_list in contract_pts.items():
+        ck, is_piros = ck_key
+        q = pickup_quantile
+        if quantile_overrides and ck in quantile_overrides:
+            q = quantile_overrides[ck]
+        pts_list.sort()
+        idx = int(len(pts_list) * q)
+        idx = min(idx, len(pts_list) - 1)
+        qval = pts_list[idx]
+        if qval > best_qval:
+            best_qval = qval
+            best_ck = ck_key
+
+    if best_ck is None:
+        return None
+
+    win_ck, win_piros = best_ck
+    win_rank = CONTRACT_TO_BID_RANK.get((win_ck, win_piros), 0)
+    win_cdef = CONTRACT_DEFS[win_ck]
+    value = best_qval / (_GAME_PTS_MAX / 2)
+
+    win_trump: Suit | None = None
+    if not win_cdef.is_betli:
+        # Infer trump from most common suit in hand (heuristic for PickupEval)
+        suit_counts: dict[Suit, int] = {}
+        for c in hand:
+            suit_counts[c.suit] = suit_counts.get(c.suit, 0) + 1
+        if win_piros:
+            win_trump = Suit.HEARTS
+        else:
+            win_trump = max(suit_counts, key=suit_counts.get)
+
+    best = PickupEval(
+        value=value,
+        bid_rank=win_rank,
+        contract_key=win_ck,
+        is_piros=win_piros,
+        trump=win_trump,
+    )
+
+    # ── Defender evaluation (unchanged) ───────────────────────────
     # Encode the player as a defender of the current contract (from
     # bid_rank) and evaluate with the defender value head. Try each
     # trump suit and take the minimum (conservative: assume the
     # soloist picked the strongest trump for themselves).
+    empty_voids = EMPTY_VOIDS
     current_contract = BID_TO_CONTRACT.get(bid_rank)
     if current_contract is not None:
         cur_ck, cur_piros = current_contract
@@ -267,29 +274,18 @@ def evaluate_pickup(
             def_feats_list: list[np.ndarray] = []
 
             if cur_cdef.is_betli:
-                # Betli: no trump, single eval
                 trump_variants = [None]
             else:
-                # Try each possible trump suit
                 trump_variants = list(Suit)
 
             for def_trump in trump_variants:
-                gs_d = _copy.deepcopy(gs)
-                # Encode player as defender (someone else is soloist)
+                gs_d = copy.deepcopy(gs)
                 dummy_soloist = (player + 1) % 3
                 gs_d.soloist = dummy_soloist
                 set_contract(gs_d, dummy_soloist, trump=def_trump, betli=cur_cdef.is_betli)
                 gs_d.training_mode = cur_cdef.training_mode
 
-                if cur_cdef.is_betli:
-                    def_comps = frozenset({"betli"})
-                else:
-                    def_comps_set: set[str] = {"parti"}
-                    if cur_ck == "ulti":
-                        def_comps_set.add("ulti")
-                    if "40" in cur_ck:
-                        def_comps_set.update({"40", "100"})
-                    def_comps = frozenset(def_comps_set)
+                def_comps = cur_cdef.components
 
                 declare_all_marriages(gs_d)
                 constraints = build_auction_constraints(gs_d, def_comps)
@@ -402,12 +398,56 @@ def _ucb_sample(
     return evals[idx]
 
 
+def _ucb_sample_with_passz(
+    evals: list[ContractEval],
+    bid_temp: float,
+    c_explore: float,
+    dk_game_counts: dict[str, int] | None,
+    rng: random.Random,
+) -> tuple[bool, ContractEval | None]:
+    """Like :func:`_ucb_sample` but includes a synthetic Passz option.
+
+    Returns ``(is_passz, ev)``.  When *is_passz* is ``True``, *ev* is
+    ``None`` — the caller should return Passz.
+    """
+    # Normalised score for Passz: first bidder pays 2 pts to each defender
+    passz_score = -PASS_PENALTY * 2 / (_GAME_PTS_MAX / 2)
+
+    pts = np.array([ev.game_pts / (_GAME_PTS_MAX / 2) for ev in evals])
+
+    if dk_game_counts is not None and c_explore > 0:
+        total_games = sum(dk_game_counts.values()) + 1
+        ln_total = math.log(total_games)
+        bonus = np.array([
+            c_explore * math.sqrt(ln_total / (dk_game_counts.get(
+                _display_key(ev.contract_key, ev.is_piros), 0) + 1))
+            for ev in evals
+        ])
+        scores = np.append(pts + bonus, passz_score)  # no UCB bonus for Passz
+    else:
+        scores = np.append(pts, passz_score)
+
+    logits = scores / max(bid_temp, 1e-6)
+    logits -= logits.max()
+    probs = np.exp(logits)
+    probs /= probs.sum()
+
+    n = len(evals)
+    idx = rng.choices(range(n + 1), weights=probs.tolist(), k=1)[0]
+    if idx == n:
+        return True, None
+    return False, evals[idx]
+
+
 # ---------------------------------------------------------------------------
 #  High-level per-turn decision functions
 #
 #  Both ``run_auction`` (training/eval) and the live API call these
 #  so the decision logic is identical everywhere.
 # ---------------------------------------------------------------------------
+
+
+_PICKUP_THRESHOLD: float = 0.0  # median must be profitable to pick up
 
 
 def decide_pickup(
@@ -419,6 +459,9 @@ def decide_pickup(
     min_bid_pts: float = 0.0,
     *,
     pickup_explore: float = 0.0,
+    n_talon_samples: int = 20,
+    pickup_quantile: float = 0.5,
+    quantile_overrides: dict[str, float] | None = None,
     rng: random.Random | None = None,
 ) -> PickupEval | None:
     """Decide whether to pick up the talon (10-card hand).
@@ -426,22 +469,32 @@ def decide_pickup(
     Returns a :class:`PickupEval` (with the intended bid rank and trump)
     if the player should pick up, or ``None`` to pass.
 
+    The primary gate is the Kermit-style soloist value (at the given
+    quantile) exceeding ``_PICKUP_THRESHOLD``.  When a real defender
+    evaluation is available (bid_rank > 0), the defender value must
+    also be exceeded.
+
     When *pickup_explore* > 0, with that probability the player picks up
     even when ``sol_value <= def_value`` (epsilon-greedy exploration).
     """
     if not can_pickup(auction) or not wrappers:
         return None
     current_rank = auction.current_bid.rank if auction.current_bid else 0
-    threshold = min_bid_pts * 2 / _GAME_PTS_MAX
-    result = evaluate_pickup(gs, player, dealer, wrappers, bid_rank=current_rank)
-    if result is None or result.value <= threshold:
+    result = evaluate_pickup(
+        gs, player, dealer, wrappers, bid_rank=current_rank,
+        n_talon_samples=n_talon_samples, rng=rng,
+        pickup_quantile=pickup_quantile,
+        quantile_overrides=quantile_overrides,
+    )
+    if result is None or result.value <= _PICKUP_THRESHOLD:
         return None
-    if result.value > result.def_value:
-        return result
-    # Epsilon-greedy: pick up despite defender advantage
-    if pickup_explore > 0 and rng is not None and rng.random() < pickup_explore:
-        return result
-    return None
+    # Apply defender gate only when a real defender eval was computed
+    # (def_value stays 0.0 when bid_rank maps to no known contract)
+    if result.def_value != 0.0 and result.value <= result.def_value:
+        if pickup_explore > 0 and rng is not None and rng.random() < pickup_explore:
+            return result
+        return None
+    return result
 
 
 def decide_bid(
@@ -467,16 +520,27 @@ def decide_bid(
     When *bid_temp* > 0, UCB+softmax sampling is used instead of
     greedy selection — both for first bids and overbids.
     """
+    current_rank = auction.current_bid.rank if auction.current_bid else 0
     evals = evaluate_all_contracts(
         gs, player, dealer,
         wrappers=wrappers,
+        min_bid_rank=current_rank,
     ) if wrappers else []
 
     # Exploratory: UCB+softmax sample from all legal contracts.
     if bid_temp > 0 and rng is not None and evals:
         legal_evals = [ev for ev in evals if _eval_to_auction_bid(ev, auction) is not None]
         if legal_evals:
-            ev = _ucb_sample(legal_evals, bid_temp, c_explore, dk_game_counts, rng)
+            # Include Passz as a candidate for the first bidder
+            if auction.current_bid is None:
+                is_passz, ev = _ucb_sample_with_passz(
+                    legal_evals, bid_temp, c_explore, dk_game_counts, rng,
+                )
+                if is_passz:
+                    discards = nn_discard(evals) if evals else fallback_discards(gs.hands[player])
+                    return BID_PASSZ, discards, None, evals
+            else:
+                ev = _ucb_sample(legal_evals, bid_temp, c_explore, dk_game_counts, rng)
             r = _eval_to_auction_bid(ev, auction)
             if r is not None:
                 bid_obj, discards = r
@@ -520,6 +584,9 @@ def run_auction(
     c_explore: float = 0.0,
     dk_game_counts: dict[str, int] | None = None,
     pickup_explore: float = 0.0,
+    n_talon_samples: int = 20,
+    pickup_quantile: float | list[float] = 0.5,
+    quantile_overrides: dict[str, float] | None = None,
     rng: random.Random | None = None,
 ) -> AuctionResult:
     """Run a competitive 3-player auction.
@@ -549,10 +616,26 @@ def run_auction(
         Per-display-key cumulative game counts for UCB bonus.
     pickup_explore : float
         Epsilon-greedy pickup exploration probability.
+    n_talon_samples : int
+        Number of random talon samples for Kermit-style pickup evaluation.
+    pickup_quantile : float or list[float]
+        Quantile for Kermit-style pickup evaluation.  A single float
+        applies to all seats; a 3-element list sets per-seat quantiles.
+    quantile_overrides : dict[str, float] or None
+        Per-contract quantile overrides.  After the winning contract is
+        determined by vote, its quantile value is recomputed using the
+        override if the contract key is present.  Defaults to
+        ``PICKUP_QUANTILE_OVERRIDES`` from constants.
     rng : random.Random
         RNG for stochastic decisions.  Required when any exploration
         parameter is non-zero.
     """
+    # Normalise pickup_quantile to a 3-element list
+    if isinstance(pickup_quantile, (int, float)):
+        _pq = [float(pickup_quantile)] * 3
+    else:
+        _pq = [float(q) for q in pickup_quantile]
+        assert len(_pq) == 3, f"pickup_quantile list must have 3 elements, got {len(_pq)}"
     first_bidder = next_player(dealer)
 
     # First bidder picks up the talon → 12 cards.
@@ -599,6 +682,9 @@ def run_auction(
                 gs, player, dealer, seat_wrappers[player], a,
                 min_bid_pts=min_bid_pts,
                 pickup_explore=pickup_explore,
+                n_talon_samples=n_talon_samples,
+                pickup_quantile=_pq[player],
+                quantile_overrides=quantile_overrides,
                 rng=rng,
             )
             if pe is not None:
@@ -624,7 +710,7 @@ def run_auction(
     if pickup_hand_10 is not None and all_evals:
         bid_train_data = []
         # Build a temporary GameState with the 10-card hand for encoding
-        gs_10 = _copy.deepcopy(gs)
+        gs_10 = copy.deepcopy(gs)
         gs_10.hands[pickup_player] = list(pickup_hand_10)
         for ev in all_evals:
             feats = encode_bid_features(

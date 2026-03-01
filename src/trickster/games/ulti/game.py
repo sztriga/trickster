@@ -485,8 +485,12 @@ def defender_tricks(state: GameState) -> int:
 
 
 def defender_won_durchmars(state: GameState) -> bool:
-    """Did the defenders win all 10 tricks?"""
-    return defender_tricks(state) == TRICKS_PER_GAME
+    """Did a single defender win all 10 tricks?"""
+    for p in range(NUM_PLAYERS):
+        if p != state.soloist:
+            if len(state.captured[p]) // NUM_PLAYERS == TRICKS_PER_GAME:
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------

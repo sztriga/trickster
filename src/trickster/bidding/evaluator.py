@@ -21,7 +21,7 @@ from typing import Sequence
 
 import numpy as np
 
-from trickster.games.ulti.adapter import UltiGame, UltiNode, build_auction_constraints
+from trickster.games.ulti.adapter import EMPTY_VOIDS, UltiGame, UltiNode, build_auction_constraints
 from trickster.games.ulti.cards import Card, Rank, Suit
 from trickster.games.ulti.encoder import UltiEncoder
 from trickster.games.ulti.game import (
@@ -34,7 +34,7 @@ from trickster.games.ulti.game import (
 from trickster.model import UltiNetWrapper
 from trickster.train_utils import _GAME_PTS_MAX
 
-from .registry import CONTRACT_DEFS, ContractDef
+from .registry import CONTRACT_DEFS, CONTRACT_TO_BID_RANK, ContractDef
 
 
 # ---------------------------------------------------------------------------
@@ -104,29 +104,13 @@ def _make_eval_state(
     gs2.training_mode = contract_def.training_mode
 
     # Marriages (with restriction for 100-games)
-    restrict = None
-    if contract_def.key == "40-100":
-        restrict = "40"
-    elif contract_def.key == "20-100":
-        restrict = "20"
-    declare_all_marriages(gs2, soloist_marriage_restrict=restrict)
+    declare_all_marriages(gs2, soloist_marriage_restrict=contract_def.marriage_restriction)
 
     # Contract components
-    if betli:
-        comps = frozenset({"betli"})
-    else:
-        comps: set[str] = {"parti"}
-        if "ulti" in contract_def.key or contract_def.key == "ulti":
-            comps.add("ulti")
-        if "40" in contract_def.key:
-            comps.update({"40", "100"})
-        if "20" in contract_def.key:
-            comps.update({"20", "100"})
-
-    comps_frozen = frozenset(comps)
+    comps_frozen = contract_def.components
 
     constraints = build_auction_constraints(gs2, comps_frozen)
-    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+    empty_voids = EMPTY_VOIDS
 
     return UltiNode(
         gs=gs2,
@@ -189,12 +173,7 @@ def evaluate_contract(
             return None
 
     # ── Pre-compute constant parts (shared across all 66 pairs) ───
-    # Marriage restriction for soloist
-    restrict = None
-    if contract_def.key == "40-100":
-        restrict = "40"
-    elif contract_def.key == "20-100":
-        restrict = "20"
+    restrict = contract_def.marriage_restriction
 
     # Defender marriages (constant — independent of soloist's discard)
     defender_marriages: list[tuple[int, Suit, int]] = []
@@ -211,19 +190,9 @@ def evaluate_contract(
                     defender_scores[p] += pts
 
     # Contract components (constant)
-    if betli:
-        comps_frozen = frozenset({"betli"})
-    else:
-        comps: set[str] = {"parti"}
-        if "ulti" in contract_def.key or contract_def.key == "ulti":
-            comps.add("ulti")
-        if "40" in contract_def.key:
-            comps.update({"40", "100"})
-        if "20" in contract_def.key:
-            comps.update({"20", "100"})
-        comps_frozen = frozenset(comps)
+    comps_frozen = contract_def.components
 
-    empty_voids = (frozenset[Suit](), frozenset[Suit](), frozenset[Suit]())
+    empty_voids = EMPTY_VOIDS
     encoder = _ENCODER
 
     # ── Batch encode all 66 discard pairs ─────────────────────────
@@ -331,6 +300,8 @@ def evaluate_all_contracts(
     soloist: int,
     dealer: int,
     wrappers: dict[str, UltiNetWrapper],
+    *,
+    min_bid_rank: int = 0,
 ) -> list[ContractEval]:
     """Evaluate all feasible contracts for the soloist's 12-card hand.
 
@@ -342,6 +313,10 @@ def evaluate_all_contracts(
     soloist : player index
     dealer : dealer index
     wrappers : contract_key → UltiNetWrapper (one per trained contract)
+    min_bid_rank : int
+        Skip contracts whose bid rank is at or below this value.
+        Used by ``evaluate_pickup`` to avoid evaluating contracts
+        that cannot legally overbid the current bid.
 
     Returns
     -------
@@ -355,11 +330,11 @@ def evaluate_all_contracts(
         cdef = CONTRACT_DEFS[contract_key]
 
         if cdef.is_betli:
-            # Betli: no trump. Evaluate both normal and rebetli (piros).
-            # The value head predicts different stakes for each because
-            # is_red is encoded in the state features and piros is in
-            # the training rewards.
             for is_piros in (False, True):
+                if min_bid_rank > 0:
+                    rank = CONTRACT_TO_BID_RANK.get((contract_key, is_piros))
+                    if rank is None or rank <= min_bid_rank:
+                        continue
                 ev = evaluate_contract(
                     gs, soloist, dealer, cdef,
                     trump=None, is_piros=is_piros,
@@ -368,8 +343,10 @@ def evaluate_all_contracts(
                 if ev is not None:
                     results.append(ev)
         elif cdef.piros_only:
-            # Piros-only contract (e.g. Parti): only evaluate Hearts trump.
-            # Plain (non-red) version cannot be played.
+            if min_bid_rank > 0:
+                rank = CONTRACT_TO_BID_RANK.get((contract_key, True))
+                if rank is None or rank <= min_bid_rank:
+                    continue
             ev = evaluate_contract(
                 gs, soloist, dealer, cdef,
                 trump=Suit.HEARTS, is_piros=True,
@@ -378,11 +355,12 @@ def evaluate_all_contracts(
             if ev is not None:
                 results.append(ev)
         else:
-            # Colored contracts: evaluate each possible trump suit.
-            # Hearts = piros (2x stakes), others = normal.
             for suit in suits_in_hand:
                 is_piros = (suit == Suit.HEARTS)
-
+                if min_bid_rank > 0:
+                    rank = CONTRACT_TO_BID_RANK.get((contract_key, is_piros))
+                    if rank is None or rank <= min_bid_rank:
+                        continue
                 ev = evaluate_contract(
                     gs, soloist, dealer, cdef,
                     trump=suit, is_piros=is_piros,

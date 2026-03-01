@@ -473,11 +473,6 @@ def contract_loss_value(bid: Bid, kontra_level: int = 0) -> int:
 
 
 # ---------------------------------------------------------------------------
-#  Marriage restriction helpers
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 #  Kontra helpers — per-component kontrable units and values
 # ---------------------------------------------------------------------------
 
@@ -599,9 +594,7 @@ def ai_should_pickup(hand: list[Card], auction: AuctionState) -> bool:
     return strong >= 5 and can_pickup(auction)
 
 
-# Bid ranks for contracts that have trained models.
-# Others will be enabled once we train them.
-SUPPORTED_BID_RANKS: frozenset[int] = frozenset({1, 2, 3, 4, 5, 8, 10, 11})
+from trickster.bidding.registry import SUPPORTED_BID_RANKS
 
 
 def ai_bid_after_pickup(hand: list[Card], auction: AuctionState) -> tuple[Bid, list[Card]]:

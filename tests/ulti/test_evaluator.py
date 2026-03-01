@@ -210,15 +210,18 @@ class TestDecidePickup:
         submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
 
         # Soloist value high, defender value low → picks up
+        # Kermit-style uses batch_value_soloist via evaluate_all_contracts
         wrappers = {}
         for key in ("parti", "betli", "ulti", "40-100"):
             w = MagicMock()
-            w.batch_bid_value = lambda states: np.full(len(states), 0.8)
+            w.batch_value_soloist = lambda states: np.full(len(states), 0.8)
             w.batch_value_defender = lambda states: np.full(len(states), 0.2)
             w.predict_value = lambda feats: 0.8
             wrappers[key] = w
 
-        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0)
+        import random
+        rng = random.Random(42)
+        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0, rng=rng)
         assert result is not None
         assert isinstance(result, PickupEval)
         assert result.value > 0.0
@@ -233,7 +236,9 @@ class TestDecidePickup:
 
         wrappers = _make_wrappers(value=-0.5)  # negative soloist value
 
-        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0)
+        import random
+        rng = random.Random(42)
+        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0, rng=rng)
         assert result is None
 
     def test_defender_value_higher_passes(self):
@@ -245,15 +250,18 @@ class TestDecidePickup:
         submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
 
         # Soloist value positive but defender value even higher → pass
+        # Kermit-style uses batch_value_soloist via evaluate_all_contracts
         wrappers = {}
         for key in ("parti", "betli", "ulti", "40-100"):
             w = MagicMock()
-            w.batch_bid_value = lambda states: np.full(len(states), 0.3)
+            w.batch_value_soloist = lambda states: np.full(len(states), 0.3)
             w.batch_value_defender = lambda states: np.full(len(states), 0.5)
             w.predict_value = lambda feats: 0.3
             wrappers[key] = w
 
-        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0)
+        import random
+        rng = random.Random(42)
+        result = decide_pickup(gs, player, 0, wrappers, a, min_bid_pts=0.0, rng=rng)
         assert result is None
 
     def test_empty_wrappers_passes(self):
@@ -281,10 +289,11 @@ class TestDecidePickup:
             submit_bid(a, fb, BID_PASSZ, [talon[0], talon[1]])
 
             # Soloist value positive but defender value higher → normally pass
+            # Kermit-style uses batch_value_soloist via evaluate_all_contracts
             wrappers = {}
             for key in ("parti", "betli", "ulti", "40-100"):
                 w = MagicMock()
-                w.batch_bid_value = lambda states: np.full(len(states), 0.3)
+                w.batch_value_soloist = lambda states: np.full(len(states), 0.3)
                 w.batch_value_defender = lambda states: np.full(len(states), 0.5)
                 w.predict_value = lambda feats: 0.3
                 wrappers[key] = w

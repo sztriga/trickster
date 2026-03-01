@@ -148,9 +148,12 @@ class BiddingTrainConfig:
     pass_penalty: float = PASS_PENALTY
     bid_temp_start: float = BID_TEMP_START
     bid_temp_end: float = BID_TEMP_END
-    c_explore: float = 2.0    # UCB exploration constant for contract selection
-    pickup_explore_start: float = 0.5  # epsilon-greedy pickup exploration (start, high)
-    pickup_explore_end: float = 0.15   # epsilon-greedy pickup exploration (end, low)
+    c_explore: float = 1.0    # UCB exploration constant for contract selection
+    pickup_explore_start: float = 0.0  # epsilon-greedy pickup exploration (start, high)
+    pickup_explore_end: float = 0.0    # epsilon-greedy pickup exploration (end, low)
+
+    # -- Pickup --
+    pickup_talon_samples: int = 20  # Kermit-style talon samples for pickup eval
 
     # -- Kontra --
     kontra_enabled: bool = True    # enable kontra/rekontra decisions after trick 1
@@ -438,6 +441,7 @@ def _play_one_bidding_game(
         c_explore=cfg.c_explore,
         dk_game_counts=dk_game_counts,
         pickup_explore=pickup_explore,
+        n_talon_samples=cfg.pickup_talon_samples,
         rng=rng,
     )
 
@@ -692,6 +696,7 @@ def train_with_bidding(
         "c_explore": cfg.c_explore,
         "pickup_explore_start": cfg.pickup_explore_start,
         "pickup_explore_end": cfg.pickup_explore_end,
+        "pickup_talon_samples": cfg.pickup_talon_samples,
         "kontra_enabled": cfg.kontra_enabled,
         "contract_keys": cfg.contract_keys,
         "num_workers": 1,
