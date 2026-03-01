@@ -35,7 +35,8 @@ node_modules/
 # TypeScript build cache
 tsconfig.tsbuildinfo
 
-# Models — tracked via Git LFS (see .gitattributes)
+# Model weights
+*.pt
 
 # Misc
 .pytest_cache/
